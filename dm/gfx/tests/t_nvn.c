@@ -12,6 +12,8 @@ void nvn_present_config(int hz, int display_mode);
 #include <fcntl.h>
 #include <errno.h>
 #include <unistd.h>
+#include <signal.h>
+#include <sys/wait.h>
 uint64_t now_ns(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }   // the host's clock (hle_os.c: Mach absolute time), which Metal's timestamps are on
 
 static int g_fail, g_n;
@@ -97,6 +99,30 @@ static tl_flat tl_flatten(const uint8_t *handle) {
     }
     free(j.objects.keys); free(j.objects.vals); return f;
 }
+// Whether flattening the handle aborts (die), in a child process: 1 when it aborted, 0 when it finished, -1 for anything else (a hang, another signal), which fails the
+// check that expected 0 or 1. The child's SIGABRT handler exits with TL_ABORTED, so no crash report is written; a child stuck after fork (die's LOG or malloc waiting on a
+// lock another thread held at the fork) exits with TL_HUNG at its alarm, and the parent kills one that outlives TL_WAIT_MS
+#define TL_ABORTED 77
+#define TL_HUNG 78
+#define TL_ALARM_S 5
+#define TL_WAIT_MS 10000
+static void tl_on_abort(int sig) { (void)sig; _exit(TL_ABORTED); }
+static void tl_on_alarm(int sig) { (void)sig; _exit(TL_HUNG); }
+static int tl_dies(const uint8_t *handle) {
+    fflush(stdout); fflush(stderr); pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) { signal(SIGABRT, tl_on_abort); signal(SIGALRM, tl_on_alarm); alarm(TL_ALARM_S); tl_flatten(handle); _exit(0); }
+    int st = 0; pid_t got = 0;
+    for (int ms = 0; ms < TL_WAIT_MS && got == 0; ms++) {
+        got = waitpid(pid, &st, WNOHANG);
+        if (got < 0 && errno == EINTR) got = 0;
+        if (got == 0) { struct timespec one = {0, 1000000}; nanosleep(&one, NULL); }
+    }
+    if (got != pid) { kill(pid, SIGKILL); while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {} printf("(flatten child did not exit in %d ms)\n", TL_WAIT_MS); return -1; }
+    if (!WIFEXITED(st)) { printf("(flatten child ended by signal %d)\n", WIFSIGNALED(st) ? WTERMSIG(st) : -1); return -1; }
+    if (WEXITSTATUS(st) == TL_HUNG) { printf("(flatten child hung)\n"); return -1; }
+    return WEXITSTATUS(st) == TL_ABORTED ? 1 : WEXITSTATUS(st) == 0 ? 0 : -1;
+}
 static int tl_same(const tl_flat *a, const tl_flat *b) { return a->nodes == b->nodes && !memcmp(a->kinds, b->kinds, sizeof a->kinds) && a->len == b->len && a->len != SIZE_MAX && !memcmp(a->bytes, b->bytes, a->len); }
 
 int main(void) {
@@ -155,12 +181,33 @@ int main(void) {
         EXPECT("wait inside a span: commands, event, commands", 1, ft.nodes == 3 && ft.kinds[0] == NQ_COMMANDS && ft.kinds[1] == NQ_EVENT && ft.kinds[2] == NQ_COMMANDS);
         EXPECT("wait inside a span: flattens as its inline stream", 1, tl_same(&ft, &fi));
         // DM_NVN_CMDSTAT's small-recording walk counts the records inside the spans too, and the tokens it walks (two SPANs, the JUMP, the END) under their own ops
-        g_cs.on = 1; cs_recording(t2);
+        g_cs.on = 1; cs_recording(t2, NULL);
         EXPECT("CMDSTAT: a token list is one small recording", 1, g_cs.small_recs);
         EXPECT("CMDSTAT: the records inside its spans counted", 1, g_cs.sop_n[OP_BLEND_COLOR] == 1 && g_cs.sop_n[OP_SCISSOR] == 1 && g_cs.sop_n[OP_BARRIER] == 1);
         EXPECT("CMDSTAT: its tokens counted under their ops", 1, g_cs.sop_n[OP_SPAN] == 2 && g_cs.sop_b[OP_SPAN] == 48 && g_cs.sop_n[OP_JUMP] == 1 && g_cs.sop_n[OP_END] == 1);
         EXPECT("CMDSTAT: its bytes, records and tokens", 3 * 24 + 2 * 24 + 16 + 8, g_cs.small_bytes);
+        EXPECT("CMDSTAT design A: a token list's spans are its SPANs", 2, g_cs.est_spans);
+        EXPECT("CMDSTAT design A: two SPANs, a JUMP, an END", 2 * 24 + 16 + 8, g_cs.est_ctl);
+        // an inline recording R R | JUMP | R CALL R END: a span ends at the segment switch and at the CALL, so three spans
+        uint8_t *e1 = i, *w8 = i + 128; tl_rec(&i, OP_BLEND_COLOR, 80); tl_rec(&i, OP_SCISSOR, 81); tl_ptr(&i, OP_JUMP, w8);
+        tl_rec(&w8, OP_BARRIER, 82); tl_ptr(&w8, OP_CALL, i5); tl_rec(&w8, OP_DEPTH_RANGE, 83); tl_put(&w8, OP_END, NULL, 0); i = w8;
+        memset(&g_cs, 0, sizeof g_cs); g_cs.on = 1; cs_recording(e1, NULL);
+        EXPECT("CMDSTAT design A: runs end at a segment switch and a CALL", 3, g_cs.est_spans);
+        EXPECT("CMDSTAT design A: three SPANs, a CALL, a switch, an END", 3 * 24 + 16 + 16 + 8, g_cs.est_ctl);
+        // a control op inside a span stops the walk there instead of following it
+        uint8_t *s0 = c; tl_rec(&c, OP_BLEND_COLOR, 90); tl_ptr(&c, OP_JUMP, a0); uint8_t *s1 = c;
+        uint8_t *t8 = t; tl_span(&t, s0, s1); tl_put(&t, OP_END, NULL, 0);
+        memset(&g_cs, 0, sizeof g_cs); g_cs.on = 1; cs_recording(t8, NULL);
+        EXPECT("CMDSTAT: a JUMP inside a span is not followed", 1, g_cs.small_recs == 1 && g_cs.sop_n[OP_BLEND_COLOR] == 1 && g_cs.sop_n[OP_SCISSOR] == 0 && g_cs.sop_n[OP_JUMP] == 0);
         memset(&g_cs, 0, sizeof g_cs); memset(g_cs_thr, 0, sizeof g_cs_thr); g_cs.on = -1;   // back to the environment's choice for the tests below
+        // a corrupt token list stops the submission (nq_flatten's die): a control op inside a span, a record running past its end, a length that cuts a record
+        uint8_t *t9 = t; tl_span(&t, s0, s1); tl_put(&t, OP_END, NULL, 0);
+        uint8_t *t10 = t; tl_span(&t, a0, a0 + 16); tl_put(&t, OP_END, NULL, 0);
+        uint8_t *t11 = t; tl_span(&t, a0, a0 + 28); tl_put(&t, OP_END, NULL, 0);
+        EXPECT("corrupt span: a JUMP inside it aborts", 1, tl_dies(t9));
+        EXPECT("corrupt span: a record past its end aborts", 1, tl_dies(t10));
+        EXPECT("corrupt span: a length not a multiple of 8 aborts", 1, tl_dies(t11));
+        EXPECT("a well-formed token list does not abort", 0, tl_dies(t1));
         EXPECT("synthetic streams fit their arrays", 1, c <= cmd + sizeof cmd && t <= ctl + 512 && w2b <= ctl + sizeof ctl && i <= inl + sizeof inl);
     }
     {   // A missing control section must not publish uninitialized bytes or poison a serial's key cache.
@@ -706,6 +753,40 @@ int main(void) {
         EXPECT("wide vertex range decode preserves all 64 bits", 1,
                b->first == 7 && b->n == 1 && b->r[0].address == UINT64_C(0xabcd123456780000) && b->r[0].size == UINT64_C(0x100000001));
         P(nvnCommandBufferFinalize)(&c2); P(nvnMemoryPoolFinalize)(&mp);
+    }
+    // 5a'. DM_NVN_CMDSTAT's control-memory rows (step 1 of the control-memory plan): per command buffer the AddControlMemory calls, bytes and chunk range, the getters'
+    //      calls and last values, the callback switch, and the recordings ended with no control memory given; rows retired at Finalize and re-Initialize; an overflow row
+    {
+        memset(g_cs_ctl, 0, sizeof g_cs_ctl); memset(&g_cs_ctl_over, 0, sizeof g_cs_ctl_over); memset(&g_cs_ctl_retired, 0, sizeof g_cs_ctl_retired); memset(&g_cs, 0, sizeof g_cs); g_cs.on = 1;
+        static uint8_t m[4096] __attribute__((aligned(4096))), ctl[1024]; NVNmemoryPoolBuilder mb; NVNmemoryPool mp; NVNcommandBuffer ca, cb;
+        P(nvnMemoryPoolBuilderSetDefaults)(&mb); P(nvnMemoryPoolBuilderSetStorage)(&mb, m, sizeof m); P(nvnMemoryPoolInitialize)(&mp, &mb);
+        P(nvnCommandBufferInitialize)(&ca, &dev); P(nvnCommandBufferInitialize)(&cb, &dev);
+        P(nvnCommandBufferAddCommandMemory)(&cb, &mp, 0, 2048); P(nvnCommandBufferBeginRecording)(&cb); P(nvnCommandBufferEndRecording)(&cb);   // no control memory
+        P(nvnCommandBufferAddControlMemory)(&ca, ctl, 256); P(nvnCommandBufferAddControlMemory)(&ca, ctl, 1024);
+        P(nvnCommandBufferGetControlMemoryFree)(&ca); P(nvnCommandBufferGetControlMemorySize)(&ca); P(nvnCommandBufferGetControlMemorySize)(&ca); P(nvnCommandBufferGetControlMemoryUsed)(&ca);
+        h_nvnCommandBufferSetControlMemoryCallbackEnabled(&ca, 1);
+        P(nvnCommandBufferAddCommandMemory)(&ca, &mp, 2048, 2048); P(nvnCommandBufferBeginRecording)(&ca); P(nvnCommandBufferEndRecording)(&ca);
+        P(nvnCommandBufferBeginRecording)(&ca); P(nvnCommandBufferEndRecording)(&ca);
+        const cs_ctl_t *rb = &g_cs_ctl[0], *ra = &g_cs_ctl[1];
+        EXPECT("control rows: one per buffer, in first-use order", 1, rb->cmd == CB(&cb) && ra->cmd == CB(&ca) && !g_cs_ctl[2].cmd);
+        EXPECT("control rows: a recording with no control memory", 1, rb->recs == 1 && rb->recs_bare == 1 && rb->adds == 0 && rb->cb_on == -1);
+        EXPECT("control rows: two grants, their bytes and range", 1, ra->adds == 2 && ra->bytes == 1280 && ra->min == 256 && ra->max == 1024);
+        EXPECT("control rows: getter calls", 1, ra->gets[CS_GET_USED] == 1 && ra->gets[CS_GET_FREE] == 1 && ra->gets[CS_GET_SIZE] == 2);
+        EXPECT("control rows: the values returned last", 1, ra->ret[CS_GET_USED] == 0 && ra->ret[CS_GET_FREE] == 1024 && ra->ret[CS_GET_SIZE] == 1024);
+        EXPECT("control rows: callback enabled, recordings with control memory", 1, ra->cb_on == 1 && ra->recs == 2 && ra->recs_bare == 0);
+        // Finalize retires a row into the sum and frees it; an Initialize at a used address (a stack buffer never finalized) does the same, so the next buffer there starts afresh
+        P(nvnCommandBufferFinalize)(&ca);
+        EXPECT("control rows: Finalize sums the row and frees it", 1, !ra->cmd && g_cs_ctl_retired.bufs == 1 && g_cs_ctl_retired.given == 1 && g_cs_ctl_retired.sum.adds == 2 && g_cs_ctl_retired.sum.recs == 2 && g_cs_ctl_retired.cb_on == 1);
+        P(nvnCommandBufferInitialize)(&cb, &dev);
+        EXPECT("control rows: a second Initialize at the address retires its row", 1, !rb->cmd && g_cs_ctl_retired.bufs == 2 && g_cs_ctl_retired.bare_bufs == 1);
+        P(nvnCommandBufferAddCommandMemory)(&cb, &mp, 0, 2048); P(nvnCommandBufferAddControlMemory)(&cb, ctl, 512); P(nvnCommandBufferBeginRecording)(&cb); P(nvnCommandBufferEndRecording)(&cb);
+        EXPECT("control rows: the new buffer there starts afresh", 1, rb->cmd == CB(&cb) && rb->recs == 1 && rb->recs_bare == 0 && rb->adds == 1 && rb->cb_on == -1);
+        for (int k = 0; k < CS_CTL_BUFS + 2; k++) cs_ctl_add((const cmd_t *)(uintptr_t)(0x100000 + 0x100 * k), 64);   // 31 take the free rows, 3 find none
+        EXPECT("control rows: buffers past the free rows go to the overflow row", 3, g_cs_ctl_over.adds);
+        cs_dump_ex(1);   // the dump's lines, read by eye in the log ("at least 35 command buffers": 32 live, 2 retired, the overflow row as one)
+        memset(g_cs_ctl, 0, sizeof g_cs_ctl); memset(&g_cs_ctl_over, 0, sizeof g_cs_ctl_over); memset(&g_cs_ctl_retired, 0, sizeof g_cs_ctl_retired);
+        memset(&g_cs, 0, sizeof g_cs); memset(g_cs_thr, 0, sizeof g_cs_thr); g_cs.on = -1;
+        P(nvnCommandBufferFinalize)(&cb); P(nvnMemoryPoolFinalize)(&mp);
     }
     // 5b'. Fixed slots sized by GetCommandMemoryUsed, as Tears of the Kingdom gives each model's prerecorded lists (GitHub issue #61): a list measured at S bytes is recorded
     //      into slot k = base + S × k with AddCommandMemory(max(S, 512)), and slot k + 1 is recorded right after it. The list here is an uniform update of n bytes and a

@@ -119,13 +119,14 @@ enum {
 // Token-list command handles, groundwork for control memory (not recorded yet). NVN keeps a command buffer's control words (its GPFIFO entries: jumps, calls, the end of a
 // recording) in control memory and only commands in command memory, so GetCommandMemoryUsed counts commands alone; the host writes its END, JUMP and CALL inline between the
 // records instead, and games that size heaps by that count get the host's control bytes in it (docs/reference/memory.md, "Model heaps sized by the host's command record
-// sizes"). A handle whose first word is OP_SPAN is a token list, which will live in control memory: a sequence of
+// sizes"). A token list, which will live in control memory, is a sequence of
 //   OP_SPAN {addr, len}: the command records in [addr, addr + len), records only (no END, JUMP, CALL or SPAN among them);
 //   OP_CALL {handle}: call another handle, of either format;
 //   OP_JUMP {target}: the list goes on at target (the next control chunk);
 //   OP_END: the end of the list.
-// Any other handle is an inline stream, as before: records with END, JUMP and CALL between them. nq_flatten (nvn_queue.inc) expands both into the queue's flat copy, which
-// carries no token, so replay and the capture never see one; cs_recording (hle_nvn.c) counts the records inside the spans
+// An inline stream, as before, is records with END, JUMP and CALL between them. Readers do not tell the formats apart by the first word: a handle is read as a token list
+// where it holds SPAN tokens, a list may start with CALL, JUMP or END, and an empty token list is byte-identical to an empty inline stream. nq_flatten (nvn_queue.inc)
+// expands both into the queue's flat copy, which carries no token, so replay and the capture never see one; cs_recording (hle_nvn.c) counts the records inside the spans
 typedef struct { uint64_t addr, len; } p_span;
 // Payload (immediately follows op_hdr)
 typedef struct {
