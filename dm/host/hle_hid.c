@@ -829,16 +829,22 @@ static void six_sample(SixAxisState *s, int64_t samp, int shakes) {
 // two sensors, the others one. A handle reads as connected while its controller is connected in that style; otherwise its entries are zero (not connected) and the count 0.
 // Only player 1's controller shakes (DM_BTN_SHAKE comes from the keyboard, the iPhone and DM_KEYS, all player 1)
 static int six_connected(uint32_t h) { return (h & 0xff) < 32 && (style_of(h >> 8 & 0xff) >> (h & 0xff) & 1); }
+// The motion behind a handle: a Joy-Con npad's own Joy-Con, else its player's controller; returns whether it is live (else the sensor lies flat), and whether it shakes
+static int six_source(uint32_t h, motion_state *ms, int *shakes) {
+    npad_ref ref = npad_resolve(h >> 8 & 0xff);
+    int pl = ref.kind >= KIND_DUAL ? ref.pad : player_of(h >> 8 & 0xff);
+    *shakes = pl == 0 && ref.kind < KIND_DUAL;
+    return ref.kind >= KIND_DUAL ? motion_joy(ref.pad, ref.kind == KIND_LEFT ? 0 : ref.kind == KIND_RIGHT ? 1 : (int)(h >> 16 & 1), ms) : motion_live(pl, ms);
+}
+static void six_at(SixAxisState *s, int64_t samp, int live, const motion_state *ms, int shakes) {
+    if (live) six_sample_live(s, samp, ms, shakes); else six_sample(s, samp, shakes);
+}
 static int six_states(SixAxisState *out, int n, uint32_t h) {
     if (n <= 0) return 0;
     if (!six_connected(h)) { memset(out, 0, sizeof *out * (size_t)n); return 0; }
     int64_t samp = (int64_t)(guest_ns() / SIX_PERIOD_NS);
-    npad_ref ref = npad_resolve(h >> 8 & 0xff);
-    int pl = ref.kind >= KIND_DUAL ? ref.pad : player_of(h >> 8 & 0xff), shakes = pl == 0 && ref.kind < KIND_DUAL;
-    motion_state ms;
-    int live = ref.kind >= KIND_DUAL ? motion_joy(ref.pad, ref.kind == KIND_LEFT ? 0 : ref.kind == KIND_RIGHT ? 1 : (int)(h >> 16 & 1), &ms) : motion_live(pl, &ms);
-    if (live) { for (int i = 0; i < n; i++) six_sample_live(&out[i], samp - i, &ms, shakes); return n; }
-    for (int i = 0; i < n; i++) six_sample(&out[i], samp - i, shakes);
+    motion_state ms; int shakes, live = six_source(h, &ms, &shakes);
+    for (int i = 0; i < n; i++) six_at(&out[i], samp - i, live, &ms, shakes);
     return n;
 }
 HLE_FORCE("_ZN2nn3hid23GetSixAxisSensorHandlesEPNS0_19SixAxisSensorHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE", "six-axis sensor handles: two for handheld / dual Joy-Cons, one otherwise",
@@ -925,8 +931,8 @@ HLE_FORCE("_ZN2nn3hid12GetJcmsStateEPNS0_9JcmsStateERKNS0_10JcmsHandleE", "Joy-C
 HLE_FORCE("_ZN2nn3hid25GetMousePointerSpeedScaleEv", "mouse pointer speed setting: the default, 1.0", float, h_hid_MouseSpeed, void) { return 1.0f; }
 // Npad IMU (Switch 2 SDKs): the six-axis samples the SDK's own sensor fusion reads (Enable/UpdateSensorFusion → GetNpadImuSamples → nn::imu::FullSensorState). EnableNpadImu gives the
 // hid service the game's buffer as transfer memory, which the host does not serve: Nintendo Switch Sports Resort aborted in InitializeSensorFusion (Result 0xe15, sdk+0x6d6948). These four
-// calls are the only users of the SDK's IMU state (sdk+0x1056c48), so the host keeps that state here: on with the game's buffer, which no service writes, and no samples yet, as on a
-// console before a controller's first report. The fusion then has nothing to feed on. A NpadImuSample is 0x28 bytes (sdk+0x6ca8b8); filling them from the host's motion is open
+// calls are the only users of the SDK's IMU state (sdk+0x1056c48), so the host keeps that state here: on with the game's buffer, which no service writes; GetNpadImuSamples writes the
+// samples straight into the caller's array instead (below)
 #define RES_NPAD_IMU_ENABLED 0x2908cau   // what the SDK's EnableNpadImu answers while it is already on (sdk+0x6ca600)
 static pthread_mutex_t g_imu_lock = PTHREAD_MUTEX_INITIALIZER;
 static void *g_imu_buf;
@@ -946,8 +952,121 @@ HLE_FORCE("_ZN2nn3hid16IsNpadImuEnabledEv", "npad IMU state as the host keeps it
     pthread_mutex_lock(&g_imu_lock); int on = g_imu_on; pthread_mutex_unlock(&g_imu_lock);
     return on;
 }
-HLE_FORCE("_ZN2nn3hid17GetNpadImuSamplesEPNS0_13NpadImuSampleEiNS0_13NpadImuHandleE", "npad IMU samples: none yet (no motion reaches this path on the host)", int, h_hid_ImuSamples, void *out, int n, uint32_t handle) {
-    (void)out; (void)n; (void)handle; return 0;
+// The handle is the six-axis sensor handle (UpdateSensorFusion passes its SensorFusionHandle to both, sdk+0x6d6ea0 and +0x6d7078): byte 1 the npad id, byte 2 the device index. The SDK
+// accepts npads No1..No8, Other and Handheld (else 0x58aca) and devices 0..2 (else 0xd6ca: VerifyValidSixAxisSensorHandle, sdk+0x6d8440). A refused handle gets a red line naming the
+// call (who), except from GetNpadImuSamples, which the fusion calls each update only after that check of its own (sdk+0x6d6ff0)
+#define RES_INVALID_SIX_DEVICE 0xd6cau
+enum { SIX_DEVICES = 3, SIX_NPADS = 10 };   // npad_id_slot's ten npads
+static Result six_handle_slot(const char *who, uint32_t h, int *slot, int *dev) {
+    *slot = npad_id_slot(h >> 8 & 0xff); *dev = (int)(h >> 16 & 0xff);
+    Result r = *slot < 0 ? RES_INVALID_NPAD_ID : *dev >= SIX_DEVICES ? RES_INVALID_SIX_DEVICE : RES_OK;
+    if (r != RES_OK && who) LOG("[RED] hid %s: six-axis handle %#x refused (%#x)", who, h, r);
+    return r;
+}
+// NpadImuSample (0x28, sdk+0x6ca8b8) as UpdateSensorFusion reads it: sampling number, ns since the previous sample, angular velocity in rad/s, acceleration in m/s^2 (sdk+0x6d7320..+0x6d7350).
+// The fusion takes the samples oldest first, skips a number at or below the last it took (within 200) and resets on a jump of 100 or more or on going back further (sdk+0x6d7198), and
+// reports acceleration as m/s^2 x (-1 / 9.80665) G (sdk+0x6d74a0) and angular velocity as the negated gyro (fneg at sdk+0x6d7334, +0x6d734c, +0x6d7350) x 57.2958 deg/s (sdk+0x6d74c8).
+// The host's six-axis state (acceleration in G, (0, 0, -1) at rest; angular velocity in revolutions / s) becomes acc = -G x 9.80665 and gyro = -rev/s x 2 pi, so the fusion's outputs read
+// in the six-axis state's own signs. That the outputs follow those signs is assumed, not checked on a console: DM_IMU_ACC_SIGN / DM_IMU_GYRO_SIGN = 1 keep the host's signs instead.
+// Samples are the sensor's 5 ms ticks on the guest clock (SIX_PERIOD_NS), each the six-axis state at that time (live motion, else flat with player 1's shake). Each device (npad, device
+// index) numbers its ticks from 1 at its first delivery and hands each tick out once: every tick since the last delivery, at most n and at most the 16 the SDK's ring holds (EnableNpadImu's
+// buffer: 16 x 0x28 per device), the newest ones; older ticks are lost and their numbers skipped, as when a console's ring wraps. Ticks while the IMU is off are lost the same way.
+// A handle whose controller is not connected in that style has none
+typedef struct { int64_t sampling, delta_ns; float gyro[3], acc[3]; } NpadImuSample;
+_Static_assert(sizeof(NpadImuSample) == 0x28, "NpadImuSample");
+enum { IMU_RING = 16 };
+#define STANDARD_GRAVITY 9.80665
+typedef struct { int64_t base, last; int started; } ImuDevice;   // the tick numbered 1, the last tick handed out
+static ImuDevice g_imu_dev[SIX_NPADS][SIX_DEVICES];   // under g_imu_lock
+static float g_imu_acc_sign = -1, g_imu_gyro_sign = -1;
+static pthread_once_t g_imu_once = PTHREAD_ONCE_INIT;
+static void imu_env_read(void) {
+    const char *e;
+    g_imu_acc_sign = (e = getenv("DM_IMU_ACC_SIGN")) && atof(e) > 0 ? 1 : -1;
+    g_imu_gyro_sign = (e = getenv("DM_IMU_GYRO_SIGN")) && atof(e) > 0 ? 1 : -1;
+}
+static void imu_sample(NpadImuSample *o, int64_t tick, int64_t base, int live, const motion_state *ms, int shakes) {
+    SixAxisState s; six_at(&s, tick, live, ms, shakes);
+    o->sampling = tick - base + 1; o->delta_ns = SIX_PERIOD_NS;
+    for (int i = 0; i < 3; i++) {
+        o->acc[i] = (float)(g_imu_acc_sign * s.acc[i] * STANDARD_GRAVITY);
+        o->gyro[i] = (float)(g_imu_gyro_sign * s.gyro[i] * 2 * M_PI);
+    }
+}
+HLE_FORCE("_ZN2nn3hid17GetNpadImuSamplesEPNS0_13NpadImuSampleEiNS0_13NpadImuHandleE", "npad IMU samples: the device's six-axis state at each 5 ms tick not yet handed out, oldest first",
+          int, h_hid_ImuSamples, void *out, int n, uint32_t handle) {
+    pthread_once(&g_imu_once, imu_env_read);
+    int slot, dev;
+    if (!out || n <= 0 || six_handle_slot(NULL, handle, &slot, &dev) != RES_OK || !six_connected(handle)) return 0;
+    motion_state ms; int shakes, live = six_source(handle, &ms, &shakes);   // before g_imu_lock: the motion sources have locks of their own
+    int64_t now = (int64_t)(guest_ns() / SIX_PERIOD_NS), base = 0, k = 0;
+    pthread_mutex_lock(&g_imu_lock);
+    if (g_imu_on) {
+        ImuDevice *d = &g_imu_dev[slot][dev];
+        if (!d->started) *d = (ImuDevice){.base = now, .last = now - 1, .started = 1};
+        k = now - d->last;
+        if (k > n) k = n;
+        if (k > IMU_RING) k = IMU_RING;
+        if (k > 0) d->last = now; else k = 0;
+        base = d->base;
+    }
+    pthread_mutex_unlock(&g_imu_lock);
+    NpadImuSample *o = out;
+    for (int64_t i = 0; i < k; i++) imu_sample(&o[i], now - k + 1 + i, base, live, &ms, shakes);
+    return (int)k;
+}
+// The fusion's initialization (sdk+0x6d7db0) asks GetSixAxisSensorIcInformation through the hid service (IHidServer +0x178, sdk+0x6c3768), which the host does not serve: on a failure it
+// latches its error flag (+0x579, sdk+0x6d7e40) and never reads a sample. It copies the 0xc8 bytes (sdk+0x6d7e58) and builds nn::imu::SixAxisSensorInformation from them
+// (sdk+0x6d7f18, built at sdk+0x6fed30): for each sensor its range, a zero-offset bound and sensitivity bounds (diagonal 1 ± e, cross-axis ± c), read at +0x00 / +0x64 (range, also the
+// limit: a sample past twice the range resets the fusion), +0x10 / +0x74 (the offset's upper bound), +0x40 / +0xa4 (1 + e) and +0x44 / +0xa8 (c). The layout matches yuzu's
+// SixAxisSensorIcInformation, whose values the host answers: 2000 deg/s and 8 G (the full scale of the Switch's six-axis IC), offsets within ±10 deg/s and ±0.0612 G, sensitivity
+// 0.95..1.05 with ±0.003 cross-axis. The ranges are the Switch's; the bounds are yuzu's guesses, not read from a Switch 2 controller
+typedef struct { float range, offset_min[3], offset_max[3], scale_min[9], scale_max[9]; } SixIcHalf;
+typedef struct { SixIcHalf gyro, acc; } SixIcInformation;
+_Static_assert(sizeof(SixIcInformation) == 0xc8, "SixAxisSensorIcInformation");
+#define SIX_IC_SCALE_MIN {0.95f, -0.003f, -0.003f, -0.003f, 0.95f, -0.003f, -0.003f, -0.003f, 0.95f}
+#define SIX_IC_SCALE_MAX {1.05f, 0.003f, 0.003f, 0.003f, 1.05f, 0.003f, 0.003f, 0.003f, 1.05f}
+static const SixIcInformation SIX_IC_INFO = {
+    .gyro = {2000.0f, {-10.0f, -10.0f, -10.0f}, {10.0f, 10.0f, 10.0f}, SIX_IC_SCALE_MIN, SIX_IC_SCALE_MAX},
+    .acc = {8.0f, {-0.0612f, -0.0612f, -0.0612f}, {0.0612f, 0.0612f, 0.0612f}, SIX_IC_SCALE_MIN, SIX_IC_SCALE_MAX},
+};
+HLE_FORCE("_ZN2nn3hid29GetSixAxisSensorIcInformationEPNS0_26SixAxisSensorIcInformationERKNS0_19SixAxisSensorHandleE", "six-axis sensor IC: 2000 deg/s, 8 G (bounds as yuzu's)",
+          Result, h_hid_SixIcInfo, void *out, const uint32_t *h) {
+    int slot, dev; Result r = six_handle_slot("GetSixAxisSensorIcInformation", *h, &slot, &dev);
+    if (r == RES_OK) memcpy(out, &SIX_IC_INFO, sizeof SIX_IC_INFO);
+    return r;
+}
+// UpdateSensorFusion asks each update whether a new controller took the device (sdk+0x6d6f48), which resets the fusion; the SDK reads that from hid shared memory, which the host does
+// not map (IsSixAxisSensorDeviceNewlyAssignedFromSharedMemory, sdk+0x6c1330), and clears it through the hid service (IHidServer +0x180, sdk+0x6c3870). The host's controllers keep
+// their npads, so the answer is no and there is nothing to clear
+HLE_FORCE("_ZN2nn3hid34IsSixAxisSensorDeviceNewlyAssignedERKNS0_19SixAxisSensorHandleE", "six-axis device newly assigned: no", unsigned, h_hid_SixNewly, const uint32_t *h) { (void)h; return 0; }
+HLE_FORCE("_ZN2nn3hid39ResetIsSixAxisSensorDeviceNewlyAssignedERKNS0_19SixAxisSensorHandleE", "six-axis device newly assigned: nothing to clear", void, h_hid_SixNewlyReset, const uint32_t *h) { (void)h; }
+// The fusion's gyro bias calibration (0x744 bytes, cleared at sdk+0x6d7f4c and +0x6d766c), kept by the hid service per device (IHidServer +0x170 Load, +0x168 Store). The fusion
+// stores it once it has calibrated the bias at rest (sdk+0x6d7690, result unused) and loads it at initialization as its initial bias guess, marking the bias calibrated (+0x538); a
+// failed load leaves the fusion to learn the bias itself (sdk+0x6d7f70). The host keeps what the game stores for the run; a device with nothing stored fails with 0xd8ca (hid 202-108;
+// which code a console gives there is not known, the only caller tests for 0)
+#define RES_SIX_CAL_NONE (202u | 108u << 9)
+enum { SIX_CAL_SIZE = 0x744 };
+static pthread_mutex_t g_six_cal_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint8_t g_six_cal[SIX_NPADS][SIX_DEVICES][SIX_CAL_SIZE], g_six_cal_have[SIX_NPADS][SIX_DEVICES];
+HLE_FORCE("_ZN2nn3hid37LoadSixAxisSensorCalibrationParameterEPNS0_33SixAxisSensorCalibrationParameterERKNS0_19SixAxisSensorHandleE",
+          "six-axis calibration: what the game stored this run, else none", Result, h_hid_SixCalLoad, void *out, const uint32_t *h) {
+    int slot, dev; Result r = six_handle_slot("LoadSixAxisSensorCalibrationParameter", *h, &slot, &dev);
+    if (r != RES_OK) return r;
+    pthread_mutex_lock(&g_six_cal_mu);
+    r = g_six_cal_have[slot][dev] ? RES_OK : RES_SIX_CAL_NONE;
+    if (r == RES_OK) memcpy(out, g_six_cal[slot][dev], SIX_CAL_SIZE);
+    pthread_mutex_unlock(&g_six_cal_mu);
+    return r;
+}
+HLE_FORCE("_ZN2nn3hid38StoreSixAxisSensorCalibrationParameterERKNS0_19SixAxisSensorHandleERKNS0_33SixAxisSensorCalibrationParameterE",
+          "six-axis calibration: kept for the run", Result, h_hid_SixCalStore, const uint32_t *h, const void *in) {
+    int slot, dev; Result r = six_handle_slot("StoreSixAxisSensorCalibrationParameter", *h, &slot, &dev);
+    if (r != RES_OK) return r;
+    pthread_mutex_lock(&g_six_cal_mu);
+    memcpy(g_six_cal[slot][dev], in, SIX_CAL_SIZE); g_six_cal_have[slot][dev] = 1;
+    pthread_mutex_unlock(&g_six_cal_mu);
+    return RES_OK;
 }
 // The Switch 2's pointer on top of those sensors (Nmouse; Fire Emblem Fortune's Weave initializes it at boot with the 1920x1080 screen it maps the pointer to, main+0x650a24). InitializeNmouse opens the
 // hid service as InitializeJcms does (its Result aborts: sdk+0x6d5340). No controller of the host has the sensor, so there are no handles, and the calls on a handle have nothing to do
