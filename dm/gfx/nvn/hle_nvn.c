@@ -921,11 +921,59 @@ static uint8_t *align8(uint8_t *p) { return (uint8_t *)(((uintptr_t)p + 7) & ~(u
 #define CS_THREADS 16   // small recordings are also counted per guest thread (the first 16 that record one)
 __attribute__((weak)) uint32_t thr_cur_handle(void) { return 0; }   // the host's thread table (hle_thread.c); graphics unit tests have none
 static struct { uint32_t thr; uint64_t recs, bytes, op_n[64], op_b[64]; } g_cs_thr[CS_THREADS];
-static struct { int on; uint64_t bytes, recs, grants, grant_bytes, grant_min, grant_max, cbs, hostseg, op_n[64], op_b[64], frame0, waste, small_recs, small_bytes, sop_n[64], sop_b[64]; } g_cs = { .on = -1 };
+static struct { int on; uint64_t bytes, recs, grants, grant_bytes, grant_min, grant_max, cbs, hostseg, op_n[64], op_b[64], frame0, waste, small_recs, small_bytes, sop_n[64], sop_b[64], est_spans, est_ctl; } g_cs = { .on = -1 };   // est_*: cs_ctl_estimate
 static pthread_mutex_t g_cs_mu = PTHREAD_MUTEX_INITIALIZER;
 uint64_t dm_nvn_frame_count(void);
 static int cs_on(void) { if (g_cs.on < 0) g_cs.on = getenv("DM_NVN_CMDSTAT") != NULL; return g_cs.on; }
 static void cs_op(uint32_t op, uint32_t size) { if (!cs_on() || op >= 64) return; pthread_mutex_lock(&g_cs_mu); g_cs.op_n[op]++; g_cs.op_b[op] += size; pthread_mutex_unlock(&g_cs_mu); }
+// DM_NVN_CMDSTAT, control memory (step 1 of the control-memory plan): per command buffer, what the game gives (AddControlMemory), reads back (the three getters, with the
+// value the host returned last) and asks for (SetControlMemoryCallbackEnabled), and how many of its recordings ended with no control memory given. Kept from boot, not reset
+// with the per-window counts: games add control memory once, at setup. The first CS_CTL_BUFS buffers get a row each, the rest share the last row
+#define CS_CTL_BUFS 32
+enum { CS_GET_USED, CS_GET_FREE, CS_GET_SIZE };
+typedef struct { const cmd_t *cmd; uint64_t adds, bytes, min, max, gets[3], ret[3], recs, recs_bare; int cb_on; } cs_ctl_t;   // cb_on: -1 never set, else the last value set
+static cs_ctl_t g_cs_ctl[CS_CTL_BUFS + 1];
+static cs_ctl_t *cs_ctl_row(const cmd_t *o) {   // under g_cs_mu
+    for (int i = 0; i < CS_CTL_BUFS; i++) {
+        if (g_cs_ctl[i].cmd == o) return &g_cs_ctl[i];
+        if (!g_cs_ctl[i].cmd) { g_cs_ctl[i] = (cs_ctl_t){.cmd = o, .cb_on = -1}; return &g_cs_ctl[i]; }
+    }
+    cs_ctl_t *rest = &g_cs_ctl[CS_CTL_BUFS]; if (!rest->cmd) *rest = (cs_ctl_t){.cmd = o, .cb_on = -1}; return rest;
+}
+static void cs_ctl_add(const cmd_t *o, size_t n) {
+    if (!cs_on()) return; pthread_mutex_lock(&g_cs_mu); cs_ctl_t *r = cs_ctl_row(o);
+    r->adds++; r->bytes += n; if (!r->min || n < r->min) r->min = n; if (n > r->max) r->max = n; pthread_mutex_unlock(&g_cs_mu);
+}
+static size_t cs_ctl_get(const cmd_t *o, int which, size_t value) {   // returns value, so a getter can return through it
+    if (!cs_on()) return value; pthread_mutex_lock(&g_cs_mu); cs_ctl_t *r = cs_ctl_row(o); r->gets[which]++; r->ret[which] = value; pthread_mutex_unlock(&g_cs_mu); return value;
+}
+static void cs_ctl_callback(const cmd_t *o, int on) { if (!cs_on()) return; pthread_mutex_lock(&g_cs_mu); cs_ctl_row(o)->cb_on = on; pthread_mutex_unlock(&g_cs_mu); }
+static void cs_ctl_recorded(const cmd_t *o) {
+    if (!cs_on()) return; pthread_mutex_lock(&g_cs_mu); cs_ctl_t *r = cs_ctl_row(o); r->recs++; r->recs_bare += !o->ctl_size; pthread_mutex_unlock(&g_cs_mu);
+}
+static void cs_ctl_dump(void) {   // under g_cs_mu: one summary line, then the buffers that record most
+    uint64_t bufs = 0, given = 0, adds = 0, bytes = 0, mn = 0, mx = 0, gets[3] = {0}, cb_on = 0, cb_off = 0, recs = 0, bare = 0, bare_bufs = 0;
+    for (int i = 0; i <= CS_CTL_BUFS && g_cs_ctl[i].cmd; i++) {
+        const cs_ctl_t *r = &g_cs_ctl[i]; bufs++; given += r->adds > 0; adds += r->adds; bytes += r->bytes; recs += r->recs; bare += r->recs_bare; bare_bufs += r->recs_bare > 0;
+        if (r->min && (!mn || r->min < mn)) mn = r->min; if (r->max > mx) mx = r->max;
+        for (int k = 0; k < 3; k++) gets[k] += r->gets[k];
+        cb_on += r->cb_on == 1; cb_off += r->cb_on == 0;
+    }
+    if (!bufs) return;
+    LOG("[nvn] control memory since boot: %llu command buffers (%llu given control memory%s): AddControlMemory %llu times, %.1f KB (chunks %llu..%llu bytes); GetControlMemoryUsed / Free / Size called %llu / %llu / %llu times; control callback enabled on %llu, disabled on %llu; recordings %llu, %llu of them with no control memory given (on %llu buffers)",
+        (unsigned long long)bufs, (unsigned long long)given, g_cs_ctl[CS_CTL_BUFS].cmd ? ", the last row sums the buffers past the first 32" : "", (unsigned long long)adds, bytes / 1024.0,
+        (unsigned long long)mn, (unsigned long long)mx, (unsigned long long)gets[0], (unsigned long long)gets[1], (unsigned long long)gets[2], (unsigned long long)cb_on, (unsigned long long)cb_off,
+        (unsigned long long)recs, (unsigned long long)bare, (unsigned long long)bare_bufs);
+    uint8_t shown[CS_CTL_BUFS + 1] = {0};
+    for (int row = 0; row < 8; row++) {
+        int bi = -1; for (int i = 0; i <= CS_CTL_BUFS && g_cs_ctl[i].cmd; i++) if (!shown[i] && (bi < 0 || g_cs_ctl[i].recs + g_cs_ctl[i].adds > g_cs_ctl[bi].recs + g_cs_ctl[bi].adds)) bi = i;
+        if (bi < 0) break; shown[bi] = 1; const cs_ctl_t *r = &g_cs_ctl[bi];
+        LOG("[nvn]   cmd %p%s: %llu recordings (%llu with no control memory); AddControlMemory %llu times, %.1f KB (%llu..%llu); Used / Free / Size read %llu / %llu / %llu times, last returned %llu / %llu / %llu; callback %s",
+            (const void *)r->cmd, bi == CS_CTL_BUFS ? " and later buffers" : "", (unsigned long long)r->recs, (unsigned long long)r->recs_bare, (unsigned long long)r->adds, r->bytes / 1024.0,
+            (unsigned long long)r->min, (unsigned long long)r->max, (unsigned long long)r->gets[0], (unsigned long long)r->gets[1], (unsigned long long)r->gets[2],
+            (unsigned long long)r->ret[0], (unsigned long long)r->ret[1], (unsigned long long)r->ret[2], r->cb_on < 0 ? "never set" : r->cb_on ? "enabled" : "disabled");
+    }
+}
 // Called once per frame (at present), and once early (force) when a buffer's pool is null: a model heap that ran out shows there, often before the 300th frame
 // (docs/reference/memory.md, "Model heaps sized by the host's command record sizes")
 static void cs_dump_ex(int force) {
@@ -941,6 +989,10 @@ static void cs_dump_ex(int force) {
             ks += snprintf(sm + ks, sizeof sm - ks, " op %d: %llu × %.1f bytes = %.1f KB;", bi, (unsigned long long)g_cs.sop_n[bi], (double)g_cs.sop_b[bi] / (double)g_cs.sop_n[bi], g_cs.sop_b[bi] / 1024.0); }
         LOG("[nvn] small recordings (at most %d bytes) up to frame %llu: %llu recordings, %.1f KB, mean %.0f bytes |%s", CS_SMALL, (unsigned long long)f,
             (unsigned long long)g_cs.small_recs, g_cs.small_bytes / 1024.0, (double)g_cs.small_bytes / (double)g_cs.small_recs, sm);
+        uint64_t inl = g_cs.sop_b[OP_END] + g_cs.sop_b[OP_JUMP] + g_cs.sop_b[OP_CALL];
+        LOG("[nvn] small recordings in control memory (design A, estimate): %llu spans, %llu CALLs, %llu segment switches, %llu ENDs = %.1f KB of control tokens, mean %.0f bytes per recording (inline END / JUMP / CALL now: %.1f KB in command memory)",
+            (unsigned long long)g_cs.est_spans, (unsigned long long)g_cs.sop_n[OP_CALL], (unsigned long long)g_cs.sop_n[OP_JUMP], (unsigned long long)g_cs.sop_n[OP_END], g_cs.est_ctl / 1024.0,
+            (double)g_cs.est_ctl / (double)g_cs.small_recs, inl / 1024.0);
         for (int t = 0; t < CS_THREADS && g_cs_thr[t].recs; t++) {   // per guest thread: a model loader's lists apart from the render thread's
             char tl[700]; int kt = 0; uint8_t tu[64] = {0};
             for (int r = 0; r < 8; r++) { int bi = -1; for (int i = 0; i < 64; i++) if (!tu[i] && g_cs_thr[t].op_b[i] && (bi < 0 || g_cs_thr[t].op_b[i] > g_cs_thr[t].op_b[bi])) bi = i; if (bi < 0) break; tu[bi] = 1;
@@ -949,6 +1001,7 @@ static void cs_dump_ex(int force) {
                 (double)g_cs_thr[t].bytes / (double)g_cs_thr[t].recs, tl);
         }
     }
+    cs_ctl_dump();
     int on = g_cs.on; memset(&g_cs, 0, sizeof g_cs); memset(g_cs_thr, 0, sizeof g_cs_thr); g_cs.on = on; g_cs.frame0 = f; pthread_mutex_unlock(&g_cs_mu);
 }
 static void cs_dump(void) { cs_dump_ex(0); }
@@ -1027,6 +1080,7 @@ NVN(nvnCommandBufferAddCommandMemory, void, NVNcommandBuffer *c, const NVNmemory
 }
 NVN(nvnCommandBufferAddControlMemory, void, NVNcommandBuffer *c, void *m, size_t n) {
     (void)m;
+    cs_ctl_add(CB(c), n);
     CB(c)->ctl_size = n;   // The host's recordings contain no control-memory entries; the entire last block remains free.
 }
 // Get space for one record and keep `keep` bytes after it (OP_RESERVE, 0 for the END); if not enough, call back into the game per the NVN convention to add command memory
@@ -1060,26 +1114,39 @@ NVN(nvnCommandBufferBeginRecording, void, NVNcommandBuffer *c) {
 // DM_NVN_CMDSTAT: the records of one finished recording, followed across its JUMPs, counted apart when the recording is small (at most CS_SMALL bytes, END and JUMPs included).
 // Games size model heaps by such per-mesh and per-shape scratch recordings (docs/reference/memory.md, "Model heaps sized by the host's command record sizes").
 // A token list (nvn_obj.h, p_span) is walked the same way, its SPANs' records counted by the same loop bounded by the span's end; its tokens are counted under their own ops
-// (OP_SPAN, OP_JUMP, OP_END), as the inline END and JUMPs are, so the op table tells the control bytes from the records. CALLs are counted, not followed, in both formats
-static void cs_walk(const uint8_t *p, const uint8_t *stop, uint64_t *n, uint64_t *b, uint64_t *total) {
+// (OP_SPAN, OP_JUMP, OP_END), as the inline END and JUMPs are, so the op table tells the control bytes from the records. CALLs are counted, not followed, in both formats.
+// spans: the runs of records a control-memory recording (design A of the control-memory plan) would name with one OP_SPAN each: a run ends at a segment switch (JUMP), a CALL
+// and the END, and in a token list each SPAN is one
+typedef struct { uint64_t n[64], b[64], total, spans; int in_run; } cs_rec_t;
+static void cs_walk(const uint8_t *p, const uint8_t *stop, cs_rec_t *r) {
     for (int k = 0; k < 65536 && (!stop || p < stop); k++) {
         op_hdr h; memcpy(&h, p, sizeof h);
-        if (h.op < 64) { n[h.op]++; b[h.op] += h.size; }
-        *total += h.size;
-        if (h.op == OP_END || !h.size || *total > CS_SMALL) return;
+        if (stop && (h.op == OP_END || h.op == OP_JUMP || h.op == OP_CALL || h.op == OP_SPAN)) return;   // a span holds records only (nq_flatten dies there; a statistic just stops)
+        if (h.op < 64) { r->n[h.op]++; r->b[h.op] += h.size; }
+        r->total += h.size;
+        if (!stop) {
+            int control = h.op == OP_END || h.op == OP_JUMP || h.op == OP_CALL || h.op == OP_SPAN;
+            if (h.op == OP_SPAN || (!control && !r->in_run)) r->spans++;
+            r->in_run = !control;
+        }
+        if (h.op == OP_END || !h.size || r->total > CS_SMALL) return;
         if (h.op == OP_JUMP) { memcpy(&p, p + 8, 8); continue; }
-        if (h.op == OP_SPAN && !stop) { p_span s; memcpy(&s, p + 8, sizeof s); const uint8_t *run = (const uint8_t *)(uintptr_t)s.addr; cs_walk(run, run + s.len, n, b, total); }
+        if (h.op == OP_SPAN && !stop) { p_span s; memcpy(&s, p + 8, sizeof s); const uint8_t *run = (const uint8_t *)(uintptr_t)s.addr; cs_walk(run, run + s.len, r); }
         p += h.size;
     }
 }
+// Control bytes a design-A recording would write for what cs_walk found: 24 per SPAN, 16 per CALL, 16 per segment switch (counted as a control JUMP: an upper bound, since a
+// switch of command memory only closes a span and a control JUMP is needed only where control memory runs out), 8 for the END
+static uint64_t cs_ctl_estimate(const cs_rec_t *r) { return 24 * r->spans + 16 * (r->n[OP_CALL] + r->n[OP_JUMP]) + 8 * r->n[OP_END]; }
 static void cs_recording(const uint8_t *p) {
     if (!cs_on() || !p) return;
-    uint64_t n[64] = {0}, b[64] = {0}, total = 0;
-    cs_walk(p, NULL, n, b, &total);
-    if (total > CS_SMALL) return;
+    cs_rec_t r = {0};
+    cs_walk(p, NULL, &r);
+    if (r.total > CS_SMALL) return;
+    uint64_t *n = r.n, *b = r.b, total = r.total;
     uint32_t thr = thr_cur_handle();
     pthread_mutex_lock(&g_cs_mu);
-    g_cs.small_recs++; g_cs.small_bytes += total;
+    g_cs.small_recs++; g_cs.small_bytes += total; g_cs.est_spans += r.spans; g_cs.est_ctl += cs_ctl_estimate(&r);
     for (int i = 0; i < 64; i++) { g_cs.sop_n[i] += n[i]; g_cs.sop_b[i] += b[i]; }
     for (int t = 0; t < CS_THREADS; t++) if (g_cs_thr[t].thr == thr || !g_cs_thr[t].recs) {
         g_cs_thr[t].thr = thr; g_cs_thr[t].recs++; g_cs_thr[t].bytes += total;
@@ -1092,7 +1159,7 @@ NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
     cmd_t *o = CB(c);
     uint8_t *p = cmd_alloc_keep(o, 8, 0); put_hdr(p, OP_END, 8);   // nothing follows: the END may take the segment's last bytes
     o->recording = 0;
-    cs_recording(o->begin);
+    cs_recording(o->begin); cs_ctl_recorded(o);
     return (NVNcommandHandle)o->begin;
 }
 NVN(nvnCommandBufferIsRecording, NVNboolean, const NVNcommandBuffer *c) { return ((const cmd_t *)c)->recording != 0; }
@@ -2671,9 +2738,9 @@ NVN_NOPROTO(nvnWindowGetNumActiveTextures, int, const NVNwindow *w) { return win
 // signals. Counted per recording, the position stayed at one frame's size (about 18 KB), the ring never freed past it, and after the first 16 MB (about 15 s) the callback waited for ring space forever
 NVN(nvnCommandBufferGetCommandMemoryUsed, size_t, const NVNcommandBuffer *c) { const cmd_t *m = (const cmd_t *)c;
     return m->begin ? (size_t)m->used : 0; }
-NVN(nvnCommandBufferGetControlMemoryUsed, size_t, const NVNcommandBuffer *c) { (void)c; return 0; }
-NVN(nvnCommandBufferGetControlMemoryFree, size_t, const NVNcommandBuffer *c) { return ((const cmd_t *)c)->ctl_size; }
-NVN(nvnCommandBufferGetControlMemorySize, size_t, const NVNcommandBuffer *c) { return ((const cmd_t *)c)->ctl_size; }
+NVN(nvnCommandBufferGetControlMemoryUsed, size_t, const NVNcommandBuffer *c) { return cs_ctl_get((const cmd_t *)c, CS_GET_USED, 0); }
+NVN(nvnCommandBufferGetControlMemoryFree, size_t, const NVNcommandBuffer *c) { return cs_ctl_get((const cmd_t *)c, CS_GET_FREE, ((const cmd_t *)c)->ctl_size); }
+NVN(nvnCommandBufferGetControlMemorySize, size_t, const NVNcommandBuffer *c) { return cs_ctl_get((const cmd_t *)c, CS_GET_SIZE, ((const cmd_t *)c)->ctl_size); }
 // Free bytes of the command memory (DRAGON QUEST XI S, Unreal Engine 4.18): what is left in the current segment
 NVN(nvnCommandBufferGetCommandMemoryFree, size_t, const NVNcommandBuffer *c) { const cmd_t *m = (const cmd_t *)c; return m->cur && m->end > m->cur ? (size_t)(m->end - m->cur) : 0; }
 // Size, as in NVN: the bytes the game last passed to AddCommandMemory (cmd_size), which only the game's own AddCommandMemory changes. Super Smash Bros. Ultimate sorts a pool of
@@ -2681,6 +2748,10 @@ NVN(nvnCommandBufferGetCommandMemoryFree, size_t, const NVNcommandBuffer *c) { c
 // docs/reference/nvn-objects.md, "GetCommandMemorySize read while another thread records"
 NVN(nvnCommandBufferGetCommandMemorySize, size_t, const NVNcommandBuffer *c) { return __atomic_load_n(&((const cmd_t *)c)->cmd_size, __ATOMIC_RELAXED); }
 NVN_NOPROTO(nvnCommandBufferSetCommandMemoryCallbackEnabled, void, NVNcommandBuffer *c, uint32_t on) { (void)c; (void)on; }
+// The host never runs out of control memory (it writes none), so it never calls the out-of-control-memory callback either way; DM_NVN_CMDSTAT records the switch.
+// It reached the unimplemented stub before, which did the same and logged one [RED] line. on is an NVNboolean: the game's code (AAPCS64) need not clear the register's upper
+// bits, which Apple's ABI expects the caller to have done for a byte argument, so only its low byte is read
+NVN_NOPROTO(nvnCommandBufferSetControlMemoryCallbackEnabled, void, NVNcommandBuffer *c, uint32_t on) { cs_ctl_callback(CB(c), (on & 0xff) != 0); }
 
 // nvnProgramSetShadersExt (NVN 55): each stage is 0x18 bytes = NVNshaderData{data, control} + one 8-byte extension field (filled from SMBW main 0x1074ff0).
 // The host identifies stages by the control section and does not use the extension field: convert to plain NVNshaderData and hand it to SetShaders.
