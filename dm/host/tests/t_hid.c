@@ -598,8 +598,42 @@ static void t_motion_hid(void) {
     dm_pad_players(1); g_phone_mode = -1;
 }
 
+// Unintended Home button input protection: one flag per npad, on until the game turns it off (Nintendo Switch Sports Resort asks, then turns it off for each npad)
+static void t_home_protection(void) {
+    const uint32_t no1 = 0, no2 = 1, other = 0x10, handheld = 0x20, bad = 9;
+    CHECK(h_hid_HomeProtIs(&no1) && h_hid_HomeProtIs(&handheld) && h_hid_HomeProtIs(&other), "home protection: on for every npad at first");
+    h_hid_HomeProtEnable(&no1, 0);
+    CHECK(!h_hid_HomeProtIs(&no1) && h_hid_HomeProtIs(&no2), "home protection: turned off for No1 only");
+    h_hid_HomeProtEnable(&handheld, 0); h_hid_HomeProtEnable(&no1, 1);
+    CHECK(!h_hid_HomeProtIs(&handheld) && h_hid_HomeProtIs(&no1), "home protection: Handheld off, No1 on again");
+    h_hid_HomeProtEnable(&bad, 0);
+    CHECK(!h_hid_HomeProtIs(&bad) && h_hid_HomeProtIs(&no2), "home protection: an id that is no npad is refused and changes nothing");
+}
+
+// Npad IMU (Switch 2): the host serves the layer the SDK's sensor fusion reads from. Enabled with the game's buffer, disabled again; no samples yet (the buffer is never written)
+static void t_npad_imu(void) {
+    uint8_t buf[64], samples[2][40]; memset(buf, 0xCD, sizeof buf); memset(samples, 0xAB, sizeof samples);
+    CHECK(!h_hid_ImuIs(), "npad imu: off at first");
+    CHECK(h_hid_ImuEnable(buf, sizeof buf) == 0 && h_hid_ImuIs(), "npad imu: enabled with the game's buffer");
+    CHECK(h_hid_ImuEnable(buf, sizeof buf) != 0 && h_hid_ImuIs(), "npad imu: enabling twice fails, as the SDK's does, and it stays on");
+    CHECK(h_hid_ImuSamples(samples, 2, 0x20) == 0 && samples[0][0] == 0xAB && buf[0] == 0xCD, "npad imu: no samples, nothing written");
+    CHECK(h_hid_ImuDisable() == 0 && !h_hid_ImuIs() && h_hid_ImuSamples(samples, 2, 0) == 0, "npad imu: disabled, still no samples");
+}
+
+// Joy-Con icon decoration colour (Switch 2): no controller of the host is a decorated Joy-Con, so each npad answers 0x4b6ca, which the SDK's own wrapper returns to the game, and the
+// colours are not written; an id that is no npad is refused
+static void t_icon_decoration(void) {
+    uint8_t a[12], b[12]; memset(a, 0xAB, sizeof a); memset(b, 0xAB, sizeof b); const uint32_t no1 = 0, handheld = 0x20, bad = 9;
+    CHECK(h_hid_IconColor(a, &no1) == 0x4b6ca && h_hid_IconColor(a, &handheld) == 0x4b6ca && a[0] == 0xAB, "icon decoration: none for a host controller, colour not written");
+    CHECK(h_hid_IconColors(a, b, &no1) == 0x4b6ca && a[11] == 0xAB && b[0] == 0xAB, "icon decoration: none for either half");
+    CHECK(h_hid_IconColor(a, &bad) != 0x4b6ca && h_hid_IconColor(a, &bad) != 0 && a[0] == 0xAB, "icon decoration: an id that is no npad is refused");
+}
+
 int main(void) {
     CHECK(setenv("DM_RUMBLE_LOG", "1", 1) == 0, "enable rumble diagnostics");
+    t_home_protection();
+    t_npad_imu();
+    t_icon_decoration();
     t_slots();
     t_npads();
     t_script();

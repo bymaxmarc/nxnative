@@ -631,6 +631,35 @@ static void joy_assign(uint32_t id, int single, int keep) {
 HLE_FORCE("_ZN2nn3hid20GetNpadJoyAssignmentERKj", "Joy-Con assignment: what the game set (dual by default)", int, h_hid_GetJoyAssign, const uint32_t *id) { return *id < DM_PLAYERS && (atomic_load(&g_single_mask) >> *id & 1); }
 HLE_FORCE("_ZN2nn3hid30SetNpadJoyAssignmentModeSingleERKj", "Joy-Con single assignment: the pair splits, the left Joy-Con stays", void, h_hid_JoySingle, const uint32_t *id) { joy_assign(*id, 1, 0); }
 HLE_FORCE("_ZN2nn3hid18SwapNpadAssignmentERKjS2_", "swap controller ids; ignored by the host", void, h_hid_Swap, const uint32_t *a, const uint32_t *b) { (void)a; (void)b; }
+// Unintended Home button input protection, one flag per npad (No1..No8, Other, Handheld, as the SDK's own check). Unhooked, the SDK asked the hid service the host does not run and aborted on
+// its error (Result 0x58cca, sdk+0x6ca40c): Nintendo Switch Sports Resort asks for each npad at boot, then turns it off. The host keeps the flag for the game to read back, on until the game
+// turns it off (the game's own use implies it starts on); it has no Home button press to hold back. An id that is no npad (the SDK aborts with 0x58aca) is refused with a red line
+static _Atomic uint8_t g_home_prot_off[10];   // 0..7 = No1..No8, 8 = Other (0x10), 9 = Handheld (0x20)
+static int npad_id_slot(uint32_t id) { return id < 8 ? (int)id : id == 0x10 ? 8 : id == 0x20 ? 9 : -1; }   // the npad ids the SDK's own checks accept, as an index; -1 otherwise
+HLE_FORCE("_ZN2nn3hid44IsUnintendedHomeButtonInputProtectionEnabledERKj", "Home button protection per npad, recorded by the host (on until the game turns it off)", int, h_hid_HomeProtIs, const uint32_t *id) {
+    int k = npad_id_slot(*id);
+    if (k < 0) { LOG("[RED] hid IsUnintendedHomeButtonInputProtectionEnabled: %#x is no npad id", *id); return 0; }
+    return !atomic_load(&g_home_prot_off[k]);
+}
+HLE_FORCE("_ZN2nn3hid41EnableUnintendedHomeButtonInputProtectionERKjb", "Home button protection per npad, recorded by the host", void, h_hid_HomeProtEnable, const uint32_t *id, int on) {
+    int k = npad_id_slot(*id);
+    if (k < 0) { LOG("[RED] hid EnableUnintendedHomeButtonInputProtection: %#x is no npad id", *id); return; }
+    atomic_store(&g_home_prot_off[k], (uint8_t)!(on & 1));   // bool in w1: only its low byte is defined
+}
+// Joy-Con icon decoration colour (Switch 2 SDKs; a 12-byte NpadJoyIconDecorationColor). Unhooked, the SDK read the npad's internal state from hid shared memory the host does not fill,
+// found none and answered 0x58cca, which its wrapper aborts on (Nintendo Switch Sports Resort, sdk+0x6cab6c, once it draws). For an npad whose controller is no decorated Joy-Con the SDK
+// answers 0x4b6ca without writing the colour (sdk+0x6be204), and its wrapper hands that to the game; no controller of the host is one. An id that is no npad aborts in the SDK (0x58aca)
+#define RES_NO_ICON_DECORATION 0x4b6cau
+#define RES_INVALID_NPAD_ID 0x58acau
+static Result icon_decoration(const uint32_t *id) {
+    if (npad_id_slot(*id) >= 0) return RES_NO_ICON_DECORATION;
+    LOG("[RED] hid GetNpadJoyIconDecorationColor: %#x is no npad id", *id);
+    return RES_INVALID_NPAD_ID;
+}
+HLE_FORCE("_ZN2nn3hid29GetNpadJoyIconDecorationColorEPNS0_26NpadJoyIconDecorationColorERKj", "Joy-Con icon decoration: none, no host controller is a decorated Joy-Con",
+          Result, h_hid_IconColor, void *out, const uint32_t *id) { (void)out; return icon_decoration(id); }
+HLE_FORCE("_ZN2nn3hid29GetNpadJoyIconDecorationColorEPNS0_26NpadJoyIconDecorationColorES2_RKj", "Joy-Con icon decoration of both halves: none, no host controller is a decorated Joy-Con",
+          Result, h_hid_IconColors, void *left, void *right, const uint32_t *id) { (void)left; (void)right; return icon_decoration(id); }
 HLE_FORCE("_ZN2nn3hid21StartLrAssignmentModeEv", "L/R assignment mode; ignored by the host", void, h_hid_LrStart, void) {}
 HLE_FORCE("_ZN2nn3hid20StopLrAssignmentModeEv", "L/R assignment mode; ignored by the host", void, h_hid_LrStop, void) {}
 // Controller applet (system UI): report the connected players, with player 1's controller selected. ControllerSupportResultInfo = { int playerCount; uint32_t selectedId; };
@@ -894,6 +923,31 @@ HLE_FORCE("_ZN2nn3hid12GetJcmsStateEPNS0_9JcmsStateERKNS0_10JcmsHandleE", "Joy-C
           void, h_hid_JcmsState, void *out, const uint32_t *h) { if (out) { memset(out, 0, 32); if (h) jcms_copy(out, 1, *h); } }
 // The system setting for the mouse pointer's speed (System Settings, Mouse): the default, 1
 HLE_FORCE("_ZN2nn3hid25GetMousePointerSpeedScaleEv", "mouse pointer speed setting: the default, 1.0", float, h_hid_MouseSpeed, void) { return 1.0f; }
+// Npad IMU (Switch 2 SDKs): the six-axis samples the SDK's own sensor fusion reads (Enable/UpdateSensorFusion → GetNpadImuSamples → nn::imu::FullSensorState). EnableNpadImu gives the
+// hid service the game's buffer as transfer memory, which the host does not serve: Nintendo Switch Sports Resort aborted in InitializeSensorFusion (Result 0xe15, sdk+0x6d6948). These four
+// calls are the only users of the SDK's IMU state (sdk+0x1056c48), so the host keeps that state here: on with the game's buffer, which no service writes, and no samples yet, as on a
+// console before a controller's first report. The fusion then has nothing to feed on. A NpadImuSample is 0x28 bytes (sdk+0x6ca8b8); filling them from the host's motion is open
+#define RES_NPAD_IMU_ENABLED 0x2908cau   // what the SDK's EnableNpadImu answers while it is already on (sdk+0x6ca600)
+static pthread_mutex_t g_imu_lock = PTHREAD_MUTEX_INITIALIZER;
+static void *g_imu_buf;
+HLE_FORCE("_ZN2nn3hid13EnableNpadImuEPvm", "npad IMU on with the game's buffer; no hid service writes it", Result, h_hid_ImuEnable, void *buf, uint64_t size) {
+    (void)size; pthread_mutex_lock(&g_imu_lock);
+    Result r = g_imu_buf ? RES_NPAD_IMU_ENABLED : 0;
+    if (!r) g_imu_buf = buf;
+    pthread_mutex_unlock(&g_imu_lock);
+    return r;
+}
+HLE_FORCE("_ZN2nn3hid14DisableNpadImuEv", "npad IMU off", Result, h_hid_ImuDisable, void) {
+    pthread_mutex_lock(&g_imu_lock); g_imu_buf = NULL; pthread_mutex_unlock(&g_imu_lock);
+    return 0;
+}
+HLE_FORCE("_ZN2nn3hid16IsNpadImuEnabledEv", "npad IMU state as the host keeps it", int, h_hid_ImuIs, void) {
+    pthread_mutex_lock(&g_imu_lock); int on = g_imu_buf != NULL; pthread_mutex_unlock(&g_imu_lock);
+    return on;
+}
+HLE_FORCE("_ZN2nn3hid17GetNpadImuSamplesEPNS0_13NpadImuSampleEiNS0_13NpadImuHandleE", "npad IMU samples: none yet (no motion reaches this path on the host)", int, h_hid_ImuSamples, void *out, int n, uint32_t handle) {
+    (void)out; (void)n; (void)handle; return 0;
+}
 // The Switch 2's pointer on top of those sensors (Nmouse; Fire Emblem Fortune's Weave initializes it at boot with the 1920x1080 screen it maps the pointer to, main+0x650a24). InitializeNmouse opens the
 // hid service as InitializeJcms does (its Result aborts: sdk+0x6d5340). No controller of the host has the sensor, so there are no handles, and the calls on a handle have nothing to do
 HLE_FORCE("_ZN2nn3hid16InitializeNmouseEPvmii", "Joy-Con mouse pointer: no hid service; front ends may turn the sensors on", void, h_hid_NmouseInit, void *work, uint64_t size, int w, int h) { (void)work; (void)size; (void)w; (void)h; atomic_fetch_or(&g_jcms_wanted, 2u); }
