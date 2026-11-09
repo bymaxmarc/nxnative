@@ -26,7 +26,8 @@ static int hid_clock_gettime(clockid_t clock, struct timespec *ts) { (void)clock
 static int hid_usleep(useconds_t usec) { (void)usec; if (script_hold) script_hold(); return 0; }
 #define CHECK(c, msg) do { checks++; if (!(c)) { fails++; fprintf(stderr, "FAIL: %s (line %d)\n", msg, __LINE__); } } while (0)
 int dm_opmode(void) { return g_mode; }
-uint64_t guest_ns(void) { return 1000000000ull; }
+static uint64_t guest_now = 1000000000ull;   // the guest clock (t_npad_imu_samples moves it)
+uint64_t guest_ns(void) { return guest_now; }
 uint64_t now_ns(void) { return motion_now; }
 static uint64_t test_frame;   // presented frames (t_rec moves it)
 uint64_t dm_guest_frame(void) { return test_frame; }
@@ -616,9 +617,108 @@ static void t_npad_imu(void) {
     CHECK(!h_hid_ImuIs(), "npad imu: off at first");
     CHECK(h_hid_ImuEnable(buf, sizeof buf) == 0 && h_hid_ImuIs(), "npad imu: enabled with the game's buffer");
     CHECK(h_hid_ImuEnable(buf, sizeof buf) != 0 && h_hid_ImuIs(), "npad imu: enabling twice fails, as the SDK's does, and it stays on");
-    CHECK(h_hid_ImuSamples(samples, 2, 0x20) == 0 && samples[0][0] == 0xAB && buf[0] == 0xCD, "npad imu: no samples, nothing written");
+    CHECK(h_hid_ImuSamples(samples, 2, 0x20) == 0 && samples[0][0] == 0xAB && buf[0] == 0xCD, "npad imu: a handle with no sensor (style bit 32) has no samples, nothing written");
     CHECK(h_hid_ImuDisable() == 0 && !h_hid_ImuIs() && h_hid_ImuSamples(samples, 2, 0) == 0, "npad imu: disabled, still no samples");
     CHECK(h_hid_ImuEnable(NULL, 0) == 0 && h_hid_ImuIs() && h_hid_ImuDisable() == 0 && !h_hid_ImuIs(), "npad imu: the state is its own, not the buffer pointer");
+}
+
+// Npad IMU samples (Switch 2): stateless, as the console's ring in shared memory. A call returns the newest min(n, 16) 5 ms ticks on the guest clock, oldest first, numbered by absolute
+// tick + 1; the SDK's fusion skips numbers it has taken (sdk+0x6d7198), so a repeated tick is harmless and every reader gets every tick. Units are the fusion's: m/s^2 and rad/s, with the
+// signs it undoes (sdk+0x6d7334, +0x6d74a0)
+typedef struct { int64_t sampling, delta_ns; float gyro[3], acc[3]; } TestImuSample;
+_Static_assert(sizeof(TestImuSample) == 0x28, "NpadImuSample");
+static int imu_numbered(const TestImuSample *s, int k, int64_t first) {   // k samples numbered first, first + 1, ... each 5 ms apart
+    for (int i = 0; i < k; i++) if (s[i].sampling != first + i || s[i].delta_ns != 5000000) return 0;
+    return 1;
+}
+static uint32_t imu_handle; static _Atomic int imu_reader_ok;
+static void *imu_reader(void *arg) {   // reads the newest 16 at a fixed guest time: ticks 585..600, numbers 586..601
+    (void)arg; TestImuSample s[16]; int ok = 1;
+    for (int r = 0; r < 50; r++) ok &= h_hid_ImuSamples(s, 16, imu_handle) == 16 && imu_numbered(s, 16, 586);
+    if (ok) atomic_fetch_add(&imu_reader_ok, 1);
+    return NULL;
+}
+static void t_npad_imu_samples(void) {
+    g_mode = 1; dm_pad_players(1); g_phone_mode = 0;
+    atomic_store(&g_shake_t0, 0); atomic_store(&g_shake_end, 0);
+    uint32_t id = 0, h; CHECK(h_hid_SixHandles(&h, 1, &id, STYLE_FULLKEY) == 1, "imu: player 1's sensor handle (the fusion's NpadImuHandle is the six-axis handle, sdk+0x6d7078)");
+    imu_handle = h;
+    TestImuSample s[40], t[40]; memset(s, 0xAB, sizeof s);
+    guest_now = 2000000000ull;   // tick 400
+    CHECK(h_hid_ImuSamples(s, 16, h) == 0 && s[0].sampling == (int64_t)0xABABABABABABABABull, "imu: off, no samples and nothing written");
+    uint8_t ring[64]; CHECK(h_hid_ImuEnable(ring, sizeof ring) == 0, "imu: on");
+    CHECK(h_hid_ImuSamples(s, 1, h) == 1 && imu_numbered(s, 1, 401), "imu: numbered by absolute tick + 1");
+    CHECK(s[0].acc[0] == 0 && s[0].acc[1] == 0 && fabsf(s[0].acc[2] - 9.80665f) < 1e-5f, "imu: at rest (0, 0, -1) G reads (0, 0, +9.80665) m/s^2");
+    CHECK(s[0].gyro[0] == 0 && s[0].gyro[1] == 0 && s[0].gyro[2] == 0, "imu: at rest no rotation");
+    CHECK(h_hid_ImuSamples(s, 16, h) == 16 && imu_numbered(s, 16, 386), "imu: the newest 16 ending at the current tick, oldest first");
+    CHECK(h_hid_ImuSamples(t, 16, h) == 16 && !memcmp(s, t, 16 * sizeof *s), "imu: the same tick again gives the same numbers (the fusion skips them)");
+    CHECK(h_hid_ImuSamples(s, 4, h) == 4 && imu_numbered(s, 4, 398), "imu: at most n: the newest 4");
+    CHECK(h_hid_ImuSamples(s, 40, h) == 16 && imu_numbered(s, 16, 386), "imu: never more than the 16 the SDK's ring holds");
+    guest_now += 4000000; CHECK(h_hid_ImuSamples(s, 1, h) == 1 && imu_numbered(s, 1, 401), "imu: less than a tick later: the same newest tick");
+    guest_now += 1000000 + 2 * 5000000; CHECK(h_hid_ImuSamples(s, 16, h) == 16 && imu_numbered(s, 16, 389), "imu: three ticks later the window moves by three");
+    CHECK(h_hid_ImuSamples(s, 0, h) == 0 && h_hid_ImuSamples(NULL, 4, h) == 0, "imu: no room: none");
+    guest_now = 2000000; CHECK(h_hid_ImuSamples(s, 16, h) == 1 && imu_numbered(s, 1, 1), "imu: at the clock's start, the first tick only, number 1");
+    guest_now = 2015000000ull;
+
+    // A live controller: its acceleration and rotation, converted. 0.5 rev/s about z is pi rad/s; the fusion negates the gyro and the acceleration's output scale (G = -m/s^2 / g)
+    float a[3] = {0.5f, 0, -0.8660254f}, w[3] = {0, 0, 3.14159265f};
+    dm_motion_set(0, a, w);
+    CHECK(h_hid_ImuSamples(s, 2, h) == 2 && imu_numbered(s, 2, 403), "imu: live motion keeps the numbering");
+    CHECK(fabsf(s[1].acc[0] + 0.5f * 9.80665f) < 1e-4f && fabsf(s[1].acc[2] - 0.8660254f * 9.80665f) < 1e-4f, "imu: live acceleration, -G x 9.80665");
+    CHECK(fabsf(s[1].gyro[2] + 3.14159265f) < 1e-4f && s[1].gyro[0] == 0, "imu: live rotation, -rev/s x 2 pi");
+    // DM_IMU_ACC_SIGN / DM_IMU_GYRO_SIGN = 1 keep the host's signs
+    setenv("DM_IMU_ACC_SIGN", "1", 1); setenv("DM_IMU_GYRO_SIGN", "1", 1); imu_env_read();
+    CHECK(h_hid_ImuSamples(s, 1, h) == 1 && fabsf(s[0].acc[0] - 0.5f * 9.80665f) < 1e-4f && fabsf(s[0].gyro[2] - 3.14159265f) < 1e-4f, "imu: both signs flipped by the switches");
+    setenv("DM_IMU_GYRO_SIGN", "-1", 1); imu_env_read();
+    CHECK(h_hid_ImuSamples(s, 1, h) == 1 && s[0].acc[0] > 0 && s[0].gyro[2] < 0, "imu: each sign on its own");
+    unsetenv("DM_IMU_ACC_SIGN"); unsetenv("DM_IMU_GYRO_SIGN"); imu_env_read();
+    dm_motion_clear(0);
+
+    // Another device reads the same clock; a handle whose controller is not connected has no samples
+    uint32_t right = h | 1u << 16;
+    CHECK(h_hid_ImuSamples(s, 2, right) == 2 && imu_numbered(s, 2, 403), "imu: another device index, the same absolute numbers");
+    uint32_t no4 = 3u << 8; memset(s, 0xAB, sizeof s);
+    CHECK(h_hid_ImuSamples(s, 16, no4) == 0 && s[0].delta_ns == (int64_t)0xABABABABABABABABull, "imu: an npad with no controller: no samples, nothing written");
+
+    // Two readers each get the same newest ticks, also at once from two threads
+    guest_now = 3000000000ull;   // tick 600
+    CHECK(h_hid_ImuSamples(s, 16, h) == 16 && h_hid_ImuSamples(t, 16, h) == 16 && !memcmp(s, t, 16 * sizeof *s) && imu_numbered(s, 16, 586), "imu: two readers, the same ticks");
+    atomic_store(&imu_reader_ok, 0);
+    pthread_t th[2]; for (int i = 0; i < 2; i++) pthread_create(&th[i], NULL, imu_reader, NULL);
+    for (int i = 0; i < 2; i++) pthread_join(th[i], NULL);
+    CHECK(atomic_load(&imu_reader_ok) == 2, "imu: concurrent readers each get every tick");
+
+    // Off: none; on again, numbering goes on from absolute time
+    CHECK(h_hid_ImuDisable() == 0 && h_hid_ImuSamples(s, 16, h) == 0, "imu: disabled, no samples");
+    guest_now += 30 * 5000000ull; h_hid_ImuEnable(ring, sizeof ring);
+    CHECK(h_hid_ImuSamples(s, 16, h) == 16 && imu_numbered(s, 16, 616), "imu: on again, numbered by absolute time");
+    h_hid_ImuDisable(); guest_now = 1000000000ull; dm_pad_players(1); g_phone_mode = -1;
+}
+
+// Six-axis sensor information the fusion's initialization reads (sdk+0x6d7e28): 0xc8 bytes (sdk+0x6d7e58 copies them), gyro half then acceleration half
+static void t_six_ic_info(void) {
+    uint8_t ic[0xd0]; memset(ic, 0xAB, sizeof ic); uint32_t h = 0;
+    float f[0xc8 / 4];
+    CHECK(h_hid_SixIcInfo(ic, &h) == 0, "ic information: success");
+    memcpy(f, ic, sizeof f);
+    CHECK(f[0] == 2000 && f[0x64 / 4] == 8, "ic information: gyro range 2000 deg/s, acceleration range 8 G");
+    CHECK(f[0x04 / 4] == -10 && f[0x10 / 4] == 10 && f[0x68 / 4] == -0.0612f && f[0x74 / 4] == 0.0612f, "ic information: zero-offset bounds");
+    CHECK(f[0x1c / 4] == 0.95f && f[0x20 / 4] == -0.003f && f[0x40 / 4] == 1.05f && f[0x44 / 4] == 0.003f && f[0x60 / 4] == 1.05f, "ic information: gyro sensitivity bounds");
+    CHECK(f[0x80 / 4] == 0.95f && f[0xa4 / 4] == 1.05f && f[0xa8 / 4] == 0.003f && f[0xc4 / 4] == 1.05f, "ic information: acceleration sensitivity bounds");
+    CHECK(ic[0xc8] == 0xAB, "ic information: nothing past 0xc8 written");
+    CHECK(!h_hid_SixNewly(&h), "newly assigned: no");
+    h_hid_SixNewlyReset(&h);
+    // Calibration: nothing stored fails (the fusion then learns the gyro bias itself); a stored parameter reads back for its device only
+    uint8_t cal[0x744], back[0x744]; memset(back, 0xAB, sizeof back);
+    for (size_t i = 0; i < sizeof cal; i++) cal[i] = (uint8_t)i;
+    CHECK(h_hid_SixCalLoad(back, &h) != 0 && back[0] == 0xAB, "calibration: none stored, fails and writes nothing");
+    CHECK(h_hid_SixCalStore(&h, cal) == 0, "calibration: stored");
+    CHECK(h_hid_SixCalLoad(back, &h) == 0 && !memcmp(back, cal, sizeof cal), "calibration: reads back");
+    uint32_t other = 1u << 16; memset(back, 0xAB, sizeof back);
+    CHECK(h_hid_SixCalLoad(back, &other) != 0 && back[0] == 0xAB, "calibration: another device has none");
+    uint32_t bad = 9u << 8, dev3 = 3u << 16;   // as the SDK's VerifyValidSixAxisSensorHandle (sdk+0x6d8440)
+    CHECK(h_hid_SixCalStore(&bad, cal) == 0x58aca && h_hid_SixCalLoad(back, &bad) == 0x58aca, "calibration: an id that is no npad is refused");
+    CHECK(h_hid_SixCalStore(&dev3, cal) == 0xd6ca && back[0] == 0xAB, "calibration: a device index past 2 is refused");
 }
 
 // Joy-Con icon decoration colour (Switch 2): no controller of the host is a decorated Joy-Con, so each npad answers 0x4b6ca, which the SDK's own wrapper returns to the game, and the
@@ -645,6 +745,8 @@ int main(void) {
     t_motion_threads();
     t_motion_live();
     t_motion_hid();
+    t_npad_imu_samples();
+    t_six_ic_info();
     t_rec();
     {   // Nmouse with no device (SDK 21's forms): the pointer range is kept, the merged handle 0 takes settings, the standard mouse and the handle queries report nothing
         int w = 0, h = 0; uint64_t std = 7; uint32_t npad = 9;
