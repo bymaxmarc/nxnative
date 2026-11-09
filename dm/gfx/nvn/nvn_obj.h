@@ -112,8 +112,21 @@ enum {
     OP_BIND_PROGRAM, OP_BIND_STATE, OP_BIND_VATTR, OP_BIND_VSTREAM, OP_BIND_VBUF,
     OP_BIND_UBO, OP_BIND_SSBO, OP_BIND_TEX, OP_BIND_SAMP,
     OP_STENCIL, OP_POLY_OFFSET, OP_DRAW, OP_DRAW_IDX, OP_DISPATCH, OP_BARRIER,
-    OP_SET_TEX_POOL, OP_SET_SAMP_POOL, OP_COPY_B2T, OP_COPY_STRIDE, OP_BLEND_COLOR, OP_COPY_T2B, OP_BIND_IMG, OP_COPY_T2T, OP_RESET_COUNTER, OP_CLEAR_TEX, OP_CLEAR_BUF, OP_DEPTH_CLAMP, OP_RENDER_COND, OP_FENCE_SYNC, OP_TF_BIND, OP_TF_STATE, OP_RAST_DISCARD, OP_VP_SWIZZLE, OP_BIND_TEX1, OP_PRIM_RESTART, OP_BIND_UBO_SMALL, OP_BIND_VBUF1, OP_DRAW_TEX, OP_ALPHA_REF, OP_PUSH_CONST, OP_DLSS, OP_MULTI_DRAW, OP_WAIT_EVENT, OP_WAIT_SYNC, OP_COUNT_
+    OP_SET_TEX_POOL, OP_SET_SAMP_POOL, OP_COPY_B2T, OP_COPY_STRIDE, OP_BLEND_COLOR, OP_COPY_T2B, OP_BIND_IMG, OP_COPY_T2T, OP_RESET_COUNTER, OP_CLEAR_TEX, OP_CLEAR_BUF, OP_DEPTH_CLAMP, OP_RENDER_COND, OP_FENCE_SYNC, OP_TF_BIND, OP_TF_STATE, OP_RAST_DISCARD, OP_VP_SWIZZLE, OP_BIND_TEX1, OP_PRIM_RESTART, OP_BIND_UBO_SMALL, OP_BIND_VBUF1, OP_DRAW_TEX, OP_ALPHA_REF, OP_PUSH_CONST, OP_DLSS, OP_MULTI_DRAW, OP_WAIT_EVENT, OP_WAIT_SYNC,
+    OP_SPAN,   // a token of a token-list handle (p_span, below); appended so the numbers of the records before it, which captures store, stay as they were
+    OP_COUNT_
 };
+// Token-list command handles, groundwork for control memory (not recorded yet). NVN keeps a command buffer's control words (its GPFIFO entries: jumps, calls, the end of a
+// recording) in control memory and only commands in command memory, so GetCommandMemoryUsed counts commands alone; the host writes its END, JUMP and CALL inline between the
+// records instead, and games that size heaps by that count get the host's control bytes in it (docs/reference/memory.md, "Model heaps sized by the host's command record
+// sizes"). A handle whose first word is OP_SPAN is a token list, which will live in control memory: a sequence of
+//   OP_SPAN {addr, len}: the command records in [addr, addr + len), records only (no END, JUMP, CALL or SPAN among them);
+//   OP_CALL {handle}: call another handle, of either format;
+//   OP_JUMP {target}: the list goes on at target (the next control chunk);
+//   OP_END: the end of the list.
+// Any other handle is an inline stream, as before: records with END, JUMP and CALL between them. nq_flatten (nvn_queue.inc) expands both into the queue's flat copy, which
+// carries no token, so replay and the capture never see one; cs_recording (hle_nvn.c) counts the records inside the spans
+typedef struct { uint64_t addr, len; } p_span;
 // Payload (immediately follows op_hdr)
 typedef struct {
     uint64_t ind, cnt, ibuf;

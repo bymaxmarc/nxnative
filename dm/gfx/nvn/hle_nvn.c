@@ -1058,18 +1058,24 @@ NVN(nvnCommandBufferBeginRecording, void, NVNcommandBuffer *c) {
     o->recording = 2;   // 2: recording, no command yet (cmd_alloc sets begin)
 }
 // DM_NVN_CMDSTAT: the records of one finished recording, followed across its JUMPs, counted apart when the recording is small (at most CS_SMALL bytes, END and JUMPs included).
-// Games size model heaps by such per-mesh and per-shape scratch recordings (docs/reference/memory.md, "Model heaps sized by the host's command record sizes")
+// Games size model heaps by such per-mesh and per-shape scratch recordings (docs/reference/memory.md, "Model heaps sized by the host's command record sizes").
+// A token list (nvn_obj.h, p_span) is walked the same way, its SPANs' records counted by the same loop bounded by the span's end; its tokens are counted under their own ops
+// (OP_SPAN, OP_JUMP, OP_END), as the inline END and JUMPs are, so the op table tells the control bytes from the records. CALLs are counted, not followed, in both formats
+static void cs_walk(const uint8_t *p, const uint8_t *stop, uint64_t *n, uint64_t *b, uint64_t *total) {
+    for (int k = 0; k < 65536 && (!stop || p < stop); k++) {
+        op_hdr h; memcpy(&h, p, sizeof h);
+        if (h.op < 64) { n[h.op]++; b[h.op] += h.size; }
+        *total += h.size;
+        if (h.op == OP_END || !h.size || *total > CS_SMALL) return;
+        if (h.op == OP_JUMP) { memcpy(&p, p + 8, 8); continue; }
+        if (h.op == OP_SPAN && !stop) { p_span s; memcpy(&s, p + 8, sizeof s); const uint8_t *run = (const uint8_t *)(uintptr_t)s.addr; cs_walk(run, run + s.len, n, b, total); }
+        p += h.size;
+    }
+}
 static void cs_recording(const uint8_t *p) {
     if (!cs_on() || !p) return;
     uint64_t n[64] = {0}, b[64] = {0}, total = 0;
-    for (int k = 0; k < 65536; k++) {
-        op_hdr h; memcpy(&h, p, sizeof h);
-        if (h.op < 64) { n[h.op]++; b[h.op] += h.size; }
-        total += h.size;
-        if (h.op == OP_END || !h.size || total > CS_SMALL) break;
-        if (h.op == OP_JUMP) { memcpy(&p, p + 8, 8); continue; }
-        p += h.size;
-    }
+    cs_walk(p, NULL, n, b, &total);
     if (total > CS_SMALL) return;
     uint32_t thr = thr_cur_handle();
     pthread_mutex_lock(&g_cs_mu);

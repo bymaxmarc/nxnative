@@ -176,14 +176,19 @@ static void nq_start(void) { pthread_t t; if(pthread_create(&t,NULL,nq_worker,NU
 static nq_node *nq_append(nq_job *j,unsigned kind) { nq_node *n=calloc(1,sizeof *n); if(!n) die("queue continuation allocation failed"); n->kind=kind; if(j->last) j->last->next=n; else j->first=n; j->last=n; return n; }
 static void nq_bytes(nq_node *n,const void *bytes,size_t length) { if(n->length+length>n->capacity) { n->capacity=(n->length+length+4095)&~(size_t)4095; n->bytes=realloc(n->bytes,n->capacity); if(!n->bytes) die("queue commands allocation failed"); } memcpy(n->bytes+n->length,bytes,length); n->length+=length; } // NOLINT(bugprone-suspicious-realloc-usage): allocation failure aborts, so the old buffer cannot leak into a continuing process
 static void nq_end(nq_job *j) { if(j->last && j->last->kind==NQ_COMMANDS && !j->last->closed) { op_hdr end={OP_END,8}; nq_bytes(j->last,&end,8); j->last->closed=1; } }
-static void nq_flatten(nq_job *j,const uint8_t *p,unsigned depth) {
+// Copies the commands of a handle into the job. Both handle formats (nvn_obj.h, p_span) take this one loop: an inline stream (stop NULL) runs to its END through JUMPs and CALLs,
+// and a token list is such a stream whose items are SPAN tokens instead of records. A span is walked by the same loop, bounded by stop: it holds records only, so a control op
+// inside it, or a record running past its end, means a corrupt list
+static void nq_flatten(nq_job *j,const uint8_t *p,const uint8_t *stop,unsigned depth) {
     if(depth>64) die("NVN command call nesting exceeds64");
-    for(;;) {
+    while(!stop || p!=stop) {   // an inline stream ends only at its END (a NULL target faults as it always did)
         op_hdr h; memcpy(&h,p,8); if(h.size<8 || h.size&7) die("invalid NVN command size"); const uint8_t *a=p+8;
+        if(stop && (h.size>(uintptr_t)(stop-p) || h.op==OP_END || h.op==OP_JUMP || h.op==OP_CALL || h.op==OP_SPAN)) die("NVN command span: op %u (%u bytes) at %p is not a record within the span",h.op,h.size,(const void *)p);
         if(h.op==OP_END) return;
         if(h.op==OP_JUMP) { memcpy(&p,a,8); continue; }
-        if(h.op==OP_CALL) { const uint8_t *called; memcpy(&called,a,8); nq_flatten(j,called,depth+1); p+=h.size; continue; }
-        if(h.op==OP_WAIT_EVENT || h.op==OP_WAIT_SYNC || h.op==OP_FENCE_SYNC) {
+        if(h.op==OP_CALL) { const uint8_t *called; memcpy(&called,a,8); nq_flatten(j,called,NULL,depth+1); }
+        else if(h.op==OP_SPAN) { p_span s; memcpy(&s,a,sizeof s); const uint8_t *run=(const uint8_t *)(uintptr_t)s.addr; nq_flatten(j,run,run+s.len,depth); }
+        else if(h.op==OP_WAIT_EVENT || h.op==OP_WAIT_SYNC || h.op==OP_FENCE_SYNC) {
             nq_end(j); nq_node *n=nq_append(j,h.op==OP_WAIT_EVENT?NQ_EVENT:h.op==OP_WAIT_SYNC?NQ_SYNC:NQ_FENCE);
             if(h.op==OP_WAIT_EVENT) { memcpy(&n->event,a,8); memcpy(&n->mode,a+8,4); memcpy(&n->value,a+12,4); }
             else { memcpy(&n->sync_source,a,8); if(h.op==OP_FENCE_SYNC) n->receipt=nq_new(); }
@@ -202,7 +207,7 @@ void nvn_queue_submit(queue_t *q,int count,const uint64_t *handles) {
     j->objects.klen=16; j->frame=dm_nvn_frame_count();
     // No scheduler lock while copying descriptors or resolving shader libraries.
     dm_host_mutex_lock(&g_sub_mu); void *pool=objc_autoreleasePoolPush(); dm_host_work++; mtl_prepare(); dm_host_work--; nq_cost cost=nq_cost_begin();
-    for(int i=0;i<count;i++) nq_flatten(j,(const uint8_t *)(uintptr_t)handles[i],0); nq_end(j);
+    for(int i=0;i<count;i++) nq_flatten(j,(const uint8_t *)(uintptr_t)handles[i],NULL,0); nq_end(j);
     nq_cost_end(cost); objc_autoreleasePoolPop(pool); pthread_mutex_unlock(&g_sub_mu);
     int waits=0; for(nq_node *node=j->first;node;node=node->next) waits|=node->kind==NQ_EVENT || node->kind==NQ_SYNC;
     nvn_cap_queue(q->serial,waits);

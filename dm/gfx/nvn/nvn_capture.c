@@ -33,7 +33,7 @@ CAP_SIZE(p_render_cond, 16); CAP_OFF(p_render_cond, mode, 0); CAP_OFF(p_render_c
 CAP_SIZE(p_multi_draw, 48); CAP_OFF(p_multi_draw, ind, 0); CAP_OFF(p_multi_draw, cnt, 8); CAP_OFF(p_multi_draw, ibuf, 16);
 CAP_OFF(p_multi_draw, stride, 24); CAP_OFF(p_multi_draw, max, 32); CAP_OFF(p_multi_draw, prim, 36); CAP_OFF(p_multi_draw, itype, 40);
 _Static_assert(OP_MULTI_DRAW == 55, "keep existing capture op numbers stable");
-_Static_assert(OP_COUNT_ == 58, "nvn_capture.c: a record op was added or removed: give it a case in cap_rec_fields");
+_Static_assert(OP_COUNT_ == 59, "nvn_capture.c: a record op was added or removed: give it a case in cap_rec_fields");
 
 #define MULTI_DRAW_LAYOUT "op 55 p_multi_draw 48 ind 0 cnt 8 ibuf 16 stride 24 max 32 prim 36 itype 40\n"
 // Copy strides travel after a copy's texture snapshot (p_copy_strides) instead of as OP_COPY_STRIDE records; the replay still takes OP_COPY_STRIDE from older captures
@@ -97,6 +97,7 @@ int cap_rec_fields(uint32_t op, uint8_t *payload, uint32_t size, const cap_ops *
         case OP_DEPTH_CLAMP: case OP_RAST_DISCARD: case OP_VP_SWIZZLE: case OP_PRIM_RESTART: case OP_ALPHA_REF: case OP_PUSH_CONST: case OP_DRAW_TEX:   // OP_DRAW_TEX: a texture handle, read through the pools at replay
             return 1;
         case OP_JUMP: case OP_CALL: return HAS(0) && ops->obj(ctx, CAP_K_SEG, F(0), payload, (uint32_t)plen);
+        case OP_SPAN: return 0;   // a token-list token: nq_flatten expands token lists into the flat copy the capture reads, so format 1 has no layout for it
         case OP_SIGNAL_EVENT: return HAS(0) && ops->addr(ctx, F(0), 4, 1);   // volatile uint32_t *val, mode, value
         case OP_WAIT_EVENT: return HAS(0) && ops->addr(ctx, F(0), 4, 0);
         case OP_REPORT_COUNTER: return HAS(8) && ops->addr(ctx, F(8), 16, 1);  // type, address of the 16-byte report

@@ -253,6 +253,13 @@ A game may tell NVN objects apart by their bytes, without an NVN call. A host re
 - **Fix:** `cmd_t` records the size of the last `AddControlMemory` block and returns it from both `GetControlMemoryFree` and `GetControlMemorySize`; `GetControlMemoryUsed` stays 0. `t_nvn` checks the values before any block, after one, after a recording and after a smaller block replaces it.
 - **Found on:** South Park: The Fractured But Whole 1.05, whose port is [PR #662](https://github.com/seedds/nxnative/pull/662) (not yet in the games table). With the getters implemented it reached the title, menu, a save and character customization on the Mac; with them returning 0 it also progressed, but submitted commands at a different rate.
 
+### Token-list command handles (groundwork for control memory)
+
+- **Why:** NVN keeps a command buffer's control words (jumps, calls, the end of a recording) in control memory, so `GetCommandMemoryUsed` counts commands alone. The host writes `OP_END`, `OP_JUMP` and `OP_CALL` inline between its records, so games that size heaps by that count also pay for the host's control bytes ([Model heaps sized by the host's command record sizes](memory.md#model-heaps-sized-by-the-hosts-command-record-sizes)). Moving them to the game's control memory needs a handle format that keeps them apart from the records.
+- **Format** (`nvn_obj.h`, `OP_SPAN` and `p_span`): a handle whose first record is `OP_SPAN` is a token list: `OP_SPAN {addr, len}` (the command records in `[addr, addr + len)`, records only), `OP_CALL` (another handle of either format), `OP_JUMP` (the list goes on at the target) and `OP_END`. Every other handle is an inline stream, as before.
+- **Readers:** `nq_flatten` (`nvn_queue.inc`) walks both formats with one loop (a span is the same loop bounded by its end, where a control op is fatal) into the queue's flat copy, which holds no token, so replay and the capture never see one; `cs_recording` (`hle_nvn.c`, `DM_NVN_CMDSTAT`) counts the records inside spans and the tokens under their own ops. `t_nvn` checks that token lists (one span, two spans across a `JUMP`, `CALL`s between the formats, empty lists, a wait inside a span) flatten to the same bytes as the equivalent inline streams.
+- **Open:** nothing records token lists yet, so no game behaviour changes; recording into control memory where a game gives it is the next step.
+
 ### Host-lent command memory segments
 
 - **Symptom:** `FATAL NVN command memory: the game's pool is empty…`.

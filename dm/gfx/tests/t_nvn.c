@@ -77,8 +77,92 @@ static void *cmdsize_recorder(void *a) {
     }
     return NULL;
 }
+// Synthetic command streams for nq_flatten: records and control ops written by hand into a byte array, then flattened as nvnQueueSubmitCommands does (no device needed:
+// the records used here carry no object pointers, so the queue snapshot touches nothing)
+static uint8_t *tl_put(uint8_t **w, uint32_t op, const void *payload, uint32_t n) {
+    uint8_t *at = *w; op_hdr h = {op, 8 + n}; memcpy(at, &h, 8); if (n) memcpy(at + 8, payload, n); *w += 8 + n; return at;
+}
+static uint8_t *tl_rec(uint8_t **w, uint32_t op, uint32_t tag) { uint32_t v[4] = {tag, tag + 1, tag + 2, tag + 3}; return tl_put(w, op, v, sizeof v); }   // a 24-byte record told apart by tag
+static uint8_t *tl_ptr(uint8_t **w, uint32_t op, const void *target) { uint64_t t = (uintptr_t)target; return tl_put(w, op, &t, 8); }   // JUMP or CALL
+static uint8_t *tl_span(uint8_t **w, const uint8_t *from, const uint8_t *to) { p_span s = {(uintptr_t)from, (uint64_t)(to - from)}; return tl_put(w, OP_SPAN, &s, sizeof s); }
+// The job's nodes after flattening one handle: their kinds in order and their command bytes concatenated
+typedef struct { int nodes; unsigned kinds[8]; size_t len; uint8_t bytes[1024]; } tl_flat;
+static tl_flat tl_flatten(const uint8_t *handle) {
+    nq_job j = {.objects = {.klen = 16}}; tl_flat f = {0};
+    nq_flatten(&j, handle, NULL, 0); nq_end(&j);
+    for (nq_node *n = j.first, *next; n; n = next) {
+        next = n->next; if (f.nodes < 8) f.kinds[f.nodes] = n->kind; f.nodes++;
+        if (n->length <= sizeof f.bytes - f.len) { memcpy(f.bytes + f.len, n->bytes, n->length); f.len += n->length; } else f.len = SIZE_MAX;
+        if (n->receipt) free(n->receipt); free(n->bytes); free(n);
+    }
+    free(j.objects.keys); free(j.objects.vals); return f;
+}
+static int tl_same(const tl_flat *a, const tl_flat *b) { return a->nodes == b->nodes && !memcmp(a->kinds, b->kinds, sizeof a->kinds) && a->len == b->len && a->len != SIZE_MAX && !memcmp(a->bytes, b->bytes, a->len); }
+
 int main(void) {
     setenv("DM_NVN_COUNT", "1", 1);   // the call-count checks below need the counting trampolines (off by default)
+    // Token-list command handles (nvn_obj.h OP_SPAN), groundwork for control memory: nothing records them yet, but nq_flatten must turn a token list into exactly the
+    // bytes the equivalent inline stream gives. Records live in "command memory" (cmd), the tokens in "control memory" (ctl); inline streams in inl
+    {
+        static _Alignas(8) uint8_t cmd[1024], ctl[1024], inl[1024];
+        uint8_t *c = cmd, *t = ctl, *i = inl;
+        // one span: R1 R2 R3
+        uint8_t *a0 = c; tl_rec(&c, OP_BLEND_COLOR, 10); tl_rec(&c, OP_SCISSOR, 20); tl_rec(&c, OP_BARRIER, 30); uint8_t *a1 = c;
+        uint8_t *t1 = t; tl_span(&t, a0, a1); tl_put(&t, OP_END, NULL, 0);
+        uint8_t *i1 = i; tl_rec(&i, OP_BLEND_COLOR, 10); tl_rec(&i, OP_SCISSOR, 20); tl_rec(&i, OP_BARRIER, 30); tl_put(&i, OP_END, NULL, 0);
+        tl_flat ft = tl_flatten(t1), fi = tl_flatten(i1);
+        EXPECT("token list, one span: three records and an END", 3 * 24 + 8, ft.len);
+        EXPECT("token list, one span: flattens as its inline stream", 1, tl_same(&ft, &fi));
+        // two spans across a JUMP of the token list (the next control chunk): R4 R5 | R6
+        uint8_t *b0 = c; tl_rec(&c, OP_BLEND_COLOR, 40); tl_rec(&c, OP_SCISSOR, 50); uint8_t *b1 = c; tl_rec(&c, OP_BARRIER, 60); uint8_t *b2 = c;
+        uint8_t *t2b = ctl + 512, *w2b = t2b; tl_span(&w2b, b1, b2); tl_put(&w2b, OP_END, NULL, 0);
+        uint8_t *t2 = t; tl_span(&t, b0, b1); tl_ptr(&t, OP_JUMP, t2b);
+        uint8_t *i2 = i; tl_rec(&i, OP_BLEND_COLOR, 40); tl_rec(&i, OP_SCISSOR, 50); tl_rec(&i, OP_BARRIER, 60); tl_put(&i, OP_END, NULL, 0);
+        ft = tl_flatten(t2); fi = tl_flatten(i2);
+        EXPECT("token list, two spans across a JUMP: three records and an END", 3 * 24 + 8, ft.len);
+        EXPECT("token list, two spans across a JUMP: flattens as its inline stream", 1, tl_same(&ft, &fi));
+        // a CALL from a token list to an inline handle: R1 CALL(R7) R3
+        uint8_t *callee_inl = i; tl_rec(&i, OP_DEPTH_RANGE, 70); tl_put(&i, OP_END, NULL, 0);
+        uint8_t *t3 = t; tl_span(&t, a0, a0 + 24); tl_ptr(&t, OP_CALL, callee_inl); tl_span(&t, a0 + 48, a1); tl_put(&t, OP_END, NULL, 0);
+        uint8_t *i3 = i; tl_rec(&i, OP_BLEND_COLOR, 10); tl_ptr(&i, OP_CALL, callee_inl); tl_rec(&i, OP_BARRIER, 30); tl_put(&i, OP_END, NULL, 0);
+        uint8_t *i3f = i; tl_rec(&i, OP_BLEND_COLOR, 10); tl_rec(&i, OP_DEPTH_RANGE, 70); tl_rec(&i, OP_BARRIER, 30); tl_put(&i, OP_END, NULL, 0);
+        ft = tl_flatten(t3); fi = tl_flatten(i3); tl_flat ff = tl_flatten(i3f);
+        EXPECT("token list calling an inline handle: flattens as its inline stream", 1, tl_same(&ft, &fi));
+        EXPECT("token list calling an inline handle: the callee's record in place", 1, tl_same(&ft, &ff));
+        // a CALL from an inline handle to a token list: R1 CALL(span R4 R5) R3
+        uint8_t *callee_tl = t; tl_span(&t, b0, b1); tl_put(&t, OP_END, NULL, 0);
+        uint8_t *callee_tl_inl = i; tl_rec(&i, OP_BLEND_COLOR, 40); tl_rec(&i, OP_SCISSOR, 50); tl_put(&i, OP_END, NULL, 0);
+        uint8_t *i4 = i; tl_rec(&i, OP_BLEND_COLOR, 10); tl_ptr(&i, OP_CALL, callee_tl); tl_rec(&i, OP_BARRIER, 30); tl_put(&i, OP_END, NULL, 0);
+        uint8_t *i4e = i; tl_rec(&i, OP_BLEND_COLOR, 10); tl_ptr(&i, OP_CALL, callee_tl_inl); tl_rec(&i, OP_BARRIER, 30); tl_put(&i, OP_END, NULL, 0);
+        ft = tl_flatten(i4); fi = tl_flatten(i4e);
+        EXPECT("inline handle calling a token list: four records and an END", 4 * 24 + 8, ft.len);
+        EXPECT("inline handle calling a token list: flattens as its inline stream", 1, tl_same(&ft, &fi));
+        // empty token lists: just END, and an empty span before the END
+        uint8_t *t5 = t; tl_put(&t, OP_END, NULL, 0);
+        uint8_t *t6 = t; tl_span(&t, a0, a0); tl_put(&t, OP_END, NULL, 0);
+        uint8_t *i5 = i; tl_put(&i, OP_END, NULL, 0);
+        fi = tl_flatten(i5); ft = tl_flatten(t5);
+        EXPECT("empty token list (END): no command node", 0, ft.nodes);
+        EXPECT("empty token list (END): flattens as an empty recording", 1, tl_same(&ft, &fi));
+        ft = tl_flatten(t6);
+        EXPECT("empty span then END: flattens as an empty recording", 1, tl_same(&ft, &fi));
+        // a wait inside a span splits the submission as it does inline: R1 WAIT R3
+        static volatile uint32_t word; struct { uint64_t w; uint32_t mode, value; } wait = {(uintptr_t)&word, 0, 1};
+        uint8_t *d0 = c; tl_rec(&c, OP_BLEND_COLOR, 10); tl_put(&c, OP_WAIT_EVENT, &wait, sizeof wait); tl_rec(&c, OP_BARRIER, 30); uint8_t *d1 = c;
+        uint8_t *t7 = t; tl_span(&t, d0, d1); tl_put(&t, OP_END, NULL, 0);
+        uint8_t *i7 = i; tl_rec(&i, OP_BLEND_COLOR, 10); tl_put(&i, OP_WAIT_EVENT, &wait, sizeof wait); tl_rec(&i, OP_BARRIER, 30); tl_put(&i, OP_END, NULL, 0);
+        ft = tl_flatten(t7); fi = tl_flatten(i7);
+        EXPECT("wait inside a span: commands, event, commands", 1, ft.nodes == 3 && ft.kinds[0] == NQ_COMMANDS && ft.kinds[1] == NQ_EVENT && ft.kinds[2] == NQ_COMMANDS);
+        EXPECT("wait inside a span: flattens as its inline stream", 1, tl_same(&ft, &fi));
+        // DM_NVN_CMDSTAT's small-recording walk counts the records inside the spans too, and the tokens it walks (two SPANs, the JUMP, the END) under their own ops
+        g_cs.on = 1; cs_recording(t2);
+        EXPECT("CMDSTAT: a token list is one small recording", 1, g_cs.small_recs);
+        EXPECT("CMDSTAT: the records inside its spans counted", 1, g_cs.sop_n[OP_BLEND_COLOR] == 1 && g_cs.sop_n[OP_SCISSOR] == 1 && g_cs.sop_n[OP_BARRIER] == 1);
+        EXPECT("CMDSTAT: its tokens counted under their ops", 1, g_cs.sop_n[OP_SPAN] == 2 && g_cs.sop_b[OP_SPAN] == 48 && g_cs.sop_n[OP_JUMP] == 1 && g_cs.sop_n[OP_END] == 1);
+        EXPECT("CMDSTAT: its bytes, records and tokens", 3 * 24 + 2 * 24 + 16 + 8, g_cs.small_bytes);
+        memset(&g_cs, 0, sizeof g_cs); memset(g_cs_thr, 0, sizeof g_cs_thr); g_cs.on = -1;   // back to the environment's choice for the tests below
+        EXPECT("synthetic streams fit their arrays", 1, c <= cmd + sizeof cmd && t <= ctl + 512 && w2b <= ctl + sizeof ctl && i <= inl + sizeof inl);
+    }
     {   // A missing control section must not publish uninitialized bytes or poison a serial's key cache.
         uint8_t control[0x880] = {0}, key[8];
         const uint8_t expected[8] = {0x56, 0x26, 0xd9, 0xa8, 0xf1, 0xd7, 0x36, 0x4b}; // SHA-256 of 0x880 zero bytes
