@@ -917,7 +917,8 @@ NVN(nvnCommandBufferSetMemoryCallbackData, void, NVNcommandBuffer *c, void *d) {
 static uint8_t *align8(uint8_t *p) { return (uint8_t *)(((uintptr_t)p + 7) & ~(uintptr_t)7); }
 // Diagnostic DM_NVN_CMDSTAT=1: every 300 frames log one line of command recording usage -- how many bytes / records were recorded per frame, how large a command memory segment the game gives each time, how many out-of-memory callbacks per frame, how many host-supplied segments,
 // and the count and bytes of each command type (to find "how much larger our records are than real-device commands"). Counts only; does not change recording / replay
-static struct { int on; uint64_t bytes, recs, grants, grant_bytes, grant_min, grant_max, cbs, hostseg, op_n[64], op_b[64], frame0, waste; } g_cs = { .on = -1 };
+#define CS_SMALL 8192   // a recording of at most this many bytes counts as small (cs_recording)
+static struct { int on; uint64_t bytes, recs, grants, grant_bytes, grant_min, grant_max, cbs, hostseg, op_n[64], op_b[64], frame0, waste, small_recs, small_bytes, sop_n[64], sop_b[64]; } g_cs = { .on = -1 };
 static pthread_mutex_t g_cs_mu = PTHREAD_MUTEX_INITIALIZER;
 uint64_t dm_nvn_frame_count(void);
 static int cs_on(void) { if (g_cs.on < 0) g_cs.on = getenv("DM_NVN_CMDSTAT") != NULL; return g_cs.on; }
@@ -931,6 +932,13 @@ static void cs_dump_ex(int force) {
         k += snprintf(top + k, sizeof top - k, " op %d: %.0f × %.0f bytes = %.1f KB;", bi, g_cs.op_n[bi] / n, (double)g_cs.op_b[bi] / (double)g_cs.op_n[bi], g_cs.op_b[bi] / n / 1024.0); }
     LOG("[nvn] command memory up to frame %llu: recorded per frame %.1f KB / %.0f records; segments from the game per frame %.2f, mean %.1f KB each (min %.1f / max %.1f); out-of-memory callbacks per frame %.2f; host-lent segments per frame %.3f; segment tails dropped on a switch per frame %.1f KB | per frame%s",
         (unsigned long long)f, g_cs.bytes / n / 1024.0, g_cs.recs / n, g_cs.grants / n, g_cs.grants ? g_cs.grant_bytes / (double)g_cs.grants / 1024.0 : 0, g_cs.grant_min / 1024.0, g_cs.grant_max / 1024.0, g_cs.cbs / n, g_cs.hostseg / n, g_cs.waste / n / 1024.0, top);
+    if (g_cs.small_recs) {   // the small recordings alone, as totals: the per-mesh and per-shape lists games measure to size model heaps
+        char sm[900]; int ks = 0; uint8_t su[64] = {0};
+        for (int r = 0; r < 12; r++) { int bi = -1; for (int i = 0; i < 64; i++) if (!su[i] && g_cs.sop_b[i] && (bi < 0 || g_cs.sop_b[i] > g_cs.sop_b[bi])) bi = i; if (bi < 0) break; su[bi] = 1;
+            ks += snprintf(sm + ks, sizeof sm - ks, " op %d: %llu × %.1f bytes = %.1f KB;", bi, (unsigned long long)g_cs.sop_n[bi], (double)g_cs.sop_b[bi] / (double)g_cs.sop_n[bi], g_cs.sop_b[bi] / 1024.0); }
+        LOG("[nvn] small recordings (at most %d bytes) up to frame %llu: %llu recordings, %.1f KB, mean %.0f bytes |%s", CS_SMALL, (unsigned long long)f,
+            (unsigned long long)g_cs.small_recs, g_cs.small_bytes / 1024.0, (double)g_cs.small_bytes / (double)g_cs.small_recs, sm);
+    }
     int on = g_cs.on; memset(&g_cs, 0, sizeof g_cs); g_cs.on = on; g_cs.frame0 = f; pthread_mutex_unlock(&g_cs_mu);
 }
 static void cs_dump(void) { cs_dump_ex(0); }
@@ -1039,10 +1047,30 @@ NVN(nvnCommandBufferBeginRecording, void, NVNcommandBuffer *c) {
     if (o->recording) LOG("[RED] BeginRecording re-entered");
     o->recording = 2;   // 2: recording, no command yet (cmd_alloc sets begin)
 }
+// DM_NVN_CMDSTAT: the records of one finished recording, followed across its JUMPs, counted apart when the recording is small (at most CS_SMALL bytes, END and JUMPs included).
+// Games size model heaps by such per-mesh and per-shape scratch recordings (docs/reference/memory.md, "Model heaps sized by the host's command record sizes")
+static void cs_recording(const uint8_t *p) {
+    if (!cs_on() || !p) return;
+    uint64_t n[64] = {0}, b[64] = {0}, total = 0;
+    for (int k = 0; k < 65536; k++) {
+        op_hdr h; memcpy(&h, p, sizeof h);
+        if (h.op < 64) { n[h.op]++; b[h.op] += h.size; }
+        total += h.size;
+        if (h.op == OP_END || !h.size || total > CS_SMALL) break;
+        if (h.op == OP_JUMP) { memcpy(&p, p + 8, 8); continue; }
+        p += h.size;
+    }
+    if (total > CS_SMALL) return;
+    pthread_mutex_lock(&g_cs_mu);
+    g_cs.small_recs++; g_cs.small_bytes += total;
+    for (int i = 0; i < 64; i++) { g_cs.sop_n[i] += n[i]; g_cs.sop_b[i] += b[i]; }
+    pthread_mutex_unlock(&g_cs_mu);
+}
 NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
     cmd_t *o = CB(c);
     uint8_t *p = cmd_alloc_keep(o, 8, 0); put_hdr(p, OP_END, 8);   // nothing follows: the END may take the segment's last bytes
     o->recording = 0;
+    cs_recording(o->begin);
     return (NVNcommandHandle)o->begin;
 }
 NVN(nvnCommandBufferIsRecording, NVNboolean, const NVNcommandBuffer *c) { return ((const cmd_t *)c)->recording != 0; }
