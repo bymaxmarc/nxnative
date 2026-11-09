@@ -930,19 +930,20 @@ HLE_FORCE("_ZN2nn3hid25GetMousePointerSpeedScaleEv", "mouse pointer speed settin
 #define RES_NPAD_IMU_ENABLED 0x2908cau   // what the SDK's EnableNpadImu answers while it is already on (sdk+0x6ca600)
 static pthread_mutex_t g_imu_lock = PTHREAD_MUTEX_INITIALIZER;
 static void *g_imu_buf;
+static int g_imu_on;   // its own flag: the state does not hang on the buffer pointer
 HLE_FORCE("_ZN2nn3hid13EnableNpadImuEPvm", "npad IMU on with the game's buffer; no hid service writes it", Result, h_hid_ImuEnable, void *buf, uint64_t size) {
     (void)size; pthread_mutex_lock(&g_imu_lock);
-    Result r = g_imu_buf ? RES_NPAD_IMU_ENABLED : 0;
-    if (!r) g_imu_buf = buf;
+    Result r = g_imu_on ? RES_NPAD_IMU_ENABLED : 0;
+    if (!r) { g_imu_buf = buf; g_imu_on = 1; }
     pthread_mutex_unlock(&g_imu_lock);
     return r;
 }
 HLE_FORCE("_ZN2nn3hid14DisableNpadImuEv", "npad IMU off", Result, h_hid_ImuDisable, void) {
-    pthread_mutex_lock(&g_imu_lock); g_imu_buf = NULL; pthread_mutex_unlock(&g_imu_lock);
+    pthread_mutex_lock(&g_imu_lock); g_imu_buf = NULL; g_imu_on = 0; pthread_mutex_unlock(&g_imu_lock);
     return 0;
 }
 HLE_FORCE("_ZN2nn3hid16IsNpadImuEnabledEv", "npad IMU state as the host keeps it", int, h_hid_ImuIs, void) {
-    pthread_mutex_lock(&g_imu_lock); int on = g_imu_buf != NULL; pthread_mutex_unlock(&g_imu_lock);
+    pthread_mutex_lock(&g_imu_lock); int on = g_imu_on; pthread_mutex_unlock(&g_imu_lock);
     return on;
 }
 HLE_FORCE("_ZN2nn3hid17GetNpadImuSamplesEPNS0_13NpadImuSampleEiNS0_13NpadImuHandleE", "npad IMU samples: none yet (no motion reaches this path on the host)", int, h_hid_ImuSamples, void *out, int n, uint32_t handle) {

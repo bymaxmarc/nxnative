@@ -618,6 +618,7 @@ static void t_npad_imu(void) {
     CHECK(h_hid_ImuEnable(buf, sizeof buf) != 0 && h_hid_ImuIs(), "npad imu: enabling twice fails, as the SDK's does, and it stays on");
     CHECK(h_hid_ImuSamples(samples, 2, 0x20) == 0 && samples[0][0] == 0xAB && buf[0] == 0xCD, "npad imu: no samples, nothing written");
     CHECK(h_hid_ImuDisable() == 0 && !h_hid_ImuIs() && h_hid_ImuSamples(samples, 2, 0) == 0, "npad imu: disabled, still no samples");
+    CHECK(h_hid_ImuEnable(NULL, 0) == 0 && h_hid_ImuIs() && h_hid_ImuDisable() == 0 && !h_hid_ImuIs(), "npad imu: the state is its own, not the buffer pointer");
 }
 
 // Joy-Con icon decoration colour (Switch 2): no controller of the host is a decorated Joy-Con, so each npad answers 0x4b6ca, which the SDK's own wrapper returns to the game, and the

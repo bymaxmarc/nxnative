@@ -918,6 +918,9 @@ static uint8_t *align8(uint8_t *p) { return (uint8_t *)(((uintptr_t)p + 7) & ~(u
 // Diagnostic DM_NVN_CMDSTAT=1: every 300 frames log one line of command recording usage -- how many bytes / records were recorded per frame, how large a command memory segment the game gives each time, how many out-of-memory callbacks per frame, how many host-supplied segments,
 // and the count and bytes of each command type (to find "how much larger our records are than real-device commands"). Counts only; does not change recording / replay
 #define CS_SMALL 8192   // a recording of at most this many bytes counts as small (cs_recording)
+#define CS_THREADS 16   // small recordings are also counted per guest thread (the first 16 that record one)
+__attribute__((weak)) uint32_t thr_cur_handle(void) { return 0; }   // the host's thread table (hle_thread.c); graphics unit tests have none
+static struct { uint32_t thr; uint64_t recs, bytes, op_n[64], op_b[64]; } g_cs_thr[CS_THREADS];
 static struct { int on; uint64_t bytes, recs, grants, grant_bytes, grant_min, grant_max, cbs, hostseg, op_n[64], op_b[64], frame0, waste, small_recs, small_bytes, sop_n[64], sop_b[64]; } g_cs = { .on = -1 };
 static pthread_mutex_t g_cs_mu = PTHREAD_MUTEX_INITIALIZER;
 uint64_t dm_nvn_frame_count(void);
@@ -938,8 +941,15 @@ static void cs_dump_ex(int force) {
             ks += snprintf(sm + ks, sizeof sm - ks, " op %d: %llu × %.1f bytes = %.1f KB;", bi, (unsigned long long)g_cs.sop_n[bi], (double)g_cs.sop_b[bi] / (double)g_cs.sop_n[bi], g_cs.sop_b[bi] / 1024.0); }
         LOG("[nvn] small recordings (at most %d bytes) up to frame %llu: %llu recordings, %.1f KB, mean %.0f bytes |%s", CS_SMALL, (unsigned long long)f,
             (unsigned long long)g_cs.small_recs, g_cs.small_bytes / 1024.0, (double)g_cs.small_bytes / (double)g_cs.small_recs, sm);
+        for (int t = 0; t < CS_THREADS && g_cs_thr[t].recs; t++) {   // per guest thread: a model loader's lists apart from the render thread's
+            char tl[700]; int kt = 0; uint8_t tu[64] = {0};
+            for (int r = 0; r < 8; r++) { int bi = -1; for (int i = 0; i < 64; i++) if (!tu[i] && g_cs_thr[t].op_b[i] && (bi < 0 || g_cs_thr[t].op_b[i] > g_cs_thr[t].op_b[bi])) bi = i; if (bi < 0) break; tu[bi] = 1;
+                kt += snprintf(tl + kt, sizeof tl - kt, " op %d: %llu × %.1f;", bi, (unsigned long long)g_cs_thr[t].op_n[bi], (double)g_cs_thr[t].op_b[bi] / (double)g_cs_thr[t].op_n[bi]); }
+            LOG("[nvn]   thread %#x: %llu small recordings, %.1f KB, mean %.0f bytes |%s", g_cs_thr[t].thr, (unsigned long long)g_cs_thr[t].recs, g_cs_thr[t].bytes / 1024.0,
+                (double)g_cs_thr[t].bytes / (double)g_cs_thr[t].recs, tl);
+        }
     }
-    int on = g_cs.on; memset(&g_cs, 0, sizeof g_cs); g_cs.on = on; g_cs.frame0 = f; pthread_mutex_unlock(&g_cs_mu);
+    int on = g_cs.on; memset(&g_cs, 0, sizeof g_cs); memset(g_cs_thr, 0, sizeof g_cs_thr); g_cs.on = on; g_cs.frame0 = f; pthread_mutex_unlock(&g_cs_mu);
 }
 static void cs_dump(void) { cs_dump_ex(0); }
 static void put_hdr(uint8_t *p, uint32_t op, uint32_t size) { op_hdr h = {op, size}; memcpy(p, &h, sizeof h); if (op) cs_op(op, size); }
@@ -1061,9 +1071,15 @@ static void cs_recording(const uint8_t *p) {
         p += h.size;
     }
     if (total > CS_SMALL) return;
+    uint32_t thr = thr_cur_handle();
     pthread_mutex_lock(&g_cs_mu);
     g_cs.small_recs++; g_cs.small_bytes += total;
     for (int i = 0; i < 64; i++) { g_cs.sop_n[i] += n[i]; g_cs.sop_b[i] += b[i]; }
+    for (int t = 0; t < CS_THREADS; t++) if (g_cs_thr[t].thr == thr || !g_cs_thr[t].recs) {
+        g_cs_thr[t].thr = thr; g_cs_thr[t].recs++; g_cs_thr[t].bytes += total;
+        for (int i = 0; i < 64; i++) { g_cs_thr[t].op_n[i] += n[i]; g_cs_thr[t].op_b[i] += b[i]; }
+        break;
+    }
     pthread_mutex_unlock(&g_cs_mu);
 }
 NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
@@ -1175,7 +1191,9 @@ NVN(nvnCommandBufferClearDepthStencil, void, NVNcommandBuffer *c, float depth, u
 }
 NVN(nvnCommandBufferSetViewports, void, NVNcommandBuffer *c, int first, int n, const float *v) {
     if (n < 0 || first + n > 16) { LOG("[RED] SetViewports first=%d n=%d", first, n); return; }
-    p_viewports *r = REC(c, OP_VIEWPORTS, p_viewports); r->first = first; r->n = n;
+    // Recorded with the n viewports it sets (every reader takes b->v[0..n)): the fixed 16 took 400 bytes for the usual one, and games size heaps by the bytes recorded
+    // (Nintendo Switch Sports Resort: 1,684 small recordings carried one; docs/reference/memory.md, "Model heaps sized by the host's command record sizes")
+    p_viewports *r = RECN(c, OP_VIEWPORTS, p_viewports, v, n); r->first = first; r->n = n;
     for (int i = 0; i < n; i++) memcpy(r->v[i], v + 4 * i, 16);
 }
 NVN(nvnCommandBufferSetScissor, void, NVNcommandBuffer *c, int x, int y, int w, int h) { *REC(c, OP_SCISSOR, p_scissor) = (p_scissor){x, y, w, h}; }

@@ -100,8 +100,15 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Symptom:** `game called nn::diag abort: Result 0x7802` (`MountNameAlreadyExists`) when a game mounts a RAM disk under a name it has just unmounted.
 - **Cause:** the host's mount table is permanent and `nn::fs::Unmount` did nothing. `nn::fs::MountRamDisk` has no host version, so it runs in `sdk` and registers in the SDK's own table, and the no-op left that entry there while the game freed the disk's buffer.
 - **Fix:** `h_fs_Unmount` leaves a host mount alone and sends any other name to the SDK: its `IsMounted`, then its `Unmount` if it holds the name (the SDK's `Unmount` aborts on a name it does not hold). `guest_sym` gives the module's own definitions, not the host's take-overs. A name in neither table stays a no-op. `t_fs.c` covers each case.
-- **Note:** this makes such a mount releasable, not usable. The host's file calls and `IsMounted` answer from the host's table only, so a file path on a RAM disk is "path not found". A game that needs the files back would need those calls routed to the SDK as well; none is known.
+- **Note:** the file calls on such a mount now reach the SDK too: [File calls on a mount in the SDK's own table](#file-calls-on-a-mount-in-the-sdks-own-table).
 - **Found on:** [Paper Mario: The Thousand-Year Door](../../dm/games/0100ECD018EBE000/README.md) ([GitHub issue #1012](https://github.com/seedds/nxnative/issues/1012)).
+
+### File calls on a mount in the SDK's own table
+
+- **Symptom:** `game called nn::diag abort: Result 0x202` (path not found) right after `fs path not found: <name>:/...` lines (`DM_FS=1`) for a mount name no `fs mount` line ever named.
+- **Cause:** `nn::fs::MountRamDisk` runs in `sdk` and registers in the SDK's own mount table ([A mount in the SDK's own table stays until the SDK releases it](#a-mount-in-the-sdks-own-table-stays-until-the-sdk-releases-it)), while every file call the host takes over looked in the host's table only. Nintendo Switch Sports Resort mounts its VoiceText speech data as the RAM disk `vtapi`, copies `VoiceText/` from `content:` into it at boot and aborted on its first `GetEntryType` (`main+0x414dbc`).
+- **Fix:** a path whose mount name the host does not hold but the SDK's `IsMounted` does goes to the SDK's own call (`sdk_path_call` in `hle_fs.c`; `guest_sym` gives the module's definition, not the host's take-over), with no host lock held. The file and directory handles that call opens are listed (`sdk_handle_add`, up to 256 open at once; past that the open is closed in the SDK and fails), and the calls that take a handle go to the SDK when it is listed; a close forgets the handle before the SDK frees it. `IsMounted` and `IsPathMounted` answer from both tables. A rename between the SDK's mount and another fails without reaching either. A path on a host mount never asks the SDK. `t_fs.c` (⑩) covers routing, handle tracking and isolation.
+- **Found on:** Nintendo Switch Sports Resort (`04008E001F098000`, no profile yet).
 
 ### File handles with low bits set, and backslash paths
 
@@ -390,6 +397,17 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Symptom:** SDK 20 calls that reach a service; `nfp`'s `AttachActivateEvent` / `AttachDeactivateEvent` crashed in the SDK at `sdk+0x3f2a78`.
 - **Fix:** the console six-axis sensor (`hid::*SevenSixAxisSensor*`) reports zero states; more `nfp` calls are hooked: `AttachActivateEvent` / `AttachDeactivateEvent`, the two-argument `Mount`, `Unmount`, `GetCommonInfo`, `GetRegisterInfo`, `GetState`, `Finalize`. The host answers as a console with no amiibo.
 - **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md) (1.9.0, SDK 20.5.22). [Super Mario Bros. Wonder](../../dm/games/010015100B514000/README.md) 1.2.1 already initialized `nn::nfp` at boot ([A game update imports SDK calls the base game did not](#a-game-update-imports-sdk-calls-the-base-game-did-not)).
+
+### Switch 2 hid calls that open the hid service
+
+- **Symptom:** at boot, `game called nn::diag abort: Result 0x58cca` at `sdk+0x6ca40c` (under `hid::IsUnintendedHomeButtonInputProtectionEnabled`) or at `sdk+0x6cab6c` (under `hid::GetNpadJoyIconDecorationColor`, once the game draws), or `Result 0xe15` at `sdk+0x6d6948` (under `hid::InitializeSensorFusion`, with `[RED] sf: the game connects to service hid itself`).
+- **Cause:** these Switch 2 SDK calls ask the hid service or read its shared memory, neither of which the host provides, and the SDK aborts on the answer.
+- **Fix:** the host answers them in `hle_hid.c`, checking npad ids as the SDK does (No1 to No8, Other, Handheld; another id is refused with a red line):
+  - Unintended Home button input protection: one flag per npad that the game reads back, on until the game turns it off (Nintendo Switch Sports Resort asks for each npad, then turns it off).
+  - Joy-Con icon decoration colour (one or both halves): `0x4b6ca`, which the SDK answers for an npad whose controller is no decorated Joy-Con (`sdk+0x6be204`) and its wrapper hands to the game; the 12-byte colour is not written.
+  - Npad IMU (`EnableNpadImu`, `DisableNpadImu`, `IsNpadImuEnabled`, `GetNpadImuSamples`): the layer the SDK's own sensor fusion reads (`Enable` / `UpdateSensorFusion` → `GetNpadImuSamples` → `nn::imu::FullSensorState`). These four are the only users of the SDK's IMU state (`sdk+0x1056c48`), so the host keeps that state: on with the game's buffer, enabling twice answers `0x2908ca` as the SDK does, and no samples yet.
+- **Note:** open: the sensor fusion has no samples, so controller orientation stays still. An `NpadImuSample` is 0x28 bytes (`sdk+0x6ca8b8`); filling it from the host's motion would give the game real orientation.
+- **Found on:** Nintendo Switch Sports Resort (`04008E001F098000`, no profile yet). `t_hid.c` covers each call.
 
 ### `nfp`'s extended application area
 
