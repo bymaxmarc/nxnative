@@ -968,16 +968,16 @@ static Result six_handle_slot(const char *who, uint32_t h, int *slot, int *dev) 
 // reports acceleration as m/s^2 x (-1 / 9.80665) G (sdk+0x6d74a0) and angular velocity as the negated gyro (fneg at sdk+0x6d7334, +0x6d734c, +0x6d7350) x 57.2958 deg/s (sdk+0x6d74c8).
 // The host's six-axis state (acceleration in G, (0, 0, -1) at rest; angular velocity in revolutions / s) becomes acc = -G x 9.80665 and gyro = -rev/s x 2 pi, so the fusion's outputs read
 // in the six-axis state's own signs. That the outputs follow those signs is assumed, not checked on a console: DM_IMU_ACC_SIGN / DM_IMU_GYRO_SIGN = 1 keep the host's signs instead.
-// Samples are the sensor's 5 ms ticks on the guest clock (SIX_PERIOD_NS), each the six-axis state at that time (live motion, else flat with player 1's shake). Each device (npad, device
-// index) numbers its ticks from 1 at its first delivery and hands each tick out once: every tick since the last delivery, at most n and at most the 16 the SDK's ring holds (EnableNpadImu's
-// buffer: 16 x 0x28 per device), the newest ones; older ticks are lost and their numbers skipped, as when a console's ring wraps. Ticks while the IMU is off are lost the same way.
-// A handle whose controller is not connected in that style has none
+// Samples are the sensor's 5 ms ticks on the guest clock (SIX_PERIOD_NS), each the six-axis state at that time (live motion, else flat with player 1's shake). As the console's ring in
+// shared memory, the answer keeps no per-reader state: a call returns the newest min(n, 16) ticks up to the current one (16: the SDK's ring, EnableNpadImu's buffer holds 16 x 0x28 per
+// device), oldest first, numbered by absolute tick + 1 (always >= 1). A tick a reader already took comes again in its next call and the fusion's skip rule drops it; ticks it read too
+// late for are skipped numbers, a gap the fusion bridges or resets on. So several readers, or a fusion created again (or the IMU switched off and on), each get every tick, and a reader
+// that read the clock before another (an older current tick) only gets numbers the fusion has taken or will skip. Off, or for a handle whose controller is not connected in that style,
+// there are none. A device index of 2 (accepted by the SDK's check) reads the motion of index 0 for a Joy-Con pair, as six_source masks it to the pair's two sides
 typedef struct { int64_t sampling, delta_ns; float gyro[3], acc[3]; } NpadImuSample;
 _Static_assert(sizeof(NpadImuSample) == 0x28, "NpadImuSample");
 enum { IMU_RING = 16 };
 #define STANDARD_GRAVITY 9.80665
-typedef struct { int64_t base, last; int started; } ImuDevice;   // the tick numbered 1, the last tick handed out
-static ImuDevice g_imu_dev[SIX_NPADS][SIX_DEVICES];   // under g_imu_lock
 static float g_imu_acc_sign = -1, g_imu_gyro_sign = -1;
 static pthread_once_t g_imu_once = PTHREAD_ONCE_INIT;
 static void imu_env_read(void) {
@@ -985,34 +985,24 @@ static void imu_env_read(void) {
     g_imu_acc_sign = (e = getenv("DM_IMU_ACC_SIGN")) && atof(e) > 0 ? 1 : -1;
     g_imu_gyro_sign = (e = getenv("DM_IMU_GYRO_SIGN")) && atof(e) > 0 ? 1 : -1;
 }
-static void imu_sample(NpadImuSample *o, int64_t tick, int64_t base, int live, const motion_state *ms, int shakes) {
+static void imu_sample(NpadImuSample *o, int64_t tick, int live, const motion_state *ms, int shakes) {
     SixAxisState s; six_at(&s, tick, live, ms, shakes);
-    o->sampling = tick - base + 1; o->delta_ns = SIX_PERIOD_NS;
+    o->sampling = tick + 1; o->delta_ns = SIX_PERIOD_NS;
     for (int i = 0; i < 3; i++) {
         o->acc[i] = (float)(g_imu_acc_sign * s.acc[i] * STANDARD_GRAVITY);
         o->gyro[i] = (float)(g_imu_gyro_sign * s.gyro[i] * 2 * M_PI);
     }
 }
-HLE_FORCE("_ZN2nn3hid17GetNpadImuSamplesEPNS0_13NpadImuSampleEiNS0_13NpadImuHandleE", "npad IMU samples: the device's six-axis state at each 5 ms tick not yet handed out, oldest first",
+HLE_FORCE("_ZN2nn3hid17GetNpadImuSamplesEPNS0_13NpadImuSampleEiNS0_13NpadImuHandleE", "npad IMU samples: the device's six-axis state at the newest 5 ms ticks, oldest first",
           int, h_hid_ImuSamples, void *out, int n, uint32_t handle) {
     pthread_once(&g_imu_once, imu_env_read);
     int slot, dev;
-    if (!out || n <= 0 || six_handle_slot(NULL, handle, &slot, &dev) != RES_OK || !six_connected(handle)) return 0;
-    motion_state ms; int shakes, live = six_source(handle, &ms, &shakes);   // before g_imu_lock: the motion sources have locks of their own
-    int64_t now = (int64_t)(guest_ns() / SIX_PERIOD_NS), base = 0, k = 0;
-    pthread_mutex_lock(&g_imu_lock);
-    if (g_imu_on) {
-        ImuDevice *d = &g_imu_dev[slot][dev];
-        if (!d->started) *d = (ImuDevice){.base = now, .last = now - 1, .started = 1};
-        k = now - d->last;
-        if (k > n) k = n;
-        if (k > IMU_RING) k = IMU_RING;
-        if (k > 0) d->last = now; else k = 0;
-        base = d->base;
-    }
-    pthread_mutex_unlock(&g_imu_lock);
+    if (!out || n <= 0 || six_handle_slot(NULL, handle, &slot, &dev) != RES_OK || !six_connected(handle) || !h_hid_ImuIs()) return 0;
+    motion_state ms; int shakes, live = six_source(handle, &ms, &shakes);
+    int64_t now = (int64_t)(guest_ns() / SIX_PERIOD_NS), k = n < IMU_RING ? n : IMU_RING;
+    if (k > now + 1) k = now + 1;   // no tick before the guest clock's start
     NpadImuSample *o = out;
-    for (int64_t i = 0; i < k; i++) imu_sample(&o[i], now - k + 1 + i, base, live, &ms, shakes);
+    for (int64_t i = 0; i < k; i++) imu_sample(&o[i], now - k + 1 + i, live, &ms, shakes);
     return (int)k;
 }
 // The fusion's initialization (sdk+0x6d7db0) asks GetSixAxisSensorIcInformation through the hid service (IHidServer +0x178, sdk+0x6c3768), which the host does not serve: on a failure it
