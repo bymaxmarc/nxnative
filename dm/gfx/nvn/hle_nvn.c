@@ -908,10 +908,12 @@ NVN(nvnQueueFinish, void, NVNqueue *q) { nvn_queue_finish((queue_t *)q); }
 // replay jumped to 0x1000000003 (that CALL record's header) after 8 to 30 minutes of play
 #define OP_RESERVE 16
 
+static void cs_ctl_retire(const cmd_t *o);   // DM_NVN_CMDSTAT (below)
 NVN(nvnCommandBufferInitialize, NVNboolean, NVNcommandBuffer *c, NVNdevice *d) {
+    cs_ctl_retire(CB(c));   // DM_NVN_CMDSTAT: a buffer at this address before (a stack buffer never finalized) is another one
     memset(c, 0, sizeof(cmd_t)); CB(c)->magic = MAGIC('C', 'M', 'D', 'B'); CB(c)->dev = d; return 1;
 }
-NVN(nvnCommandBufferFinalize, void, NVNcommandBuffer *c) { CB(c)->magic = 0; }
+NVN(nvnCommandBufferFinalize, void, NVNcommandBuffer *c) { cs_ctl_retire(CB(c)); CB(c)->magic = 0; }
 NVN(nvnCommandBufferSetMemoryCallback, void, NVNcommandBuffer *c, PFNNVNCOMMANDBUFFERMEMORYCALLBACKPROC cb) { CB(c)->cb = cb; }
 NVN(nvnCommandBufferSetMemoryCallbackData, void, NVNcommandBuffer *c, void *d) { CB(c)->cb_data = d; }
 static uint8_t *align8(uint8_t *p) { return (uint8_t *)(((uintptr_t)p + 7) & ~(uintptr_t)7); }
@@ -928,17 +930,33 @@ static int cs_on(void) { if (g_cs.on < 0) g_cs.on = getenv("DM_NVN_CMDSTAT") != 
 static void cs_op(uint32_t op, uint32_t size) { if (!cs_on() || op >= 64) return; pthread_mutex_lock(&g_cs_mu); g_cs.op_n[op]++; g_cs.op_b[op] += size; pthread_mutex_unlock(&g_cs_mu); }
 // DM_NVN_CMDSTAT, control memory (step 1 of the control-memory plan): per command buffer, what the game gives (AddControlMemory), reads back (the three getters, with the
 // value the host returned last) and asks for (SetControlMemoryCallbackEnabled), and how many of its recordings ended with no control memory given. Kept from boot, not reset
-// with the per-window counts: games add control memory once, at setup. The first CS_CTL_BUFS buffers get a row each, the rest share the last row
+// with the per-window counts: games add control memory once, at setup. A live buffer takes one of CS_CTL_BUFS rows; Finalize, or an Initialize at the same address (stack
+// buffers that are never finalized), retires its row into one sum, so a reused address starts afresh and short-lived boot buffers leave the rows to the render buffers. A buffer
+// that finds no free row is counted in the overflow row, which cannot tell how many buffers it holds
 #define CS_CTL_BUFS 32
 enum { CS_GET_USED, CS_GET_FREE, CS_GET_SIZE };
 typedef struct { const cmd_t *cmd; uint64_t adds, bytes, min, max, gets[3], ret[3], recs, recs_bare; int cb_on; } cs_ctl_t;   // cb_on: -1 never set, else the last value set
-static cs_ctl_t g_cs_ctl[CS_CTL_BUFS + 1];
+typedef struct { uint64_t bufs, given, bare_bufs, cb_on, cb_off; cs_ctl_t sum; } cs_ctl_sum_t;   // buffers summed into one row, and how many had each property
+static cs_ctl_t g_cs_ctl[CS_CTL_BUFS], g_cs_ctl_over;   // cmd NULL: a free row; g_cs_ctl_over.cmd: the first buffer that found none
+static cs_ctl_sum_t g_cs_ctl_retired;
+static void cs_ctl_fold(cs_ctl_sum_t *t, const cs_ctl_t *r) {
+    cs_ctl_t *s = &t->sum; t->bufs++; t->given += r->adds > 0; t->bare_bufs += r->recs_bare > 0; t->cb_on += r->cb_on == 1; t->cb_off += r->cb_on == 0;
+    s->adds += r->adds; s->bytes += r->bytes; s->recs += r->recs; s->recs_bare += r->recs_bare;
+    if (r->min && (!s->min || r->min < s->min)) s->min = r->min;
+    if (r->max > s->max) s->max = r->max;
+    for (int k = 0; k < 3; k++) s->gets[k] += r->gets[k];
+}
 static cs_ctl_t *cs_ctl_row(const cmd_t *o) {   // under g_cs_mu
-    for (int i = 0; i < CS_CTL_BUFS; i++) {
-        if (g_cs_ctl[i].cmd == o) return &g_cs_ctl[i];
-        if (!g_cs_ctl[i].cmd) { g_cs_ctl[i] = (cs_ctl_t){.cmd = o, .cb_on = -1}; return &g_cs_ctl[i]; }
-    }
-    cs_ctl_t *rest = &g_cs_ctl[CS_CTL_BUFS]; if (!rest->cmd) *rest = (cs_ctl_t){.cmd = o, .cb_on = -1}; return rest;
+    cs_ctl_t *free_row = NULL;
+    for (int i = 0; i < CS_CTL_BUFS; i++) { if (g_cs_ctl[i].cmd == o) return &g_cs_ctl[i]; if (!g_cs_ctl[i].cmd && !free_row) free_row = &g_cs_ctl[i]; }
+    cs_ctl_t *r = free_row ? free_row : &g_cs_ctl_over;
+    if (!r->cmd) *r = (cs_ctl_t){.cmd = o, .cb_on = -1};
+    return r;
+}
+static void cs_ctl_retire(const cmd_t *o) {   // Initialize and Finalize: the buffer's row goes into the retired sum and becomes free
+    if (!cs_on()) return; pthread_mutex_lock(&g_cs_mu);
+    for (int i = 0; i < CS_CTL_BUFS; i++) if (g_cs_ctl[i].cmd == o) { cs_ctl_fold(&g_cs_ctl_retired, &g_cs_ctl[i]); g_cs_ctl[i] = (cs_ctl_t){0}; break; }
+    pthread_mutex_unlock(&g_cs_mu);
 }
 static void cs_ctl_add(const cmd_t *o, size_t n) {
     if (!cs_on()) return; pthread_mutex_lock(&g_cs_mu); cs_ctl_t *r = cs_ctl_row(o);
@@ -948,31 +966,30 @@ static size_t cs_ctl_get(const cmd_t *o, int which, size_t value) {   // returns
     if (!cs_on()) return value; pthread_mutex_lock(&g_cs_mu); cs_ctl_t *r = cs_ctl_row(o); r->gets[which]++; r->ret[which] = value; pthread_mutex_unlock(&g_cs_mu); return value;
 }
 static void cs_ctl_callback(const cmd_t *o, int on) { if (!cs_on()) return; pthread_mutex_lock(&g_cs_mu); cs_ctl_row(o)->cb_on = on; pthread_mutex_unlock(&g_cs_mu); }
-static void cs_ctl_recorded(const cmd_t *o) {
-    if (!cs_on()) return; pthread_mutex_lock(&g_cs_mu); cs_ctl_t *r = cs_ctl_row(o); r->recs++; r->recs_bare += !o->ctl_size; pthread_mutex_unlock(&g_cs_mu);
+static void cs_ctl_row_log(const cs_ctl_t *r, const char *who) {
+    LOG("[nvn]   %s: %llu recordings (%llu with no control memory); AddControlMemory %llu times, %.1f KB (%llu..%llu); Used / Free / Size read %llu / %llu / %llu times, last returned %llu / %llu / %llu; callback %s",
+        who, (unsigned long long)r->recs, (unsigned long long)r->recs_bare, (unsigned long long)r->adds, r->bytes / 1024.0, (unsigned long long)r->min, (unsigned long long)r->max,
+        (unsigned long long)r->gets[0], (unsigned long long)r->gets[1], (unsigned long long)r->gets[2], (unsigned long long)r->ret[0], (unsigned long long)r->ret[1], (unsigned long long)r->ret[2],
+        r->cb_on < 0 ? "never set" : r->cb_on ? "enabled" : "disabled");
 }
-static void cs_ctl_dump(void) {   // under g_cs_mu: one summary line, then the buffers that record most
-    uint64_t bufs = 0, given = 0, adds = 0, bytes = 0, mn = 0, mx = 0, gets[3] = {0}, cb_on = 0, cb_off = 0, recs = 0, bare = 0, bare_bufs = 0;
-    for (int i = 0; i <= CS_CTL_BUFS && g_cs_ctl[i].cmd; i++) {
-        const cs_ctl_t *r = &g_cs_ctl[i]; bufs++; given += r->adds > 0; adds += r->adds; bytes += r->bytes; recs += r->recs; bare += r->recs_bare; bare_bufs += r->recs_bare > 0;
-        if (r->min && (!mn || r->min < mn)) mn = r->min; if (r->max > mx) mx = r->max;
-        for (int k = 0; k < 3; k++) gets[k] += r->gets[k];
-        cb_on += r->cb_on == 1; cb_off += r->cb_on == 0;
-    }
-    if (!bufs) return;
-    LOG("[nvn] control memory since boot: %llu command buffers (%llu given control memory%s): AddControlMemory %llu times, %.1f KB (chunks %llu..%llu bytes); GetControlMemoryUsed / Free / Size called %llu / %llu / %llu times; control callback enabled on %llu, disabled on %llu; recordings %llu, %llu of them with no control memory given (on %llu buffers)",
-        (unsigned long long)bufs, (unsigned long long)given, g_cs_ctl[CS_CTL_BUFS].cmd ? ", the last row sums the buffers past the first 32" : "", (unsigned long long)adds, bytes / 1024.0,
-        (unsigned long long)mn, (unsigned long long)mx, (unsigned long long)gets[0], (unsigned long long)gets[1], (unsigned long long)gets[2], (unsigned long long)cb_on, (unsigned long long)cb_off,
-        (unsigned long long)recs, (unsigned long long)bare, (unsigned long long)bare_bufs);
-    uint8_t shown[CS_CTL_BUFS + 1] = {0};
+static void cs_ctl_dump(void) {   // under g_cs_mu: one summary line, then the live buffers that record most and the overflow row
+    cs_ctl_sum_t t = g_cs_ctl_retired; uint64_t live = 0;
+    for (int i = 0; i < CS_CTL_BUFS; i++) if (g_cs_ctl[i].cmd) { cs_ctl_fold(&t, &g_cs_ctl[i]); live++; }
+    int over = g_cs_ctl_over.cmd != NULL; if (over) { cs_ctl_fold(&t, &g_cs_ctl_over); t.bufs--; }   // the overflow row's properties count once, its buffers are not counted
+    if (!t.bufs && !over) return;
+    const cs_ctl_t *s = &t.sum;
+    LOG("[nvn] control memory since boot: %s%llu command buffers (%llu live, %llu finalized or reinitialized; %llu given control memory)%s: AddControlMemory %llu times, %.1f KB (chunks %llu..%llu bytes); GetControlMemoryUsed / Free / Size called %llu / %llu / %llu times; control callback enabled on %llu, disabled on %llu; recordings %llu, %llu of them with no control memory given (on %llu buffers)",
+        over ? "at least " : "", (unsigned long long)t.bufs + (uint64_t)over, (unsigned long long)live, (unsigned long long)g_cs_ctl_retired.bufs, (unsigned long long)t.given,
+        over ? ", and more past the 32 rows summed in one overflow row" : "", (unsigned long long)s->adds, s->bytes / 1024.0, (unsigned long long)s->min, (unsigned long long)s->max,
+        (unsigned long long)s->gets[0], (unsigned long long)s->gets[1], (unsigned long long)s->gets[2], (unsigned long long)t.cb_on, (unsigned long long)t.cb_off,
+        (unsigned long long)s->recs, (unsigned long long)s->recs_bare, (unsigned long long)t.bare_bufs);
+    uint8_t shown[CS_CTL_BUFS] = {0};
     for (int row = 0; row < 8; row++) {
-        int bi = -1; for (int i = 0; i <= CS_CTL_BUFS && g_cs_ctl[i].cmd; i++) if (!shown[i] && (bi < 0 || g_cs_ctl[i].recs + g_cs_ctl[i].adds > g_cs_ctl[bi].recs + g_cs_ctl[bi].adds)) bi = i;
-        if (bi < 0) break; shown[bi] = 1; const cs_ctl_t *r = &g_cs_ctl[bi];
-        LOG("[nvn]   cmd %p%s: %llu recordings (%llu with no control memory); AddControlMemory %llu times, %.1f KB (%llu..%llu); Used / Free / Size read %llu / %llu / %llu times, last returned %llu / %llu / %llu; callback %s",
-            (const void *)r->cmd, bi == CS_CTL_BUFS ? " and later buffers" : "", (unsigned long long)r->recs, (unsigned long long)r->recs_bare, (unsigned long long)r->adds, r->bytes / 1024.0,
-            (unsigned long long)r->min, (unsigned long long)r->max, (unsigned long long)r->gets[0], (unsigned long long)r->gets[1], (unsigned long long)r->gets[2],
-            (unsigned long long)r->ret[0], (unsigned long long)r->ret[1], (unsigned long long)r->ret[2], r->cb_on < 0 ? "never set" : r->cb_on ? "enabled" : "disabled");
+        int bi = -1; for (int i = 0; i < CS_CTL_BUFS; i++) if (g_cs_ctl[i].cmd && !shown[i] && (bi < 0 || g_cs_ctl[i].recs + g_cs_ctl[i].adds > g_cs_ctl[bi].recs + g_cs_ctl[bi].adds)) bi = i;
+        if (bi < 0) break; shown[bi] = 1;
+        char who[48]; snprintf(who, sizeof who, "cmd %p", (const void *)g_cs_ctl[bi].cmd); cs_ctl_row_log(&g_cs_ctl[bi], who);
     }
+    if (over) cs_ctl_row_log(&g_cs_ctl_over, "buffers past the 32 rows");
 }
 // Called once per frame (at present), and once early (force) when a buffer's pool is null: a model heap that ran out shows there, often before the 300th frame
 // (docs/reference/memory.md, "Model heaps sized by the host's command record sizes")
@@ -1138,20 +1155,23 @@ static void cs_walk(const uint8_t *p, const uint8_t *stop, cs_rec_t *r) {
 // Control bytes a design-A recording would write for what cs_walk found: 24 per SPAN, 16 per CALL, 16 per segment switch (counted as a control JUMP: an upper bound, since a
 // switch of command memory only closes a span and a control JUMP is needed only where control memory runs out), 8 for the END
 static uint64_t cs_ctl_estimate(const cs_rec_t *r) { return 24 * r->spans + 16 * (r->n[OP_CALL] + r->n[OP_JUMP]) + 8 * r->n[OP_END]; }
-static void cs_recording(const uint8_t *p) {
-    if (!cs_on() || !p) return;
+// o: the buffer the recording ended on, for its control-memory row (NULL: none); one lock for both
+static void cs_recording(const uint8_t *p, const cmd_t *o) {
+    if (!cs_on()) return;
     cs_rec_t r = {0};
-    cs_walk(p, NULL, &r);
-    if (r.total > CS_SMALL) return;
-    uint64_t *n = r.n, *b = r.b, total = r.total;
+    if (p) cs_walk(p, NULL, &r);
+    int small = p && r.total <= CS_SMALL;
     uint32_t thr = thr_cur_handle();
     pthread_mutex_lock(&g_cs_mu);
-    g_cs.small_recs++; g_cs.small_bytes += total; g_cs.est_spans += r.spans; g_cs.est_ctl += cs_ctl_estimate(&r);
-    for (int i = 0; i < 64; i++) { g_cs.sop_n[i] += n[i]; g_cs.sop_b[i] += b[i]; }
-    for (int t = 0; t < CS_THREADS; t++) if (g_cs_thr[t].thr == thr || !g_cs_thr[t].recs) {
-        g_cs_thr[t].thr = thr; g_cs_thr[t].recs++; g_cs_thr[t].bytes += total;
-        for (int i = 0; i < 64; i++) { g_cs_thr[t].op_n[i] += n[i]; g_cs_thr[t].op_b[i] += b[i]; }
-        break;
+    if (o) { cs_ctl_t *row = cs_ctl_row(o); row->recs++; row->recs_bare += !o->ctl_size; }
+    if (small) {
+        g_cs.small_recs++; g_cs.small_bytes += r.total; g_cs.est_spans += r.spans; g_cs.est_ctl += cs_ctl_estimate(&r);
+        for (int i = 0; i < 64; i++) { g_cs.sop_n[i] += r.n[i]; g_cs.sop_b[i] += r.b[i]; }
+        for (int t = 0; t < CS_THREADS; t++) if (g_cs_thr[t].thr == thr || !g_cs_thr[t].recs) {
+            g_cs_thr[t].thr = thr; g_cs_thr[t].recs++; g_cs_thr[t].bytes += r.total;
+            for (int i = 0; i < 64; i++) { g_cs_thr[t].op_n[i] += r.n[i]; g_cs_thr[t].op_b[i] += r.b[i]; }
+            break;
+        }
     }
     pthread_mutex_unlock(&g_cs_mu);
 }
@@ -1159,7 +1179,7 @@ NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
     cmd_t *o = CB(c);
     uint8_t *p = cmd_alloc_keep(o, 8, 0); put_hdr(p, OP_END, 8);   // nothing follows: the END may take the segment's last bytes
     o->recording = 0;
-    cs_recording(o->begin); cs_ctl_recorded(o);
+    cs_recording(o->begin, o);
     return (NVNcommandHandle)o->begin;
 }
 NVN(nvnCommandBufferIsRecording, NVNboolean, const NVNcommandBuffer *c) { return ((const cmd_t *)c)->recording != 0; }
