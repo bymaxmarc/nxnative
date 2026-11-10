@@ -2866,6 +2866,10 @@ static MTLTextureDescriptor *tex_desc(const tex_t *t, int packaged) {
     // Mansion 3), and upgrading later would recreate a depth buffer in use. Unlike colour formats it costs nothing measured: on an M4 Pro a 2560x1440 one has the same allocated size and the same
     // GPU time over eight load / store passes with and without it
     if (d.pixelFormat == MTLPixelFormatDepth32Float_Stencil8) d.usage |= MTLTextureUsagePixelFormatView;
+    // An RGB9E5 texture the GPU writes has the format-view usage from the start too: NVIDIA's GPUs have no RGB9E5 colour target, so a game draws into one through an R32_UI view
+    // of it (rt_view_upgrade), packing the bits in its shader. Nintendo Switch Sports Resort's NDSR upscaler input is one, made again at each new size of its dynamic resolution: without
+    // this every one of them was upgraded (copied into a new texture) at its first pass, 27 in 80 s of its menus
+    if (d.pixelFormat == MTLPixelFormatRGB9E5Float && (d.usage & MTLTextureUsageRenderTarget)) d.usage |= MTLTextureUsagePixelFormatView;
     return d;
 }
 // In-place upgrade: when the original texture was not created with PixelFormatView (off by default, to keep Apple GPU lossless compression) but a different-format view is needed, create a new one with the original spec + PixelFormatView, copy over every slice × level, and replace the registration.
@@ -5127,6 +5131,18 @@ static NSUInteger att_layers(MTLRenderPassAttachmentDescriptor *a, const view_t 
     if (has_v && v->set_layers && v->nlayers) n = MIN(n, (NSUInteger)v->nlayers);
     return MAX(n, 1u);
 }
+// A colour render target view of another format with the same texel size, on a texture made without the format-view usage (it costs lossless compression, so textures get it only
+// when needed): the texture is upgraded to that usage before the pass opens, as a clear or an image of another class does, and the view is attached. Drawing in the base format
+// instead was no fallback for a class change: Nintendo Switch Sports Resort packs its NDSR upscaler's input into an RGB9E5 texture through an R32_UI view, with a fragment shader
+// (401877446d25d079) whose output is the packed bits as uint. On the RGB9E5Float attachment the pipeline took its float entry, which wrote the bits' float value (red in the millions,
+// green and blue 0), and every upscaled picture came out red; Metal refuses the uint entry for that attachment ("output of type uint4 is not compatible"). Returns the texture to attach
+static id<MTLTexture> rt_view_upgrade(const tex_t *t, id<MTLTexture> base, const view_t *v) {
+    uint32_t want = 0; uint8_t swz[4];
+    if (!nvn_fmt_to_mtl(v->format, &want, swz) || !want || !tex_need_pfv(base.pixelFormat, (MTLPixelFormat)want) || (base.usage & MTLTextureUsagePixelFormatView)) return base;
+    size_t n = mtl_pf_bytes(base.pixelFormat);
+    if (!n || n != mtl_pf_bytes((MTLPixelFormat)want) || base.sampleCount != 1) return base;   // Metal views keep the texel size; multisample and compressed textures are not upgraded here
+    return tex_upgrade_pfv(t, base, (MTLPixelFormat)want);
+}
 static void attach(MTLRenderPassAttachmentDescriptor *a, const tex_t *t, const view_t *v, int has_v) {
     id<MTLTexture> base = tex_mtl(t); sparse_gpu_wrote(t);
     // A texture made without render-target use (packaged or CPU-written, uploaded from its storage) drawn into: give it that use, as a clear of one does (clear_tex). Metal's validation
@@ -5140,6 +5156,7 @@ static void attach(MTLRenderPassAttachmentDescriptor *a, const tex_t *t, const v
     // A view that changes the format is attached as a Metal view of that format (pipeline formats follow the attachment). SMBW's last pass writes the RGBA8 swapchain texture through an RGBA8_SRGB view, so the hardware encodes sRGB on write;
     // attaching the base texture instead stored the linear values as they were and the whole picture came out dark (every value decoded from sRGB once more, on the Mac and the iPhone). The view lives until this submission completes
     if (base && has_v && v->set_format) {
+        base = rt_view_upgrade(t, base, v); a.texture = base;
         MTLPixelFormat pf = rt_view_fmt(base, v, has_v);
         if (pf != base.pixelFormat) {
             id<MTLTexture> vw = [base newTextureViewWithPixelFormat:pf];
