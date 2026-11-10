@@ -15,6 +15,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import tracemalloc
 from unittest import mock
@@ -184,9 +185,15 @@ class Compute(unittest.TestCase):
         self.assertEqual([(n, len(x), len(y)) for n, x, y in po.groups_of([], c, 5, 0)], [('c00001', 0, 3)])
 
 
+def run_logged_through_run(cmd, log_path, env, timeout=None):
+    """po.run_logged by way of subprocess.run, which the tests replace: no compiler runs; a runner that returns None as its exit status stands for a run past its time limit"""
+    with log_path.open('w') as log: return subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, env=env).returncode
+
+
 class Build(unittest.TestCase):
     """main: one archive per architecture, made again only when its key changes; the stamp, rest_pairs.tsv and archive.tsv beside them"""
     def setUp(self):
+        patcher = mock.patch.object(po, 'run_logged', run_logged_through_run); patcher.start(); self.addCleanup(patcher.stop)
         self.t = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, self.t)
         self.lib = self.t / f'b-{CHAIN}'; self.lib.mkdir()
         for k, j, funcs in (('v', {'pull': {}, 'entry_z': 'main0_z'}, [('main0', False), ('main0_z', False)]), ('f', {}, [('main0', False)]), ('c', {}, [('main0', True)])):
@@ -450,12 +457,14 @@ class Build(unittest.TestCase):
             self.assertEqual(observed, before, 'the normal packer must reuse the complete merged archive')
             self.assertIn('bases\t5\n', (self.out/'archive.tsv').read_text())
 
-    def test_batch_failure_preserves_completed_work_and_publishes_nothing(self):
+    def test_batch_failure_preserves_completed_work_and_publishes_nothing(self):   # a failure that stops the build (here a full volume before the second group)
         bases = [('v_bp', f'vertex{i}', 'f_b', 'main0') for i in range(5)]
-        runner, observed = self.batched_runner(fail_compile='vertex2')
-        with mock.patch.object(self, 'fake_run', runner), mock.patch.object(po, 'plan', return_value=(bases, [], {})), self.assertRaises(SystemExit):
+        runner, observed = self.batched_runner()
+        usage = lambda path: shutil._ntuple_diskusage(1 << 40, 1 << 40, (100 << 20) if '00002' in str(path) else (100 << 30))
+        with mock.patch.object(self, 'fake_run', runner), mock.patch.object(po, 'plan', return_value=(bases, [], {})), mock.patch.object(po.shutil, 'disk_usage', usage), \
+                self.assertRaises(SystemExit):
             self.main('--batch-size','2','--os-min','27.0')
-        self.assertEqual(observed, [('compile',['vertex0','vertex1']),('compile',['vertex2','vertex3'])])
+        self.assertEqual(observed, [('compile',['vertex0','vertex1'])])
         self.assertFalse((self.out/'prebuilt.tsv').exists())
         self.assertFalse((self.work/'key.applegpu_g18p').exists())
         self.assertFalse(list(self.out.glob('*.mtl4a')))
@@ -467,6 +476,77 @@ class Build(unittest.TestCase):
             self.main('--batch-size','2','--os-min','27.0')
         self.assertEqual(first.stat().st_mtime_ns, identity)
         self.assertEqual(observed, [('compile',['vertex2','vertex3']),('compile',['vertex4']),('merge',3)])
+
+    def test_a_pipeline_that_fails_alone_is_left_out(self):   # Nintendo Switch Sports Resort: one failing pipeline lost the whole archive after hours
+        bases = [('v_bp', f'vertex{i}', 'f_b', 'main0') for i in range(5)]
+        runner, observed = self.batched_runner(fail_compile='vertex2')
+        out = io.StringIO()
+        with mock.patch.object(self, 'fake_run', runner), mock.patch.object(po, 'plan', return_value=(bases, [], {})), contextlib.redirect_stdout(out):
+            self.main('--batch-size','2','--os-min','27.0','--jobs','1')
+        # the failed group in halves: vertex2 fails alone and is left out, vertex3 compiles; one archive of the rest
+        self.assertEqual(observed, [('compile',['vertex0','vertex1']),('compile',['vertex2','vertex3']),('compile',['vertex2']),('compile',['vertex3']),('compile',['vertex4']),('merge',3)])
+        self.assertTrue((self.out/'applegpu_g18p.mtl4a').is_file()); self.assertTrue((self.out/'prebuilt.tsv').is_file())
+        self.assertEqual((self.work/'left_out.applegpu_g18p.tsv').read_text().split('\n')[1:], ['v_bp\tvertex2\tf_b\tmain0', ''])
+        self.assertIn('left out\t1\n', (self.out/'archive.tsv').read_text())
+        self.assertFalse(list(self.work.rglob('*.partial')))
+        observed.clear()   # unchanged inputs: the archive and its list reused
+        with mock.patch.object(self, 'fake_run', runner), mock.patch.object(po, 'plan', return_value=(bases, [], {})):
+            self.main('--batch-size','2','--os-min','27.0','--jobs','1')
+        self.assertEqual(observed, []); self.assertIn('left out\t1\n', (self.out/'archive.tsv').read_text())
+        observed.clear(); (self.out/'applegpu_g18p.mtl4a').unlink()   # made again: the failed group goes straight to its parts (its failure is kept), the lone pipeline is tried again
+        with mock.patch.object(self, 'fake_run', runner), mock.patch.object(po, 'plan', return_value=(bases, [], {})):
+            self.main('--batch-size','2','--os-min','27.0','--jobs','1')
+        self.assertEqual(observed, [('compile',['vertex2']),('merge',3)])
+
+    def test_left_out_pairs_go_to_the_device(self):   # their pairs join rest_pairs.tsv: the host builds them, and its probe of the archive skips them
+        (self.lib / 'g_b.json').write_text(json.dumps({'chain': CHAIN, 'entry': 'main0'})); (self.lib / 'g_b.metallib').write_bytes(metallib([('main0', False)]))
+        (self.prof / 'shader_pairs.tsv').write_text('v\tf\nv\tc\nv\tg\n')
+        compiles = []
+        def run(cmd, **kw):
+            cmd = [str(c) for c in cmd]
+            if 'metal-tt' in cmd and '-o' in cmd:
+                libs = sorted(l['label'] for l in json.loads(next(Path(p) for p in cmd if p.endswith('.mtl4-json')).read_text())['libraries'])
+                compiles.append(libs)
+                if 'g_b' in libs: return subprocess.CompletedProcess(cmd, 1)
+            if 'metal-pack' in cmd: Path(cmd[cmd.index('-o') + 1]).write_bytes(b'merged'); return subprocess.CompletedProcess(cmd, 0)
+            return self.fake_run(cmd, **kw)
+        with mock.patch.object(po.subprocess, 'run', run), mock.patch.dict(os.environ, DM_GAMES_DIR=str(self.prof.parent)), contextlib.redirect_stdout(io.StringIO()):
+            po.main(['--game', '0100000000001000', '--msl', str(self.lib), '--out', str(self.out), '--work', str(self.work), '--os-min', '27.0', '--jobs', '1'])
+        self.assertEqual(compiles, [['f_b', 'g_b', 'v_bp'], ['f_b', 'g_b', 'v_bp'], ['f_b', 'v_bp'], ['g_b', 'v_bp']])   # whole, its group in parts, then the halves
+        self.assertEqual((self.out / 'rest_pairs.tsv').read_text(), 'v\tc\nv\tg\n')   # function constants, then the pair left out
+        self.assertIn('rest\t2\n', (self.out / 'archive.tsv').read_text())
+
+    def test_gives_up_when_nothing_compiles(self):   # a broken toolchain fails every pipeline: stop after GIVE_UP of them alone, not after trying each
+        bases = [('v_bp', f'vertex{i}', 'f_b', 'main0') for i in range(40)]
+        calls, original = [], self.fake_run
+        def fail(cmd, **kw):
+            cmd = [str(c) for c in cmd]
+            if '-version' in cmd or '--show-sdk-version' in cmd: return original(cmd)
+            calls.append(cmd); return subprocess.CompletedProcess(cmd, 1)
+        with mock.patch.object(self, 'fake_run', fail), mock.patch.object(po, 'plan', return_value=(bases, [], {})), self.assertRaises(SystemExit) as e:
+            self.main('--batch-size','20','--os-min','27.0','--jobs','1')
+        self.assertIn('compiler itself', str(e.exception))
+        self.assertLess(len(calls), 30)
+        self.assertFalse(list(self.out.glob('*.mtl4a')))
+
+    def test_a_run_past_its_time_limit_is_compiled_in_parts(self):
+        bases = [('v_bp', f'vertex{i}', 'f_b', 'main0') for i in range(2)]
+        runner, observed = self.batched_runner()
+        limits = []
+        def slow(cmd, log_path, env, timeout=None):   # the run of both pipelines does not finish in time
+            limits.append(timeout)
+            if sum('vertex' in line for line in Path(next(c for c in cmd if str(c).endswith('.mtl4-json'))).read_text().split('\n') if '"name"' in line) > 1:
+                log_path.write_text(''); return None
+            return run_logged_through_run(cmd, log_path, env, timeout)
+        out = io.StringIO()
+        with mock.patch.object(po.subprocess, 'run', runner), mock.patch.object(po, 'plan', return_value=(bases, [], {})), mock.patch.object(po, 'run_logged', slow), \
+                mock.patch.dict(os.environ, DM_GAMES_DIR=str(self.prof.parent)), contextlib.redirect_stdout(out):
+            po.main(['--game', '0100000000001000', '--msl', str(self.lib), '--out', str(self.out), '--work', str(self.work), '--os-min', '27.0', '--time-limit', '30', '--jobs', '1'])
+        self.assertEqual(limits, [po.RUN_BASE_S + 60, po.RUN_BASE_S + 60, po.RUN_BASE_S + 30, po.RUN_BASE_S + 30])
+        self.assertIn('ran past its limit', out.getvalue())
+        self.assertEqual(po.time_limit(1000, po.PER_PIPELINE_S), po.RUN_BASE_S + 1000 * po.PER_PIPELINE_S); self.assertIsNone(po.time_limit(1000, 0))
+        self.assertTrue((self.out / 'applegpu_g18p.mtl4a').is_file())
+        self.assertNotIn('left out', (self.out / 'archive.tsv').read_text())
 
     def test_merge_failure_never_publishes_partial_archive(self):
         bases = [('v_bp', f'vertex{i}', 'f_b', 'main0') for i in range(3)]
@@ -559,13 +639,14 @@ class Build(unittest.TestCase):
         def fail(cmd, **kw):
             cmd = [str(c) for c in cmd]
             if '-version' in cmd or '--show-sdk-version' in cmd: return self.fake_run(cmd)
-            (self.work / 'translate-0001').mkdir(); (self.work / 'translate-0001/x').write_bytes(b'x'); (self.work / 'a.airp').write_bytes(b'x')
+            tmp = Path(kw['env']['TMPDIR'])   # where metal-tt writes them: the work folder, or a group's folder when the failed run is compiled again in parts
+            (tmp / 'translate-0001').mkdir(); (tmp / 'translate-0001/x').write_bytes(b'x'); (tmp / 'a.airp').write_bytes(b'x')
             return subprocess.CompletedProcess(cmd, 1)
-        usage = lambda _: shutil._ntuple_diskusage(1 << 40, 1 << 40, free_with_temporaries if (self.work / 'a.airp').exists() else 100 << 30)
+        usage = lambda _: shutil._ntuple_diskusage(1 << 40, 1 << 40, free_with_temporaries if next(self.work.rglob('a.airp'), None) else 100 << 30)
         with mock.patch.object(po.subprocess, 'run', fail), mock.patch.object(po.shutil, 'disk_usage', usage), \
                 mock.patch.dict(os.environ, DM_GAMES_DIR=str(self.prof.parent)), contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as e:
             po.main(['--game', '0100000000001000', '--msl', str(self.lib), '--out', str(self.out), '--work', str(self.work)])
-        return str(e.exception), {p.name for p in self.work.iterdir()}
+        return str(e.exception), {p.name for p in self.work.rglob('*')}
 
     def test_metal_tt_failure_on_a_full_volume_says_so(self):   # the free space as it failed, not after its temporaries are cleared: clearing them brings it back above the estimate
         text, left = self.failed_run(100 << 20)
@@ -576,6 +657,26 @@ class Build(unittest.TestCase):
         text, left = self.failed_run(10 << 30)
         self.assertNotIn('out of disk space', text); self.assertIn('metal-tt failed', text)
         self.assertFalse({'translate-0001', 'a.airp'} & left)
+
+
+class RunLogged(unittest.TestCase):
+    """po.run_logged with real processes: a run past its time limit is stopped with the processes it started (metal-tt's air-tt and applegpu-nt go on compiling otherwise)"""
+    def setUp(self): self.t = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, self.t)
+
+    def test_exit_status_and_log(self):
+        self.assertEqual(po.run_logged(['sh', '-c', 'echo made; exit 3'], self.t / 'log', dict(os.environ)), 3)
+        self.assertEqual((self.t / 'log').read_text(), 'made\n')
+
+    def test_time_limit_stops_the_whole_group(self):
+        pid = self.t / 'pid'
+        self.assertIsNone(po.run_logged(['sh', '-c', f'sleep 30 & echo $! > {pid}; wait'], self.t / 'log', dict(os.environ), timeout=1))
+        child = int(pid.read_text())
+        for _ in range(50):   # SIGKILL is delivered at once; give the kernel a moment to reap it
+            try: os.kill(child, 0)
+            except ProcessLookupError: break
+            if subprocess.run(['ps', '-o', 'stat=', '-p', str(child)], capture_output=True, text=True).stdout.strip().startswith('Z'): break
+            time.sleep(0.1)
+        else: self.fail('the grandchild outlived the time limit')
 
 
 class IpaFallback(unittest.TestCase):
