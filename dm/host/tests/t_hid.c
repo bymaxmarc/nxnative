@@ -803,6 +803,13 @@ static void t_swing(void) {
     dm_pad_players(1);
     guest_now = 5000000000ull + (uint64_t)(swing_duration(1500) * 1e9) + SIX_PERIOD_NS;
     CHECK(six_states(st, 1, h) == 1 && st[0].acc[2] == -1 && st[0].gyro[2] == 0 && st[0].dir[0] == 1 && h_hid_SixRest(&h), "after the swing: flat and at rest again");
+    // A front end's key (dm_input_swing, the Mac's V / B): the same swing from the guest clock's now; an axis that does not exist is ignored
+    pthread_mutex_lock(&g_swing_mu); g_swing_set = 0; pthread_mutex_unlock(&g_swing_mu);
+    dm_input_swing(3, 1);
+    guest_now += (uint64_t)(swing_impact(SWING_DPS_DEFAULT) * 1e9);
+    CHECK(six_states(st, 1, h) == 1 && st[0].gyro[2] == 0 && st[0].gyro[0] == 0, "dm_input_swing: no axis 3, no swing");
+    guest_now = 9000000000ull; dm_input_swing(2, -1); guest_now += (uint64_t)(swing_impact(SWING_DPS_DEFAULT) * 1e9);
+    CHECK(six_states(st, 1, h) == 1 && fabsf(st[0].gyro[2] + (float)(SWING_DPS_DEFAULT / 360)) < 1e-3f, "dm_input_swing(2, -1): a backhand about -z at the default speed");
     g_nsteps = 0; g_steps = NULL; guest_now = 1000000000ull; g_phone_mode = -1;
     pthread_mutex_lock(&g_swing_mu); g_swing_set = 0; pthread_mutex_unlock(&g_swing_mu);
     unsetenv("DM_IMU_NOISE"); imu_env_read();
