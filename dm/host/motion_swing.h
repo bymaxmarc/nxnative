@@ -23,19 +23,26 @@
 #define SWING_ACC_MAX_G 8.0
 #define SWING_GRAVITY 9.80665
 
-typedef struct { int axis; double sign, peak_dps; } swing_spec;   // axis 0 x, 1 y, 2 z; sign +1 / -1 (right-handed about the axis); peak in deg/s
+typedef struct { int axis; double sign, peak_dps; int lift; } swing_spec;   // axis 0 x, 1 y, 2 z; sign +1 / -1 (right-handed about the axis); peak in deg/s (a lift: in G)
 
 // "Swing", "Swing-z", "Swingx@1800": the axis with its sign (a "+" is read too, though DM_KEYS cuts its keys at "+") (default +z: lying flat, a turn counterclockwise seen from above) and the peak speed. Returns 0 on anything else
+// A lift ("Lift", "Lift-z", "Liftx@4"): the controller moved along one of its axes without turning, accelerated then braked over LIFT_S (a sine of acceleration, so it ends still,
+// moved by about 2 cm at the default 3 G), as a quick upward flick that tosses a ball; the peak after "@" in G (LIFT_G_MIN..SWING_ACC_MAX_G)
+#define LIFT_S 0.3
+#define LIFT_G_DEFAULT 3.0
+#define LIFT_G_MIN 0.2
 static inline int swing_parse(const char *k, swing_spec *out) {
-    static const char word[] = "swing";
-    for (int i = 0; word[i]; i++) if (!k[i] || (k[i] | 0x20) != word[i]) return 0;
-    const char *s = k + 5;
-    swing_spec sp = {2, 1, SWING_DPS_DEFAULT};
+    static const char word[] = "swing", lword[] = "lift";
+    int lift = 1;
+    for (int i = 0; lword[i]; i++) if (!k[i] || (k[i] | 0x20) != lword[i]) { lift = 0; break; }
+    if (!lift) for (int i = 0; word[i]; i++) if (!k[i] || (k[i] | 0x20) != word[i]) return 0;
+    const char *s = k + (lift ? 4 : 5);
+    swing_spec sp = {2, 1, lift ? LIFT_G_DEFAULT : SWING_DPS_DEFAULT, lift};
     if (*s == '-' || *s == '+') { sp.sign = *s == '-' ? -1 : 1; s++; if (!*s || *s == '@') return 0; }
     if (*s && *s != '@') { int a = (*s | 0x20) - 'x'; if (a < 0 || a > 2) return 0; sp.axis = a; s++; }
     if (*s == '@') {
         char *end; double v = strtod(s + 1, &end);
-        if (end == s + 1 || *end || !(v >= SWING_DPS_MIN && v <= SWING_DPS_MAX)) return 0;
+        if (end == s + 1 || *end || !(lift ? v >= LIFT_G_MIN && v <= SWING_ACC_MAX_G : v >= SWING_DPS_MIN && v <= SWING_DPS_MAX)) return 0;
         sp.peak_dps = v; s = end;
     }
     if (*s) return 0;
@@ -44,6 +51,8 @@ static inline int swing_parse(const char *k, swing_spec *out) {
 static inline double swing_seconds(double peak_dps) { return 2 * SWING_DEG / peak_dps; }   // the swing alone: a sin^2 profile covers its angle at half its peak on average
 static inline double swing_duration(double peak_dps) { return 2 * SWING_BACK_S + swing_seconds(peak_dps); }
 static inline double swing_impact(double peak_dps) { return SWING_BACK_S + swing_seconds(peak_dps) / 2; }
+static inline double swing_spec_duration(const swing_spec *sp) { return sp->lift ? LIFT_S : swing_duration(sp->peak_dps); }
+static inline double swing_spec_impact(const swing_spec *sp) { return sp->lift ? LIFT_S / 4 : swing_impact(sp->peak_dps); }
 
 // One sin^2 segment of length d (s) turning by phi (rad), tau seconds in: the angle so far, the speed and the angular acceleration
 static inline void swing_segment(double tau, double d, double phi, double *th, double *w, double *al) {
@@ -56,6 +65,11 @@ static inline void swing_segment(double tau, double d, double phi, double *th, d
 static inline int swing_pose(const swing_spec *sp, double t, float acc[3], float gyro[3], float angle[3], float dir[9]) {
     memset(acc, 0, 3 * sizeof *acc); memset(gyro, 0, 3 * sizeof *gyro); memset(angle, 0, 3 * sizeof *angle); memset(dir, 0, 9 * sizeof *dir);
     acc[2] = -1; dir[0] = dir[4] = dir[8] = 1;
+    if (sp->lift) {   // no turn: the gravity direction less the acceleration along the axis, a sine over LIFT_S
+        if (!(t >= 0 && t < LIFT_S)) return 0;
+        acc[sp->axis] -= (float)(sp->sign * sp->peak_dps * sin(2 * M_PI * t / LIFT_S));
+        return 1;
+    }
     double S = swing_seconds(sp->peak_dps), T = swing_duration(sp->peak_dps), big = SWING_DEG * M_PI / 180;
     if (!(t >= 0 && t < T)) return 0;
     double th, w, al;

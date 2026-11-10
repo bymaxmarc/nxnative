@@ -113,6 +113,16 @@ static void swing_checks(void) {
     CHECK(swing_parse("SWINGY", &sp) && sp.axis == 1 && sp.sign == 1, "SwingY: any case");
     CHECK(!swing_parse("Swing@5000", &sp) && !swing_parse("Swing@", &sp) && !swing_parse("Swingw", &sp) && !swing_parse("Swing-", &sp) && !swing_parse("Swingz1", &sp) && !swing_parse("Swin", &sp) && !swing_parse("Shake", &sp),
           "bad swings are refused (speed out of range, no axis after a sign, unknown axis, trailing text)");
+    CHECK(swing_parse("Lift", &sp) && sp.lift && sp.axis == 2 && sp.sign == 1 && sp.peak_dps == LIFT_G_DEFAULT && !swing_parse("Lift@9", &sp) && swing_parse("lift-x@1", &sp) && sp.lift && sp.axis == 0 && sp.sign == -1,
+          "Lift: a move along +z at 3 G by default, any axis and sign, at most 8 G");
+    CHECK(swing_parse("Swing", &sp) && !sp.lift, "Swing is no lift");
+    {   // a lift up: the reading is heavier (-z beyond 1 G) while it speeds up, lighter while it brakes, no turn, still and flat afterwards
+        float a[3], g[3], an[3], d[9]; swing_spec up = {2, 1, 3, 1};
+        CHECK(swing_pose(&up, LIFT_S / 4, a, g, an, d) && fabsf(a[2] + 4) < 1e-4f && a[0] == 0 && g[0] == 0 && g[2] == 0 && d[8] == 1, "lift: at its quarter, -1 - 3 G on z, no rotation");
+        CHECK(swing_pose(&up, 3 * LIFT_S / 4, a, g, an, d) && fabsf(a[2] - 2) < 1e-4f, "lift: braking, -1 + 3 G");
+        CHECK(!swing_pose(&up, LIFT_S, a, g, an, d) && a[2] == -1, "lift: done after LIFT_S, at rest");
+        CHECK(swing_spec_duration(&up) == LIFT_S && swing_spec_impact(&up) == LIFT_S / 4, "lift: its length and its strongest push");
+    }
     float acc[3], gyro[3], ang[3], dir[9];
     swing_spec z = {2, 1, 1500};
     CHECK(!swing_pose(&z, -0.01, acc, gyro, ang, dir) && acc[2] == -1 && dir[0] == 1 && gyro[2] == 0, "before the swing: at rest, flat");

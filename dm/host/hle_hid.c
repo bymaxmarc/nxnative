@@ -65,11 +65,12 @@ static pthread_mutex_t g_swing_mu = PTHREAD_MUTEX_INITIALIZER;
 static swing_spec g_swing; static uint64_t g_swing_t0; static int g_swing_set;
 static void swing_start(const swing_spec *sp) {
     pthread_mutex_lock(&g_swing_mu); g_swing = *sp; g_swing_t0 = guest_ns(); g_swing_set = 1; pthread_mutex_unlock(&g_swing_mu);
-    LOG("swing: about %c%c at %.0f deg/s, impact %.2f s after the press, over %.2f s", sp->sign < 0 ? '-' : '+', "xyz"[sp->axis], sp->peak_dps, swing_impact(sp->peak_dps), swing_duration(sp->peak_dps));
+    if (sp->lift) LOG("swing: a lift along %c%c at %.1f G, over %.2f s", sp->sign < 0 ? '-' : '+', "xyz"[sp->axis], sp->peak_dps, LIFT_S);
+    else LOG("swing: about %c%c at %.0f deg/s, impact %.2f s after the press, over %.2f s", sp->sign < 0 ? '-' : '+', "xyz"[sp->axis], sp->peak_dps, swing_impact(sp->peak_dps), swing_duration(sp->peak_dps));
 }
 void dm_input_swing(int axis, int sign) {   // a front end's key (dm_input.h)
     if (axis < 0 || axis > 2) return;
-    swing_spec sp = {axis, sign < 0 ? -1 : 1, SWING_DPS_DEFAULT}; swing_start(&sp);
+    swing_spec sp = {axis, sign < 0 ? -1 : 1, SWING_DPS_DEFAULT, 0}; swing_start(&sp);
 }
 // The swing's pose at guest time t (ns): 1 while it plays (acc, gyro, angle, dir filled), else 0
 static int swing_at(uint64_t t, float acc[3], float gyro[3], float angle[3], float dir[9]) {
