@@ -1,5 +1,6 @@
 // nn::hid (controller): on the real device shared memory is read through the hid service; the host takes the current state written by the front end (Mac keyboard / controller, iOS virtual gamepad / controller).
-// Generic, game-independent version: player 1 is always connected, as the handheld controller (Npad id 0x20) with DM_OPMODE=0 (handheld), otherwise as the 1P full-key controller (id 0);
+// Generic, game-independent version: player 1 is always connected, as the handheld controller (Npad id 0x20) with DM_OPMODE=0 (handheld), otherwise as the 1P full-key controller (id 0;
+// a dual Joy-Con pair when the game supports no full-key style, pad_style);
 // players 2..8 are full-key controllers on No2..No8 (ids 1..7) while the front end reports a controller for them (dm_pad_players; the Mac gives each physical controller a player
 // of its own, front_mac.m). A player whose npad the game does not support (SetSupportedNpadIdType) is not reported: in a one-player game it feeds player 1, otherwise it is not used.
 // Six-axis sensor: one per connected controller (two for handheld), at rest lying flat, player 1's shaken side to side while the front end holds DM_BTN_SHAKE (see the six-axis section below).
@@ -343,10 +344,19 @@ static npad_ref npad_resolve(uint32_t id) {
     }
     return r;
 }
+// The style of a whole controller (KIND_PAD: the keyboard, a Pro-like pad, a Joy-Con pair the game supports no Joy-Con style for): Handheld on the Handheld npad, full-key elsewhere.
+// The hid service connects a controller only in a style the game supports (SetSupportedNpadStyleSet), and games test the style before anything else: Nintendo Switch Sports Resort
+// supports Handheld | JoyDual (0x6) in its lobby (main+0xa9e940), and its player check (main+0x58d0f0) found no player 1 on a full-key No1, so it opened the controller applet
+// again every frame (main+0x3f9d264), 7,162 times in 3 minutes. Docked, a full-key controller the game does not support is shown as a JoyDual pair instead, the supported style
+// that has all its buttons and both sticks; no other style has them, so a game that supports neither keeps full-key, as before
+static uint32_t pad_style(uint32_t id) {
+    if (id == NPAD_HANDHELD) return STYLE_HANDHELD;
+    return !(g_styles_supported & STYLE_FULLKEY) && (g_styles_supported & STYLE_JOYDUAL) ? STYLE_JOYDUAL : STYLE_FULLKEY;
+}
 static uint32_t kind_style(npad_ref r, uint32_t id) {
     uint32_t two = r.pad >= 0 && r.pad < DM_PLAYERS && atomic_load(&g_joy_two[r.pad]) ? g_styles_supported : 0;
     switch (r.kind) {
-    case KIND_PAD: return id == NPAD_HANDHELD ? STYLE_HANDHELD : STYLE_FULLKEY;
+    case KIND_PAD: return pad_style(id);
     case KIND_DUAL: return STYLE_JOYDUAL | (two & STYLE_JOYDUAL2);
     case KIND_LEFT: return STYLE_JOYLEFT | (two & STYLE_JOYLEFT2);
     case KIND_RIGHT: return STYLE_JOYRIGHT | (two & STYLE_JOYRIGHT2);
@@ -608,7 +618,11 @@ HLE_FORCE("_ZN2nn3hid22SetSupportedNpadIdTypeEPKjm", "supported controller ids; 
     note_merged();
 }
 HLE_FORCE("_ZN2nn3hid24SetSupportedNpadStyleSetENS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE", "supported controller styles; the host records them and picks the reported style from them", void, h_hid_SetStyles, uint32_t styles) {
-    if (styles != g_styles_supported) LOG("hid supported controller styles %#x", styles); g_styles_supported = styles; }
+    if (styles == g_styles_supported) return;
+    uint32_t was[DM_PLAYERS]; for (uint32_t i = 0; i < DM_PLAYERS; i++) was[i] = style_of(i);
+    LOG("hid supported controller styles %#x", styles); g_styles_supported = styles;
+    for (uint32_t i = 0; i < DM_PLAYERS; i++) if (style_of(i) != was[i]) style_changed(i);   // a controller now shown in another style (pad_style), as the hid service reports it
+}
 HLE_FORCE("_ZN2nn3hid15GetNpadStyleSetERKj", "controller style query; follows DM_OPMODE", uint32_t, h_hid_GetStyle, const uint32_t *id) { return style_of(*id); }
 HLE_FORCE("_ZN2nn3hid13GetNpadStatesEPNS0_16NpadFullKeyStateEiRKj", "full-key controller states", int, h_hid_StatesFullKey, NpadState *s, int n, const uint32_t *id) { return states(s, n, *id, STYLE_FULLKEY); }
 HLE_FORCE("_ZN2nn3hid13GetNpadStatesEPNS0_17NpadHandheldStateEiRKj", "handheld controller states", int, h_hid_StatesHandheld, NpadState *s, int n, const uint32_t *id) { return states(s, n, *id, STYLE_HANDHELD); }
@@ -1130,13 +1144,15 @@ static uint32_t vib_targets(uint32_t h, int *motor) {
     *motor = (int)(dev & 1);
     if (h >> 24 || dev > 1 || type < 3 || type > 7) return 0;
     npad_ref r = npad_resolve(id);
+    int p = player_of(id);
+    uint32_t pad_players = p == 0 ? 1u | merged_players() : p > 0 ? 1u << p : 0;   // a whole controller's motors: player 1's merged controllers too
     if (type >= 5) {
+        if (type == 5 && r.kind == KIND_PAD && kind_style(r, id) == STYLE_JOYDUAL) return dm_haptics_available() & pad_players;   // a controller shown as a pair (pad_style)
         if (r.kind != (type == 5 ? KIND_DUAL : type == 6 ? KIND_LEFT : KIND_RIGHT) || (type != 5 && dev)) return 0;
         if (type != 5) *motor = type == 7;
         return dm_haptics_available() & (1u << r.pad);
     }
     if (type > 4) return 0;
-    int p = player_of(id);
     // A full-key handle on an npad that now holds Joy-Cons still reaches them: a game keeps the handles it got before the Joy-Cons connected (Super Mario Odyssey asks for the
     // JoyDual handles when the pair connects, but keeps sending to its full-key ones). Its motor is the Joy-Con of that side; a single Joy-Con takes the handle of its side
     if (p >= 0 && r.kind >= KIND_DUAL && type == 3 && id != NPAD_HANDHELD) {
@@ -1144,8 +1160,10 @@ static uint32_t vib_targets(uint32_t h, int *motor) {
         if (r.kind == KIND_RIGHT && !dev) return 0;
         return dm_haptics_available() & (1u << r.pad);
     }
-    if (p < 0 || r.kind != KIND_PAD || kind_style(r, id) != (1u << (type - 3))) return 0;
-    return dm_haptics_available() & (p == 0 ? 1u | merged_players() : 1u << p);
+    // A controller shown as a pair because the game supports no full-key style keeps the full-key handles it got before the game changed its styles, as a pair's Joy-Cons do
+    uint32_t st = kind_style(r, id);
+    if (p < 0 || r.kind != KIND_PAD || (st != (1u << (type - 3)) && !(type == 3 && st == STYLE_JOYDUAL))) return 0;
+    return dm_haptics_available() & pad_players;
 }
 static void vib_send(const uint32_t *handles, const dm_vibration *values, int n) {
     if (!handles || !values || n <= 0) return;
@@ -1184,7 +1202,8 @@ HLE_FORCE("_ZN2nn3hid25GetVibrationDeviceHandlesEPNS0_21VibrationDeviceHandleEiR
         return 0;
     }
     npad_ref r = npad_resolve(*id);
-    uint32_t type = r.kind == KIND_DUAL ? 5u : r.kind == KIND_LEFT ? 6u : r.kind == KIND_RIGHT ? 7u : *id == NPAD_HANDHELD ? 4u : 3u;
+    uint32_t st = kind_style(r, *id);   // the handle's type follows the reported style (a whole controller may be shown as a pair, pad_style)
+    uint32_t type = st & STYLE_JOYDUAL ? 5u : st & STYLE_JOYLEFT ? 6u : st & STYLE_JOYRIGHT ? 7u : st & STYLE_HANDHELD ? 4u : 3u;
     uint32_t base = (*id << 8) | type;
     int count = n < (r.kind == KIND_LEFT || r.kind == KIND_RIGHT ? 1 : 2) ? n : (r.kind == KIND_LEFT || r.kind == KIND_RIGHT ? 1 : 2);
     for (int i = 0; i < count; i++) h[i] = base | (uint32_t)i << 16;

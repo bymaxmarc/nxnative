@@ -340,6 +340,14 @@ Most service calls can be found before they crash, before the first boot or the 
   | [Super Mario Bros. Wonder](../../dm/games/010015100B514000/README.md) 1.2.1 | a pair was one controller: its two-player screen found one and was canceled | choosing two players splits the pair (single assignment): one sideways Joy-Con each |
   | [Super Smash Bros. Ultimate](../../dm/games/01006A800016E000/README.md) 13.0.5 | a pair was one Pro-style pad; one Joy-Con could never be a fighter of its own | holding SL + SR splits the pair into two sideways players; a 1v1 with a Joy-Con each, the rail buttons as shoulders, rumble on each |
 
+### A controller in a style the game does not support
+
+- **Symptom:** docked, the game opens the controller applet again every frame and never leaves the screen behind it. The log repeats `oe library applet: controller support`, `hid controller applet: 1 to 1 players wanted, 1 connected` and focus 2, then 1, thousands of times (7,162 in 3 minutes), after `hid supported controller styles 0x6`.
+- **Cause:** the host showed every whole controller (the keyboard, a Pro-like pad, a Joy-Con pair the game supports no Joy-Con style for) as full-key on No1..No8, whatever styles the game supports. The hid service connects a controller only in a supported style, so a game may take any connected npad as one of its own. Nintendo Switch Sports Resort sets Handheld | JoyDual (0x6) for its Tennis lobby (`main+0xa9e940`); its player check (`main+0x58d0f0`) found no usable player 1 on a full-key No1, so its caller (`main+0x3f9d120`) opened `ShowControllerSupport` again, and the applet's answer (one player, No1) could not change that.
+- **Fix:** docked, a whole controller is shown as a JoyDual pair when the game supports JoyDual but not full-key (`pad_style`, `hle_hid.c`): JoyDual is the only other style with all its buttons and both sticks. Its JoyDual state, two six-axis sensors, type 5 vibration handles and the applet's selected npad follow; full-key handles taken earlier still reach its motors. A change of supported styles that changes an npad's style signals that npad's style update event. Handheld mode keeps the Handheld npad, and a game that supports full-key, or neither style, is unchanged.
+- **Found on:** Nintendo Switch Sports Resort (04008E001F098000, no profile yet), on the Mac with the keyboard and `DM_KEYS`: after the fix the applet is not opened once in 220 s, and Play leads to its one-controller screen ("press the button") and into a doubles Tennis match at its serve prompt.
+- **Check:** `t_hid` (`t_unsupported_style`).
+
 ### Live controller motion
 
 - **Symptom:** motion controls do nothing with a controller that has a gyroscope (Breath of the Wild: aiming with its Motion Controls option on); the six-axis sensor always lies flat.

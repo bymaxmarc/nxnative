@@ -220,6 +220,42 @@ static void t_joycons(void) {
     dm_haptics_route(0, 0); dm_pad_players(1); h_hid_SetStyles(0xffffffffu);
 }
 
+// A game that supports no full-key style (Nintendo Switch Sports Resort's lobby: Handheld | JoyDual, 0x6): a controller that is not a Joy-Con pair (the keyboard, a Pro-like pad)
+// is shown docked as a dual Joy-Con pair, the supported style that has its buttons and both sticks, so GetNpadStyleSet only answers supported styles; the states, six-axis sensors,
+// vibration handles and the controller applet's answer follow. Handheld mode and a game that supports full-key: unchanged
+static void vibration_sink(dm_haptic_state s);
+static void t_unsupported_style(void) {
+    static uint8_t ev0[0x40];
+    g_mode = 1; ids((uint32_t[]){0, 1, 2, 3, NPAD_HANDHELD}, 5); dm_pad_players(1);
+    h_hid_SetStyles(0x1f);
+    CHECK(h_hid_GetStyle(&(uint32_t){0}) == STYLE_FULLKEY, "full-key supported: player 1 is full-key, as before");
+    h_hid_BindStyleEv(&(uint32_t){0}, ev0, 0);
+    g_signals = 0; h_hid_SetStyles(STYLE_HANDHELD | STYLE_JOYDUAL);
+    CHECK(h_hid_GetStyle(&(uint32_t){0}) == STYLE_JOYDUAL, "full-key not supported: player 1's controller is a JoyDual npad on No1");
+    CHECK(g_signals > 0 && g_signalled == ev0, "No1's style event signalled when its style changes with the supported styles");
+    dm_input_set(DM_BTN_A, -12000, 0, 0, 9000);
+    NpadState st = npad_of(0, STYLE_JOYDUAL);
+    CHECK((st.buttons & DM_BTN_A) && st.lx == -12000 && st.ry == 9000 && st.attributes == (ATTR_CONNECTED | ATTR_LEFT_CONN | ATTR_RIGHT_CONN), "its JoyDual state: the keyboard's buttons and both sticks, both halves connected");
+    CHECK(!npad_of(0, STYLE_FULLKEY).attributes, "no full-key state for it");
+    dm_input_set(0, 0, 0, 0, 0); npad_of(0, STYLE_JOYDUAL);
+    uint32_t h[2], id = 0;
+    CHECK(h_hid_SixHandles(h, 2, &id, STYLE_JOYDUAL) == 2 && six_connected(h[0]) && six_connected(h[1]), "two six-axis sensors, connected");
+    dm_haptics_init(vibration_sink, 1); dm_haptics_route(0, 1);
+    CHECK(h_hid_VibHandles(h, 2, &id, STYLE_JOYDUAL) == 2 && (h[0] & 0xff) == 5 && h[1] == (h[0] | 1u << 16), "JoyDual vibration handles: type 5, two motors");
+    { int m; CHECK(vib_targets(h[1], &m) == 1 && m == 1 && vib_targets(0x0003, &m) == 1 && m == 0, "they reach player 1's motors, and so do the full-key handles it got before"); }
+    dm_haptics_route(0, 0);
+    int32_t info[2]; int8_t arg[8] = {1, 1};
+    CHECK(h_hid_ShowCtrl(info, arg) == RES_OK && info[0] == 1 && (h_hid_GetStyle(&(uint32_t){(uint32_t)info[1]}) & h_hid_GetStyles()), "the controller applet selects an npad whose style the game supports");
+    dm_pad_players(3);
+    CHECK(h_hid_GetStyle(&(uint32_t){1}) == STYLE_JOYDUAL, "player 2's controller: JoyDual on No2 too");
+    dm_pad_players(1);
+    g_mode = 0;
+    CHECK(h_hid_GetStyle(&(uint32_t){NPAD_HANDHELD}) == STYLE_HANDHELD, "handheld mode: the Handheld npad, supported");
+    g_mode = 1; h_hid_SetStyles(STYLE_JOYLEFT | STYLE_JOYRIGHT);
+    CHECK(h_hid_GetStyle(&(uint32_t){0}) == STYLE_FULLKEY, "no style with a whole controller's buttons supported: full-key, as before");
+    h_hid_SetStyles(0xffffffffu); atomic_store(&g_style_ev[0], NULL);
+}
+
 // A Joy-Con's mouse sensor (dm_joy_mouse): its JcmsState ring by handle (npad id, JcmsType 0 left / 1 right), newest first; none for a Joy-Con that never reported
 static void t_jcms(void) {
     g_mode = 1; ids((uint32_t[]){0, 1}, 2); dm_pad_players(1); dm_joy_attach(0, 3);
@@ -740,6 +776,7 @@ int main(void) {
     t_script();
     t_vibration();
     t_joycons();
+    t_unsupported_style();
     t_jcms();
     t_rumble_log();
     t_motion_threads();
