@@ -1014,6 +1014,22 @@ static void t_live_edges(void) {
         float n0 = o2.dir[0] * o2.dir[0] + o2.dir[1] * o2.dir[1] + o2.dir[2] * o2.dir[2], d01 = o2.dir[0] * o2.dir[3] + o2.dir[1] * o2.dir[4] + o2.dir[2] * o2.dir[5];
         CHECK(fabsf(n0 - 1) < 1e-4f && fabsf(d01) < 1e-4f && fabsf(o2.dir[0] - 0.7071f) < 1e-3f && fabsf(o2.dir[1] - 0.7071f) < 1e-3f, "edges: the direction halfway between a quarter turn is the eighth turn, a rotation");
     }
+    {   // half a turn apart (the blend vanishes) or 60 ms apart: the nearer sample's direction, a rotation
+        motion_sample r3[2] = {{.t = 0, .dir = {1, 0, 0, 0, 1, 0, 0, 0, 1}}, {.t = 10, .dir = {-1, 0, 0, 0, -1, 0, 0, 0, 1}}}, o3;
+        live_at(r3, 2, 4, &o3); CHECK(o3.dir[0] == 1 && o3.dir[4] == 1 && o3.dir[8] == 1, "edges: half a turn apart, the nearer direction (the earlier one)");
+        live_at(r3, 2, 6, &o3); CHECK(o3.dir[0] == -1 && o3.dir[4] == -1, "edges: and the later one past halfway");
+        motion_sample r4[2] = {{.t = 0, .dir = {1, 0, 0, 0, 1, 0, 0, 0, 1}}, {.t = 60000000, .dir = {0, 1, 0, -1, 0, 0, 0, 0, 1}}};
+        live_at(r4, 2, 20000000, &o3); CHECK(o3.dir[0] == 1 && o3.dir[1] == 0, "edges: samples 60 ms apart: no blend, the nearer direction");
+    }
+    {   // the clock going back by more than a second (a reset): the marks start again from it instead of pinning the old numbers
+        uint64_t was = guest_now;
+        guest_now += 10000000000ull; edge_read(&w);
+        guest_now = was; TestImuSample q[2];
+        CHECK(h_hid_ImuSamples(q, 2, 0x20003) == 2 && q[1].sampling == (int64_t)(guest_now / 5000000) + 1, "edges: the clock 10 s back: the IMU numbers follow it");
+        SixAxisState st5; uint32_t h5 = 0x3; CHECK(h_hid_SixStates(&st5, 1, &h5) == 1 && st5.sampling == (int64_t)(guest_now / 5000000), "edges: and the six-axis history's");
+        guest_now += 3000000; CHECK(h_hid_ImuSamples(q, 2, 0x20003) == 2 && q[1].sampling == (int64_t)(guest_now / 5000000) + 1, "edges: then they follow it on");
+        TestImuSample q2[2]; guest_now -= 500000000; CHECK(h_hid_ImuSamples(q2, 2, 0x20003) == 2 && q2[1].sampling == q[1].sampling, "edges: back by half a second only: held at the mark");
+    }
     atomic_store(&g_test_lag, 0); dm_motion_clear_hid(0); h_hid_ImuDisable(); unsetenv("DM_IMU_NOISE"); imu_env_read();
     guest_now = 1000000000ull; motion_now = 1000000000ull; g_phone_mode = -1;
 }

@@ -765,6 +765,7 @@ enum { MOTION_STALE_NS = 300000000 };
 // LIVE_RING samples cover 128 ms at 1 kHz and 1.28 s at 100 Hz, more than the 16 ticks (80 ms) an IMU answer reaches back at any source rate the host sees; 80 bytes each,
 // about 340 KB for every stream of every player
 enum { LIVE_RING = 128 };
+#define LIVE_BLEND_MAX_NS 50000000ull   // live_at: past 50 ms between two samples, no blend of their directions
 typedef struct { uint64_t t; float acc[3], gyro[3], angle[3], dir[9]; } motion_sample;   // t: the sample's host ns in the ring, guest ns once copied out (live_ring_copy); the SixAxisSensorState fields (motion_fill)
 typedef struct { pthread_mutex_t mu; motion_state st; uint64_t last_ns, received_ns, logged; motion_sample ring[LIVE_RING]; unsigned head, count; } live_motion;
 static live_motion g_motion[DM_PLAYERS] = {[0 ... DM_PLAYERS - 1] = {.mu = PTHREAD_MUTEX_INITIALIZER}};
@@ -897,8 +898,14 @@ static void live_at(const motion_sample *r, unsigned n, uint64_t t, motion_sampl
     float f = (float)((double)(t - a->t) / (double)(b->t - a->t));
     o->t = t;
     for (int i = 0; i < 3; i++) { o->acc[i] = a->acc[i] + (b->acc[i] - a->acc[i]) * f; o->gyro[i] = a->gyro[i] + (b->gyro[i] - a->gyro[i]) * f; o->angle[i] = a->angle[i] + (b->angle[i] - a->angle[i]) * f; }
-    // direction: the two rotations blended and made a rotation again (normalized lerp; a 5 ms step turns far less than the angle where that departs from a slerp)
+    // direction: the two rotations blended and made a rotation again (normalized lerp; a 5 ms step turns far less than the angle where that departs from a slerp). Samples more
+    // than LIVE_BLEND_MAX_NS apart, or a blend that nearly vanishes (rotations about half a turn apart: a column shorter than 0.5), take the nearer sample's direction instead,
+    // so the direction is always a rotation
+    const motion_sample *near = f < 0.5f ? a : b;
+    memcpy(o->dir, near->dir, sizeof o->dir);
+    if (b->t - a->t > LIVE_BLEND_MAX_NS) return;
     float R[3][3]; for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) R[i][j] = a->dir[3 * i + j] + (b->dir[3 * i + j] - a->dir[3 * i + j]) * f;
+    for (int j = 0; j < 3; j++) if (R[0][j] * R[0][j] + R[1][j] * R[1][j] + R[2][j] * R[2][j] < 0.25f) return;
     m3_orthonormalize(R);
     for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) o->dir[3 * i + j] = R[i][j];
 }
@@ -907,7 +914,7 @@ static void live_at(const motion_sample *r, unsigned n, uint64_t t, motion_sampl
 // read the clock a moment earlier, nor when the source changes. Before, a live answer ended at the newest sample's tick: a first sample stamped a few ticks late, or a switch
 // between a controller's GameController and HID streams with different latencies, took the numbers back, and a game polling faster than its controller reported read the same
 // numbers again, then a jump when the controller stopped. HWM_SLOTS handles per kind; an unknown handle past them goes by the clock alone
-enum { HWM_SLOTS = 64 };
+enum { HWM_SLOTS = 64, HWM_BACK_TICKS = 200 };   // 200 ticks: 1 s
 typedef struct { _Atomic uint32_t key[HWM_SLOTS]; _Atomic int64_t tick[HWM_SLOTS]; } tick_hwm;
 static tick_hwm g_hwm_states, g_hwm_imu;
 static int64_t answer_tick(tick_hwm *w, uint32_t h, int64_t now_tick) {
@@ -917,8 +924,9 @@ static int64_t answer_tick(tick_hwm *w, uint32_t h, int64_t now_tick) {
         if (!k) { uint32_t z = 0; if (!atomic_compare_exchange_strong(&w->key[at], &z, key) && z != key) continue; k = key; }
         if (k != key) continue;
         int64_t prev = atomic_load(&w->tick[at]);
-        while (prev < now_tick && !atomic_compare_exchange_weak(&w->tick[at], &prev, now_tick)) {}
-        return prev > now_tick ? prev : now_tick;
+        // a mark more than HWM_BACK_TICKS ahead of the clock means the clock went back (a reset, a restored state): start again from the clock, not pinned to the old mark
+        while ((prev < now_tick || prev - now_tick > HWM_BACK_TICKS) && !atomic_compare_exchange_weak(&w->tick[at], &prev, now_tick)) {}
+        return prev > now_tick && prev - now_tick <= HWM_BACK_TICKS ? prev : now_tick;
     }
     return now_tick;
 }
