@@ -631,7 +631,7 @@ static void t_npad_imu(void) {
 // Npad IMU samples (Switch 2): stateless, as the console's ring in shared memory. A call returns the newest min(n, 16) 5 ms ticks on the guest clock, oldest first, numbered by absolute
 // tick + 1; the SDK's fusion skips numbers it has taken (sdk+0x6d7198), so a repeated tick is harmless and every reader gets every tick. Units are the fusion's: m/s^2 and rad/s, with the
 // signs it undoes (sdk+0x6d7334, +0x6d74a0)
-typedef struct { int64_t sampling, delta_ns; float gyro[3], acc[3]; } TestImuSample;
+typedef struct { int64_t sampling, delta_ns; float acc[3], gyro[3]; } TestImuSample;   // acceleration at +0x10, angular velocity at +0x1c (sdk+0x6d7320)
 _Static_assert(sizeof(TestImuSample) == 0x28, "NpadImuSample");
 static int imu_numbered(const TestImuSample *s, int k, int64_t first) {   // k samples numbered first, first + 1, ... each 5 ms apart
     for (int i = 0; i < k; i++) if (s[i].sampling != first + i || s[i].delta_ns != 5000000) return 0;
@@ -646,7 +646,7 @@ static void *imu_reader(void *arg) {   // reads the newest 16 at a fixed guest t
 }
 static void t_npad_imu_samples(void) {
     g_mode = 1; dm_pad_players(1); g_phone_mode = 0;
-    setenv("DM_IMU_NOISE", "0", 1); imu_env_read();   // exact values here; t_imu_noise checks the noise
+    setenv("DM_IMU_NOISE", "0", 1); unsetenv("DM_IMU_ACC_SIGN"); unsetenv("DM_IMU_GYRO_SIGN"); imu_env_read();   // exact values and the host's own signs here; t_imu_noise checks the noise
     atomic_store(&g_shake_t0, 0); atomic_store(&g_shake_end, 0);
     uint32_t h = 0x20003;   // the SDK's own handle (utility::GetSixAxisSensorHandle, sdk+0x6d8490): full key (style index 3) on No1, the whole controller (device 2)
     imu_handle = h;
@@ -655,7 +655,11 @@ static void t_npad_imu_samples(void) {
     CHECK(h_hid_ImuSamples(s, 16, h) == 0 && s[0].sampling == (int64_t)0xABABABABABABABABull, "imu: off, no samples and nothing written");
     uint8_t ring[64]; CHECK(h_hid_ImuEnable(ring, sizeof ring) == 0, "imu: on");
     CHECK(h_hid_ImuSamples(s, 1, h) == 1 && imu_numbered(s, 1, 401), "imu: numbered by absolute tick + 1");
-    CHECK(s[0].acc[0] == 0 && s[0].acc[1] == 0 && fabsf(s[0].acc[2] - 9.80665f) < 1e-5f, "imu: at rest (0, 0, -1) G reads (0, 0, +9.80665) m/s^2");
+    CHECK(s[0].acc[0] == 0 && s[0].acc[1] == 0 && fabsf(s[0].acc[2] + 9.80665f) < 1e-5f, "imu: at rest (0, 0, -1) G reads (0, 0, -9.80665) m/s^2");
+    {   // the layout the fusion reads: acceleration at +0x10, angular velocity at +0x1c
+        float raw[10]; memcpy(raw, &s[0], sizeof raw);
+        CHECK(sizeof(TestImuSample) == 0x28 && fabsf(raw[(0x10 + 8) / 4] + 9.80665f) < 1e-5f && raw[(0x1c + 8) / 4] == 0, "imu: acceleration at +0x10 (z at +0x18), angular velocity at +0x1c");
+    }
     CHECK(s[0].gyro[0] == 0 && s[0].gyro[1] == 0 && s[0].gyro[2] == 0, "imu: at rest no rotation");
     CHECK(h_hid_ImuSamples(s, 16, h) == 16 && imu_numbered(s, 16, 386), "imu: the newest 16 ending at the current tick, oldest first");
     CHECK(h_hid_ImuSamples(t, 16, h) == 16 && !memcmp(s, t, 16 * sizeof *s), "imu: the same tick again gives the same numbers (the fusion skips them)");
@@ -667,18 +671,18 @@ static void t_npad_imu_samples(void) {
     hwm_clear(), guest_now = 2000000; CHECK(h_hid_ImuSamples(s, 16, h) == 1 && imu_numbered(s, 1, 1), "imu: at the clock's start, the first tick only, number 1");
     hwm_clear(), guest_now = 2015000000ull;
 
-    // A live controller: its acceleration and rotation, converted. 0.5 rev/s about z is pi rad/s; the fusion negates the gyro and the acceleration's output scale (G = -m/s^2 / g)
+    // A live controller: its acceleration and rotation, converted. 0.5 rev/s about z is pi rad/s; G x 9.80665 m/s^2 (the fusion negates it into a specific force)
     float a[3] = {0.5f, 0, -0.8660254f}, w[3] = {0, 0, 3.14159265f};
     dm_motion_set(0, a, w);
     CHECK(h_hid_ImuSamples(s, 2, h) == 2 && imu_numbered(s, 2, 403), "imu: live motion keeps the numbering");
-    CHECK(fabsf(s[1].acc[0] + 0.5f * 9.80665f) < 1e-4f && fabsf(s[1].acc[2] - 0.8660254f * 9.80665f) < 1e-4f, "imu: live acceleration, -G x 9.80665");
-    CHECK(fabsf(s[1].gyro[2] + 3.14159265f) < 1e-4f && s[1].gyro[0] == 0, "imu: live rotation, -rev/s x 2 pi");
-    // DM_IMU_ACC_SIGN / DM_IMU_GYRO_SIGN = 1 keep the host's signs
-    setenv("DM_IMU_ACC_SIGN", "1", 1); setenv("DM_IMU_GYRO_SIGN", "1", 1); imu_env_read();
-    CHECK(h_hid_ImuSamples(s, 1, h) == 1 && fabsf(s[0].acc[0] - 0.5f * 9.80665f) < 1e-4f && fabsf(s[0].gyro[2] - 3.14159265f) < 1e-4f, "imu: both signs flipped by the switches");
-    setenv("DM_IMU_GYRO_SIGN", "-1", 1); imu_env_read();
-    CHECK(h_hid_ImuSamples(s, 1, h) == 1 && s[0].acc[0] > 0 && s[0].gyro[2] < 0, "imu: each sign on its own");
-    unsetenv("DM_IMU_ACC_SIGN"); unsetenv("DM_IMU_GYRO_SIGN"); imu_env_read();
+    CHECK(fabsf(s[1].acc[0] - 0.5f * 9.80665f) < 1e-4f && fabsf(s[1].acc[2] + 0.8660254f * 9.80665f) < 1e-4f, "imu: live acceleration, G x 9.80665");
+    CHECK(fabsf(s[1].gyro[2] - 3.14159265f) < 1e-4f && s[1].gyro[0] == 0, "imu: live rotation, rev/s x 2 pi");
+    // DM_IMU_ACC_SIGN / DM_IMU_GYRO_SIGN = -1 negate either
+    setenv("DM_IMU_ACC_SIGN", "-1", 1); setenv("DM_IMU_GYRO_SIGN", "-1", 1); imu_env_read();
+    CHECK(h_hid_ImuSamples(s, 1, h) == 1 && fabsf(s[0].acc[0] + 0.5f * 9.80665f) < 1e-4f && fabsf(s[0].gyro[2] + 3.14159265f) < 1e-4f, "imu: both signs flipped by the switches");
+    setenv("DM_IMU_GYRO_SIGN", "1", 1); imu_env_read();
+    CHECK(h_hid_ImuSamples(s, 1, h) == 1 && s[0].acc[0] < 0 && s[0].gyro[2] > 0, "imu: each sign on its own");
+    setenv("DM_IMU_GYRO_SIGN", "-1", 1); imu_env_read();   // the rest of the tests: negated (main)
     dm_motion_clear(0);
 
     // Another device reads the same clock; a handle whose controller is not connected has no samples
@@ -1257,9 +1261,9 @@ static void t_live_delay_swap(void) {
     h_hid_ImuDisable(); guest_now = motion_now = 1000000000ull; g_phone_mode = -1;
 }
 
-// The IMU conversion end to end, as the SDK's fusion takes it (UpdateSensorFusion feeds nn::imu the sample's acceleration unchanged and its angular velocity negated, sdk+0x6d7334):
+// The IMU conversion end to end, as the SDK's fusion takes it (UpdateSensorFusion feeds nn::imu the sample's acceleration, at +0x10, negated and its angular velocity, at +0x1c, as it is):
 // a controller lying still, then tilted slowly about x (30 deg/s for 1.5 s), then still again. Integrating the fusion's angular velocity turns the first acceleration into the last
-// one (no drift: the gyro and the accelerometer agree in axes, sign and scale), and the still stretches carry no rotation. DM_IMU_GYRO_SIGN=1 (the other sign) shows as drift
+// one (no drift: the gyro and the accelerometer agree in axes, sign and scale), and the still stretches carry no rotation. DM_IMU_GYRO_SIGN=-1 (the other sign) shows as drift
 static double imu_conversion_drift(int *still_ok) {
     hwm_clear(); dm_motion_clear_hid(0);
     uint8_t ring[64]; h_hid_ImuEnable(ring, sizeof ring);
@@ -1281,7 +1285,8 @@ static double imu_conversion_drift(int *still_ok) {
             if (q[i].sampling <= last) continue;
             last = q[i].sampling;
             double a[3] = {q[i].acc[0], q[i].acc[1], q[i].acc[2]}, n = sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
-            double om[3] = {-q[i].gyro[0], -q[i].gyro[1], -q[i].gyro[2]};   // what nn::imu gets
+            double om[3] = {q[i].gyro[0], q[i].gyro[1], q[i].gyro[2]};   // what nn::imu gets: the angular velocity as it is (its acceleration is the sample's negated)
+            for (int j = 0; j < 3; j++) a[j] = -a[j];
             double tick_s = (double)((uint64_t)(q[i].sampling - 1) * SIX_PERIOD_NS - t0) / 1e9;
             if ((tick_s > 0.3 && tick_s < tilt0 - 0.1) || tick_s > tilt1 + 0.3) *still_ok &= fabs(om[0]) < 1e-3 && fabs(om[1]) < 1e-3 && fabs(om[2]) < 1e-3;
             if (!have) { for (int j = 0; j < 3; j++) f[j] = a[j] / n; have = 1; continue; }
@@ -1296,16 +1301,16 @@ static double imu_conversion_drift(int *still_ok) {
     return acos(dot > 1 ? 1 : dot < -1 ? -1 : dot) * 180 / M_PI;
 }
 static void t_imu_conversion(void) {
-    g_mode = 1; dm_pad_players(1); g_phone_mode = 0; unsetenv("DM_IMU_NOISE"); unsetenv("DM_IMU_DELAY"); unsetenv("DM_IMU_GYRO_SIGN"); imu_env_read();
+    g_mode = 1; dm_pad_players(1); g_phone_mode = 0; unsetenv("DM_IMU_NOISE"); unsetenv("DM_IMU_DELAY"); unsetenv("DM_IMU_ACC_SIGN"); unsetenv("DM_IMU_GYRO_SIGN"); imu_env_read();
     int still_ok; double drift = imu_conversion_drift(&still_ok);
     char what[160]; snprintf(what, sizeof what, "IMU conversion: a 45 degree tilt integrated from the fusion's gyro ends on the accelerometer's (drift %.2f deg)", drift);
     CHECK(drift < 1.0, what);
     CHECK(still_ok, "IMU conversion: the still stretches carry no rotation");
-    setenv("DM_IMU_GYRO_SIGN", "1", 1); imu_env_read();
+    setenv("DM_IMU_GYRO_SIGN", "-1", 1); imu_env_read();
     double flipped = imu_conversion_drift(&still_ok);
     snprintf(what, sizeof what, "IMU conversion: the other gyro sign shows as drift (%.0f deg)", flipped);
     CHECK(flipped > 60, what);
-    unsetenv("DM_IMU_GYRO_SIGN"); setenv("DM_IMU_DELAY", "0", 1); imu_env_read();
+    setenv("DM_IMU_ACC_SIGN", "-1", 1); setenv("DM_IMU_GYRO_SIGN", "-1", 1); setenv("DM_IMU_DELAY", "0", 1); imu_env_read();   // main's for the rest
     guest_now = motion_now = 1000000000ull; g_phone_mode = -1;
 }
 
@@ -1520,6 +1525,9 @@ static void t_unsupported_style(void) {
 int main(void) {
     CHECK(setenv("DM_RUMBLE_LOG", "1", 1) == 0, "enable rumble diagnostics");
     setenv("DM_IMU_DELAY", "0", 1);   // the tests of the live history read it at the present; t_live_delay checks the playout delay
+    // The plumbing tests (streams, interpolation, dither, pairs) were written with the samples negated: they keep that (DM_IMU_*_SIGN=-1); t_npad_imu_samples and
+    // t_imu_conversion check the host's own signs
+    setenv("DM_IMU_ACC_SIGN", "-1", 1); setenv("DM_IMU_GYRO_SIGN", "-1", 1);
     t_npad_imu();
     t_icon_decoration();
     t_slots();

@@ -1235,22 +1235,26 @@ static Result six_handle_slot(const char *who, uint32_t h, int *slot, int *dev) 
     if (r != RES_OK && who) LOG("[RED] hid %s: six-axis handle %#x refused (%#x)", who, h, r);
     return r;
 }
-// NpadImuSample (0x28, sdk+0x6ca8b8) as UpdateSensorFusion reads it: sampling number, ns since the previous sample, angular velocity in rad/s, acceleration in m/s^2 (sdk+0x6d7320..+0x6d7350).
-// The fusion takes the samples oldest first, skips a number at or below the last it took (within 200) and resets on a jump of 100 or more or on going back further (sdk+0x6d7198), and
-// reports acceleration as m/s^2 x (-1 / 9.80665) G (sdk+0x6d74a0) and angular velocity as the negated gyro (fneg at sdk+0x6d7334, +0x6d734c, +0x6d7350) x 57.2958 deg/s (sdk+0x6d74c8).
-// The host's six-axis state (acceleration in G, (0, 0, -1) at rest; angular velocity in revolutions / s) becomes acc = -G x 9.80665 and gyro = -rev/s x 2 pi, so the fusion's outputs read
-// in the six-axis state's own signs. That the outputs follow those signs is assumed, not checked on a console: DM_IMU_ACC_SIGN / DM_IMU_GYRO_SIGN = 1 keep the host's signs instead.
+// NpadImuSample (0x28, sdk+0x6ca8b8) as UpdateSensorFusion reads it: sampling number, ns since the previous sample, acceleration in m/s^2 at +0x10, angular velocity in rad/s at
+// +0x1c. UpdateSensorFusion copies +0x10..+0x18 negated (fneg at sdk+0x6d7334, +0x6d734c, +0x6d7350) to nn::imu's SixAxisSensorSample +0x24 and +0x1c..+0x24 unchanged to its +0x18
+// (sdk+0x6d7320..+0x6d7354); nerd's FeedSixAxisSensorValues (sdk+0x6ffac0) passes sample +0x24 on as the acceleration (GyroPointing::FeedImuSampleNoUpdate, sdk+0x700e90, takes off
+// its offset in cm/s^2) and +0x18 as the angular velocity (sdk+0x700f84, less the bias). So the fusion's acceleration is the sample's negated, a specific force (+9.8 m/s^2 up for a
+// controller lying face up), and its angular velocity the sample's own; it reports them as m/s^2 x (-1 / 9.80665) G (sdk+0x6d74a0) and rad/s x 57.2958 deg/s (sdk+0x6d74c8), the
+// six-axis state's own signs. The host's six-axis state (acceleration in G, (0, 0, -1) at rest; angular velocity in revolutions / s, right-handed in the same axes) becomes acc =
+// G x 9.80665 and gyro = rev/s x 2 pi. Before, the host wrote the angular velocity at +0x10 and the acceleration at +0x1c, each negated: the fusion took gravity (9.8 m/s^2) for an
+// angular velocity of 9.8 rad/s, so its stable orientation turned about the vertical at 562 deg/s (probed at sdk+0x6d7118, GetUnbiasedAngularVelocity z = 561.9 deg/s with a flat
+// controller) and the calibration never completed. DM_IMU_ACC_SIGN / DM_IMU_GYRO_SIGN = -1 negate either, for a test
 // Samples are the sensor's 5 ms ticks on the guest clock (SIX_PERIOD_NS), each the six-axis state at that time (live motion, else flat with player 1's shake). As the console's ring in
 // shared memory, the answer keeps no per-reader state: a call returns the newest min(n, 16) ticks up to the current one (16: the SDK's ring, EnableNpadImu's buffer holds 16 x 0x28 per
 // device), oldest first, numbered by absolute tick + 1 (always >= 1). A tick a reader already took comes again in its next call and the fusion's skip rule drops it; ticks it read too
 // late for are skipped numbers, a gap the fusion bridges or resets on. So several readers, or a fusion created again (or the IMU switched off and on), each get every tick, and a reader
 // that read the clock before another (an older current tick) only gets numbers the fusion has taken or will skip. Off, or for a handle whose controller is not connected in that style,
 // there are none. A device index of 2 (accepted by the SDK's check) reads the motion of index 0 for a Joy-Con pair, as six_source masks it to the pair's two sides
-typedef struct { int64_t sampling, delta_ns; float gyro[3], acc[3]; } NpadImuSample;
+typedef struct { int64_t sampling, delta_ns; float acc[3], gyro[3]; } NpadImuSample;
 _Static_assert(sizeof(NpadImuSample) == 0x28, "NpadImuSample");
 enum { IMU_RING = 16 };
 #define STANDARD_GRAVITY 9.80665
-static float g_imu_acc_sign = -1, g_imu_gyro_sign = -1;
+static float g_imu_acc_sign = 1, g_imu_gyro_sign = 1;
 #define IMU_NOISE_DPS 0.1      // the default noise (see imu_sample)
 #define IMU_NOISE_G 0.00005
 #define IMU_DITHER_SCALE 0.1     // held live ticks: a tenth of the host noise (0.01 deg/s, 0.005 mG), under a real controller's floor; DM_IMU_NOISE scales or removes it too
@@ -1267,8 +1271,8 @@ static int64_t live_delay_env(const char *name, int64_t dflt) {   // a delay swi
 }
 static void imu_env_read(void) {
     const char *e;
-    g_imu_acc_sign = (e = getenv("DM_IMU_ACC_SIGN")) && atof(e) > 0 ? 1 : -1;
-    g_imu_gyro_sign = (e = getenv("DM_IMU_GYRO_SIGN")) && atof(e) > 0 ? 1 : -1;
+    g_imu_acc_sign = (e = getenv("DM_IMU_ACC_SIGN")) && atof(e) < 0 ? -1 : 1;
+    g_imu_gyro_sign = (e = getenv("DM_IMU_GYRO_SIGN")) && atof(e) < 0 ? -1 : 1;
     // DM_IMU_NOISE: "<deg/s>,<mG>" sets both spreads (for tuning); a single number scales the defaults (0 none, 1 the defaults); anything else keeps the defaults, with a log line
     double nd = IMU_NOISE_DPS, ng = IMU_NOISE_G * 1000, f; char tail;
     if ((e = getenv("DM_IMU_NOISE")) && *e) {
