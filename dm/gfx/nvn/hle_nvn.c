@@ -1659,6 +1659,7 @@ static void sleep_until_ns(uint64_t dl);
 static uint64_t present_period(const win_t *o);
 static uint64_t rt_period_ns(const win_t *o, uint64_t period);
 static int present_itv(const win_t *o);
+static int present_unpaced(const win_t *o);
 static int link_wait(const win_t *o, uint64_t timeout_ns);
 __attribute__((weak)) void dm_main_yield_stats(uint64_t *n, uint64_t *ns) { *n = 0; *ns = 0; }   // The host's hle_thread.c provides the ground truth; 0 in graphics unit tests
 __attribute__((weak)) uint32_t dm_guest_work_qos(unsigned *count) { if (count) *count = 0; return QOS_CLASS_UNSPECIFIED; }
@@ -1684,7 +1685,8 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
         if (rtp && rt_period != rtp) { rt_period = rtp; set_time_constraint(rtp); }
         rt_comp_tick(rtp);
         uint64_t p0 = now_ns(); int snap = mtl_snap_on();
-        if (snap && mtl_link_active() && mtl_link_stalled()) { if (wait) sleep_until_ns(at); }   // present snapshots (nvn_mtl.m) while the display link is silent (the window in the background or covered):
+        if (present_unpaced(o)) {}   // present interval 0: no vsync wait (below); only the free texture the ticket wait below gives
+        else if (snap && mtl_link_active() && mtl_link_stalled()) { if (wait) sleep_until_ns(at); }   // present snapshots (nvn_mtl.m) while the display link is silent (the window in the background or covered):
             // frames are dropped as fast as they come and nothing frees a ring slot later, so the texture's slot time paces the game: unpaced, Breath of the Wild ran 3 to 4.5 times real time there.
             // Otherwise snapshots take the display link's wait below like any present. The wait for a free ring slot (mtl_snap_acquire_wait) alone did not pace: the link takes frames in
             // order and drops all but the newest two, and a dropped frame frees its slot, so Donkey Kong Bananza at the 30 fps cap ran 43-65 fps of game time and dropped about 110 of every 300 frames
@@ -1839,6 +1841,10 @@ static void power_line(uint64_t frame) {
         if (ps[0] != pps[0] || ps[2] != pps[2] || ps[3] != pps[3]) LOG("[nvn] pool tables up to frame %llu, per frame: %.2f built whole (%.2f ms), %.2f patched, %.2f kept; of these two %.2f over memory pool changes, %.2f over a new submission",
             frame, (ps[0] - pps[0]) / nf, (ps[1] - pps[1]) / 1e3 / nf, (ps[2] - pps[2]) / nf, (ps[3] - pps[3]) / nf, (ps[4] - pps[4]) / nf, (ps[5] - pps[5]) / nf);
         memcpy(pps, ps, sizeof pps);
+        void mtl_gsb_stats(uint64_t *, uint64_t *); static uint64_t pgn, pgb; uint64_t gn, gb; mtl_gsb_stats(&gn, &gb);   // GPU textures' writes stored into their storage (nvn_mtl.m gsb_store)
+        if (gn != pgn) LOG("[nvn] GPU texture storage up to frame %llu: %llu regions, %.1f MB written into their storage on the GPU (%.2f regions, %.2f MB per frame)",
+            frame, (unsigned long long)(gn - pgn), (gb - pgb) / 1048576.0, (gn - pgn) / nf, (gb - pgb) / 1048576.0 / nf);
+        pgn = gn; pgb = gb;
         char tc[400]; dm_thread_cpu(tc, sizeof tc, s);
         LOG("[nvn] threads up to frame %llu: CPU %s", frame, tc); }
     else { char yt[192], rs[400], tc[400]; dm_yield_top(yt, sizeof yt); mtl_res_stats(rs, sizeof rs); dm_thread_cpu(tc, sizeof tc, 1); }   // the first call only takes the baselines
@@ -1884,8 +1890,8 @@ static void tsummary(uint64_t frame) {
             LOG("[nvn] thread policy: main thread real-time computation %.2f ms / period %.2f ms, real-time policy %s, current priority %d (base %d, policy %d); %u worker threads QoS %#x; present QoS %#x", g_rt_comp_ms, g_rt_period_ms, rt_live ? "in effect" : "not in effect", okx ? xi.pth_curpri : -1, okx ? xi.pth_priority : -1, okx ? xi.pth_policy : -1, wn, wq, mtl_present_qos()); }
         py = cy; pk = ck; pw = cw; }
       pi = ci; pc = cc; pd = dr_; pf = frame; }
-    uint64_t up, re, es = mtl_pkg_edge_skips(), fa, pr, op, oc; mtl_pkg_stats(&up, &re); nvn_dirty_stats(&fa, &pr); nvn_dirty_open_stats(&op, &oc);
-    LOG("[nvn] packaged textures: first uploads %llu, re-uploads on pool content change %llu, writes beside a texture only (not re-uploaded) %llu; write-protection faults %llu, pages unprotected before host writes %llu, opened for pool buffers %llu (changed while open %llu); missed %llu (cumulative); CPU-written textures alive %u", up, re, es, fa, pr, op, oc, mtl_pkg_miss(), mtl_cpu_tex_count());
+    uint64_t up, re, es = mtl_pkg_edge_skips(), ca = mtl_pkg_copy_absorbs(), fa, pr, op, oc; mtl_pkg_stats(&up, &re); nvn_dirty_stats(&fa, &pr); nvn_dirty_open_stats(&op, &oc);
+    LOG("[nvn] packaged textures: first uploads %llu, re-uploads on pool content change %llu, writes beside a texture only (not re-uploaded) %llu, GPU copies into one written into its storage too (not re-uploaded) %llu; write-protection faults %llu, pages unprotected before host writes %llu, opened for pool buffers %llu (changed while open %llu); missed %llu (cumulative); CPU-written textures alive %u", up, re, es, ca, fa, pr, op, oc, mtl_pkg_miss(), mtl_cpu_tex_count());
     memset(g_tn, 0, sizeof g_tn);
 }
 // DM_SLOWFRAME=1 (test switch, read over the log port on a real device): per-frame timings are first stored in a ring of the last 16 frames; dropped frames are judged 8 frames late (GPU / on-screen present times are back by then),
@@ -2044,15 +2050,24 @@ static int fstep_on(void) { return fps_step_cap() != 0; }   // the host decides 
 // Engine-native frame limiters have no frame-step state page. Their requested
 // cap still governs presentation, even when the profile uses display pacing.
 // Without a limiter the host writes (dm_fps_lock_engine) nothing makes the game
-// follow the cap, so the game's own present interval stays: a fixed-step game
-// presented at a cap it does not step by runs fast or slow.
+// follow the cap, so in game mode the game's own present interval stays: a fixed-step
+// game presented at a cap it does not step by runs fast or slow. Display mode already
+// declares that the game steps by the time that passed (its present interval is its
+// only limit), so there the cap is applied as the present interval alone: Red Dead
+// Redemption asks for interval 2 once and steps by time, and its 60 needs no limiter.
 static int g_present_cap = -1;
+static int display_mode(void) {   // present_cfg's choice, also before its first call (the cap can be asked for before the window's first interval)
+    if (g_hz >= 0) return g_display_mode;
+    const char *m = getenv("DM_PRESENT_INTERVAL"); return m ? !strcmp(m, "display") : DM_GAME_PRESENT_DISPLAY;
+}
 static int fps_present_cap(void) {
     if (dm_fps_state || fps_high()) return fps_step_cap();
     if (g_present_cap < 0) {
         const char *e=getenv("DM_FPS_TARGET");int t=e?atoi(e):DM_GAME_FPS_TARGET;
         g_present_cap=t==30||t==60?t:t==120?60:0;   // 120 here: not this game's (fps_high), so it runs at 60
-        if (g_present_cap && !dm_fps_lock_engine()) {
+        if (g_present_cap && !dm_fps_lock_engine() && display_mode())
+            LOG("[nvn] present cap %d fps (%s) applied by the present interval alone: display mode, and this main has no engine frame limit the host writes", g_present_cap, e ? "DM_FPS_TARGET" : "game profile fps_target");
+        else if (g_present_cap && !dm_fps_lock_engine()) {
             LOG("[nvn] present cap %d fps (%s) not applied: this main has neither a frame step nor an engine frame limit the host writes, so the game's own present interval stays", g_present_cap, e ? "DM_FPS_TARGET" : "game profile fps_target");
             g_present_cap=0;
         }
@@ -2084,6 +2099,14 @@ static void present_cfg(const win_t *o) {
         m ? "DM_PRESENT_INTERVAL" : "game profile present_interval", o->interval, scr > 0 ? "window" : "no window");
 }
 static int present_itv(const win_t *o) { int c = fps_present_cap(), k = atomic_load(&g_fs_k); return c ? (k && fstep_on() ? k : fstep_hz() / c) : g_display_mode ? 1 : o->interval > 0 ? o->interval : 1; }   // vsyncs per frame that presentation follows
+// Present interval 0 swaps without waiting for a vsync on Horizon: the window's acquire waits only for a texture the display has let go of, the display shows the newest frame at each
+// vsync, and the game paces itself (or runs as fast as it can; the Switch's unlocked-frame-rate mods set interval 0 to go past 60). The acquire took it as 1 and waited a display
+// tick each frame. Ori and the Blind Forest: Definitive Edition sets Unity's vSyncCount to 0 only for its shader prewarm behind the first loading screen and back to 1 after it: the
+// prewarm draws shaders until a per-frame time budget runs out and waits 15 frames whenever it drew 2 or fewer, and each draw waits for the graphics worker, which sat in that tick
+// wait, so the loading screen took about 5 minutes. Presentation keeps one frame per display tick (the display link drops the older frames waiting, nvn_mtl.m: there Ori made
+// 446 frames in 315 ticks, 146 dropped), and the acquire's ticket wait still holds a texture until the frame it showed is taken or dropped. A host frame cap (fps_target, the
+// frame step) or display mode decides the pacing itself and keeps it
+static int present_unpaced(const win_t *o) { present_cfg(o); return o->interval == 0 && !g_display_mode && !fps_present_cap(); }
 // The present interval the game reads back (nvnWindowGetPresentInterval): the one it set, except in display mode, where the window presents at the interval above (1, or the cap's)
 // whatever the game set, and answering the game's own let it pace for that interval itself. Luigi's Mansion 3 (30 fps on the Switch, interval 2) reads the newest frame-history entry
 // and the interval before each present (main+0xb7a4b8): while that frame is not shown it sleeps 16.67 ms per vsync of the interval, and once shown it waits until (interval - 1)
@@ -3244,24 +3267,36 @@ NVN(nvnTextureWriteTexelsStrided, void, const NVNtexture *t, const NVNtextureVie
 // what the pool had there before (another texture's data, zeros), and the Yoshis' felt sampled speckles from the moment a level streamed in. A 3D texture's copies are mirrored slice by
 // slice: LEGO Star Wars: The Skywalker Saga fills its BC6H light-probe volumes a slice at a time with buffer copies, then moves them into new textures by copying their storage, and
 // with 3D left out the moved volumes held the pool's old bytes and every dynamically lit object came out at the half-float maximum, white (GitHub #1856). −1 when the copy cannot be
-// mirrored (a format mismatch, a region out of range): the GPU copy alone then stands until the next upload
-static int mirror_prepare(const tex_t *t, unsigned level, unsigned layer) {   // unprotect (and mark written) the storage of one level of one layer
-    uint64_t lo = nvn_tex_level_offset(&t->d, level), hi = level + 1 < t->d.levels ? nvn_tex_level_offset(&t->d, level + 1) : t->L.layer_size;
-    if (hi <= lo || hi > t->L.layer_size || (uint64_t)layer * t->L.layer_size + hi > t->L.size) return -1;
-    dm_guest_write_prepare(t->mem + (uint64_t)layer * t->L.layer_size + lo, hi - lo);
+// mirrored (a format mismatch, a region out of range): the GPU copy alone then stands until the next upload. ms (may be NULL): the storage ranges made writable for it, the host's own
+// write, which the copy's absorption excepts (pkg_copy_absorb in nvn_mtl.m): a level of a layer each, a 3D texture's whole level (its slices lie in it)
+int nvn_tex_level_range(const tex_t *t, unsigned level, unsigned layer, uint64_t *lo, uint64_t *hi) {   // the storage of one level of one layer, as offsets into the texture's; −1 out of range
+    uint64_t a = nvn_tex_level_offset(&t->d, level), b = level + 1 < t->d.levels ? nvn_tex_level_offset(&t->d, level + 1) : t->L.layer_size;
+    if (b <= a || b > t->L.layer_size || (uint64_t)layer * t->L.layer_size + b > t->L.size) return -1;
+    *lo = (uint64_t)layer * t->L.layer_size + a; *hi = (uint64_t)layer * t->L.layer_size + b;
     return 0;
 }
-int nvn_tex_mirror_b2t(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, const uint8_t *src, size_t row, size_t img) {
+static void mspan_add(mspan_t *ms, uintptr_t lo, uintptr_t hi) {
+    if (!ms || ms->n < 0 || (ms->n && ms->r[ms->n - 1][0] == lo && ms->r[ms->n - 1][1] == hi)) return;   // a 3D level's slices: one range
+    if (ms->n == (int)(sizeof ms->r / sizeof ms->r[0])) { ms->n = -1; return; }
+    ms->r[ms->n][0] = lo; ms->r[ms->n][1] = hi; ms->n++;
+}
+static int mirror_prepare(const tex_t *t, unsigned level, unsigned layer, mspan_t *ms) {   // unprotect (and mark written) the storage of one level of one layer
+    uint64_t lo, hi;
+    if (nvn_tex_level_range(t, level, layer, &lo, &hi)) return -1;
+    dm_guest_write_prepare(t->mem + lo, hi - lo); mspan_add(ms, (uintptr_t)t->mem + lo, (uintptr_t)t->mem + hi);
+    return 0;
+}
+int nvn_tex_mirror_b2t(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, const uint8_t *src, size_t row, size_t img, mspan_t *ms) {
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     if (!t->mem || !bpb || level >= t->d.levels) return -1;
     int nz = r->depth ? r->depth : 1;
     for (int z = 0; z < nz; z++) {
         unsigned layer, slice; region_image(t, layer0, r, z, &layer, &slice);
-        if (mirror_prepare(t, level, layer) || write_region_mirror(t, level, layer, slice, r, src + (size_t)z * img, row, bw, bh, bpb)) return -1;
+        if (mirror_prepare(t, level, layer, ms) || write_region_mirror(t, level, layer, slice, r, src + (size_t)z * img, row, bw, bh, bpb)) return -1;
     }
     return 0;
 }
-int nvn_tex_mirror_t2t(const tex_t *s, unsigned sl, unsigned ss, const NVNcopyRegion *sr, const tex_t *d, unsigned dl, unsigned ds, const NVNcopyRegion *dr) {
+int nvn_tex_mirror_t2t(const tex_t *s, unsigned sl, unsigned ss, const NVNcopyRegion *sr, const tex_t *d, unsigned dl, unsigned ds, const NVNcopyRegion *dr, mspan_t *ms) {
     int bw, bh, bpb = nvn_fmt_bpb(s->d.format, &bw, &bh), dbw, dbh, dbpb = nvn_fmt_bpb(d->d.format, &dbw, &dbh);
     if (!s->mem || !d->mem || !bpb || bpb != dbpb || bw != dbw || bh != dbh) return -1;
     if (sl >= s->d.levels || dl >= d->d.levels || sr->width != dr->width || sr->height != dr->height || sr->xoffset < 0 || sr->yoffset < 0 || sr->zoffset < 0) return -1;
@@ -3275,7 +3310,7 @@ int nvn_tex_mirror_t2t(const tex_t *s, unsigned sl, unsigned ss, const NVNcopyRe
     for (int z = 0; z < nz && ok; z++) {
         unsigned layer, slice; region_image(d, ds, dr, z, &layer, &slice);
         const uint8_t *img = lin + (s3 ? (size_t)(sr->zoffset + z) * lp * lr : 0) + y0 * lp + x0;
-        ok = (s3 || !nvn_deswizzle(&s->d, sl, ss + (unsigned)(sr->zoffset + z), s->mem, lin, lp)) && !mirror_prepare(d, dl, layer) && !write_region_mirror(d, dl, layer, slice, dr, img, lp, bw, bh, bpb);
+        ok = (s3 || !nvn_deswizzle(&s->d, sl, ss + (unsigned)(sr->zoffset + z), s->mem, lin, lp)) && !mirror_prepare(d, dl, layer, ms) && !write_region_mirror(d, dl, layer, slice, dr, img, lp, bw, bh, bpb);
     }
     free(lin);
     return ok ? 0 : -1;

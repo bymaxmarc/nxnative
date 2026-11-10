@@ -534,7 +534,7 @@ t_logic: t_logic.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_logic.m $(MTL_T_SRC) $(FW)
 check_t_logic: t_logic
 	@set -e; work=$$(mktemp -d); trap 'rm -rf "$$work"' EXIT; python3 test_dmsh_logic.py --fixture "$$work"; MTL_DEBUG_LAYER=1 ./t_logic "$$work"
-# gl_FragCoord.z against the depth the rasterizer stored for the same triangle, through dmsh_build.py frag_z_snap's dm_zsnap (from test_dmsh_zsnap.py)
+# gl_FragCoord.z against the depth the rasterizer stored for the same triangle, through dmsh_rewrite.py frag_z_snap's dm_zsnap (from test_dmsh_zsnap.py)
 t_zsnap: t_zsnap.m
 	clang -O1 -g -Wall -fobjc-arc -o $@ t_zsnap.m -framework Metal -framework Foundation
 check_t_zsnap: t_zsnap
@@ -586,3 +586,20 @@ t_tg_spill: t_tg_spill.m $(MTL_T_DEP)
 check_t_tg_spill: t_tg_spill
 	MTL_DEBUG_LAYER=1 DM_NVN_DISPATCH_OWN=0 ./$<
 	MTL_DEBUG_LAYER=1 DM_NVN_DISPATCH_OWN=1 ./$<
+
+# A read ID keeps its read mark when it gets another texture: first-table GPU pixels, finalized IDs, IDs waiting for the read budget.
+t_pool_seen_replace: t_pool_seen_replace.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_pool_seen_replace.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_pool_seen_replace
+check_t_pool_seen_replace: t_pool_seen_replace
+	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=0 ./t_pool_seen_replace
+	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=1 ./t_pool_seen_replace
+
+# A texture the pool walk leaves out for good holds a stand-in of its own smallest levels until its first read (issue #1969)
+t_pool_standin: t_pool_standin.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_pool_standin.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_pool_standin
+check_t_pool_standin: t_pool_standin
+	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=0 ./t_pool_standin
+	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=1 ./t_pool_standin
+	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=0 DM_NVN_POOL_STANDIN=0 ./t_pool_standin
