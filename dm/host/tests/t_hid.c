@@ -1257,6 +1257,58 @@ static void t_live_delay_swap(void) {
     h_hid_ImuDisable(); guest_now = motion_now = 1000000000ull; g_phone_mode = -1;
 }
 
+// The IMU conversion end to end, as the SDK's fusion takes it (UpdateSensorFusion feeds nn::imu the sample's acceleration unchanged and its angular velocity negated, sdk+0x6d7334):
+// a controller lying still, then tilted slowly about x (30 deg/s for 1.5 s), then still again. Integrating the fusion's angular velocity turns the first acceleration into the last
+// one (no drift: the gyro and the accelerometer agree in axes, sign and scale), and the still stretches carry no rotation. DM_IMU_GYRO_SIGN=1 (the other sign) shows as drift
+static double imu_conversion_drift(int *still_ok) {
+    hwm_clear(); dm_motion_clear_hid(0);
+    uint8_t ring[64]; h_hid_ImuEnable(ring, sizeof ring);
+    const uint64_t t0 = 840000000000ull, period = 15000000;   // a 67 Hz controller
+    const double w = 30 * M_PI / 180, tilt0 = 1.0, tilt1 = 2.5, end = 3.5;
+    uint64_t next = t0, nf = t0 + 16666667; int64_t last = 0; int have = 0; double f[3] = {0}, f_end[3] = {0};
+    *still_ok = 1;
+    for (uint64_t t = t0; t < t0 + (uint64_t)(end * 1e9); t += 500000) {
+        motion_now = guest_now = t;
+        if (t >= next) {
+            double s = (double)(t - t0) / 1e9, th = s < tilt0 ? 0 : s < tilt1 ? w * (s - tilt0) : w * (tilt1 - tilt0);
+            float acc[3] = {0, (float)-sin(th), (float)-cos(th)}, rot[3] = {s >= tilt0 && s < tilt1 ? (float)w : 0, 0, 0};
+            dm_motion_set_hid(0, acc, rot, t); next += period;
+        }
+        if (t < nf) continue;
+        nf += 16666667;
+        TestImuSample q[16]; int k = h_hid_ImuSamples(q, 16, 0x20003);
+        for (int i = 0; i < k; i++) {
+            if (q[i].sampling <= last) continue;
+            last = q[i].sampling;
+            double a[3] = {q[i].acc[0], q[i].acc[1], q[i].acc[2]}, n = sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
+            double om[3] = {-q[i].gyro[0], -q[i].gyro[1], -q[i].gyro[2]};   // what nn::imu gets
+            double tick_s = (double)((uint64_t)(q[i].sampling - 1) * SIX_PERIOD_NS - t0) / 1e9;
+            if ((tick_s > 0.3 && tick_s < tilt0 - 0.1) || tick_s > tilt1 + 0.3) *still_ok &= fabs(om[0]) < 1e-3 && fabs(om[1]) < 1e-3 && fabs(om[2]) < 1e-3;
+            if (!have) { for (int j = 0; j < 3; j++) f[j] = a[j] / n; have = 1; continue; }
+            double dt = q[i].delta_ns / 1e9, c[3] = {f[1] * om[2] - f[2] * om[1], f[2] * om[0] - f[0] * om[2], f[0] * om[1] - f[1] * om[0]};   // a world-fixed vector in the body: f' = f x w
+            for (int j = 0; j < 3; j++) f[j] += c[j] * dt;
+            double fn = sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]); for (int j = 0; j < 3; j++) f[j] /= fn;
+            for (int j = 0; j < 3; j++) f_end[j] = a[j] / n;
+        }
+    }
+    dm_motion_clear_hid(0); h_hid_ImuDisable();
+    double dot = f[0] * f_end[0] + f[1] * f_end[1] + f[2] * f_end[2];
+    return acos(dot > 1 ? 1 : dot < -1 ? -1 : dot) * 180 / M_PI;
+}
+static void t_imu_conversion(void) {
+    g_mode = 1; dm_pad_players(1); g_phone_mode = 0; unsetenv("DM_IMU_NOISE"); unsetenv("DM_IMU_DELAY"); unsetenv("DM_IMU_GYRO_SIGN"); imu_env_read();
+    int still_ok; double drift = imu_conversion_drift(&still_ok);
+    char what[160]; snprintf(what, sizeof what, "IMU conversion: a 45 degree tilt integrated from the fusion's gyro ends on the accelerometer's (drift %.2f deg)", drift);
+    CHECK(drift < 1.0, what);
+    CHECK(still_ok, "IMU conversion: the still stretches carry no rotation");
+    setenv("DM_IMU_GYRO_SIGN", "1", 1); imu_env_read();
+    double flipped = imu_conversion_drift(&still_ok);
+    snprintf(what, sizeof what, "IMU conversion: the other gyro sign shows as drift (%.0f deg)", flipped);
+    CHECK(flipped > 60, what);
+    unsetenv("DM_IMU_GYRO_SIGN"); setenv("DM_IMU_DELAY", "0", 1); imu_env_read();
+    guest_now = motion_now = 1000000000ull; g_phone_mode = -1;
+}
+
 // The six-axis states path (GetSixAxisSensorStates) reads the newest state each frame: no delay by default (DM_SIX_DELAY=0), only the IMU path's; DM_SIX_DELAY sets its own
 static void t_live_delay_paths(void) {
     g_mode = 1; dm_pad_players(1); g_phone_mode = 0; hwm_clear(); setenv("DM_IMU_NOISE", "0", 1);
@@ -1494,6 +1546,7 @@ int main(void) {
     t_live_delay();
     t_live_delay_paths();
     t_live_delay_swap();
+    t_imu_conversion();
     t_live_pinned();
     t_pair_half_pause();
     t_six_ic_info();
