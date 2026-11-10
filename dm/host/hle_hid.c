@@ -58,7 +58,9 @@ static void shake_note(void) {
     else { uint64_t t0 = atomic_load(&g_shake_t0); atomic_store(&g_shake_end, t0 + ((t - t0) / SHAKE_CYCLE_NS + 1) * SHAKE_CYCLE_NS); }
 }
 // Swing (DM_KEYS / DM_CTL "Swing[<axis>][@<deg/s>]", motion_swing.h): one scripted swing of player 1's controller, started by the step's press on the guest clock and played to its
-// end whatever the hold; a new swing replaces one still playing. Like the shake it moves the sensor of player 1's own controller while no live motion drives it
+// end whatever the hold; a new swing replaces one still playing. Like the shake it moves only the sensor of player 1's own controller (the keyboard, a pad shown as one controller,
+// handheld), and only while no live motion drives it: it does nothing on a real Joy-Con pair or single Joy-Con (their own sensors, six_source's KIND_DUAL and up) or on any
+// controller whose gyro reports (live motion wins, six_at)
 static pthread_mutex_t g_swing_mu = PTHREAD_MUTEX_INITIALIZER;
 static swing_spec g_swing; static uint64_t g_swing_t0; static int g_swing_set;
 static void swing_start(const swing_spec *sp) {
@@ -272,7 +274,8 @@ static void *ctl_main(void *arg) {
                                                      while (*e3 == ' ') e3++; dm_ctl_memdump(a, n, e3); continue; }
                 if (!strncmp(line, "cvari ", 6)) { void dm_ctl_cvar_i32(uint64_t off, int32_t v); char *e2; uint64_t off = strtoull(line + 6, &e2, 16); dm_ctl_cvar_i32(off, (int32_t)strtol(e2, NULL, 0)); continue; }
                 if (!strncmp(line, "cvarf ", 6)) { void dm_ctl_cvar_f32(uint64_t off, float v); char *e2; uint64_t off = strtoull(line + 6, &e2, 16); dm_ctl_cvar_f32(off, strtof(e2, NULL)); continue; }
-                if (!strncmp(line, "env ", 4)) { char *eq = strchr(line + 4, '='); if (eq) { *eq = 0; setenv(line + 4, eq + 1, 1); LOG("DM_CTL: env %s=%s", line + 4, eq + 1); } continue; }
+                if (!strncmp(line, "env ", 4)) { char *eq = strchr(line + 4, '='); if (eq) { *eq = 0; setenv(line + 4, eq + 1, 1); LOG("DM_CTL: env %s=%s", line + 4, eq + 1);
+                                                     if (!strncmp(line + 4, "DM_IMU_", 7)) { void imu_env_reread(void); imu_env_reread(); } } continue; }   // the IMU's switches are read again
                 if (!strncmp(line, "texdump ", 8)) { void dm_gfx_texdump_next(const char *path); dm_gfx_texdump_next(line + 8); LOG("DM_CTL: colour targets of the next frame → %s (as DM_NVN_TEXDUMP)", line + 8); continue; }
                 if (!strncmp(line, "passdump ", 9)) { void dm_gfx_passdump_next(long n); dm_gfx_passdump_next(atol(line + 9)); LOG("DM_CTL: passes of the next %ld frames (as DM_NVN_PASSDUMP)", atol(line + 9)); continue; }
                 if (!strncmp(line, "drag ", 5)) {   // one finger, a step every 8 ms
@@ -862,10 +865,32 @@ static void six_sample(SixAxisState *s, int64_t samp, int shakes) {
     float c = (float)cos(2 * M_PI * yaw), sn = (float)sin(2 * M_PI * yaw);
     s->dir[0] = c; s->dir[1] = sn; s->dir[3] = -sn; s->dir[4] = c; s->dir[8] = 1;
 }
-// SixAxisSensorHandle: byte 0 the style's bit number, byte 1 the npad id, byte 2 the device (left / right Joy-Con of a pair). The styles made of two Joy-Cons (handheld, dual) have
-// two sensors, the others one. A handle reads as connected while its controller is connected in that style; otherwise its entries are zero (not connected) and the count 0.
-// Only player 1's controller shakes (DM_BTN_SHAKE comes from the keyboard, the iPhone and DM_KEYS, all player 1)
-static int six_connected(uint32_t h) { return (h & 0xff) < 32 && (style_of(h >> 8 & 0xff) >> (h & 0xff) & 1); }
+// SixAxisSensorHandle, as the console's SDK makes it (nn::hid::utility::GetSixAxisSensorHandle, sdk+0x6d8490 in Nintendo Switch Sports Resort's SDK 22; its GetSixAxisSensorHandles,
+// GetNpadImuHandles and GetSensorFusionHandles all call it): byte 0 the NpadStyleIndex (3 full key or GameCube, 4 handheld, 5 Joy-Con pair, 6 left Joy-Con, 7 right Joy-Con), byte 1
+// the npad id, byte 2 the device (0 the left and 1 the right sensor of two; SDK 22 gives a full-key or handheld controller's single sensor device 2). The host's own handles
+// (GetSixAxisSensorHandles below) use the same numbering, so a handle from either reads the same everywhere. They used to carry the style's bit number in byte 0, and the SDK's IMU
+// handles that the fusion passes to GetNpadImuSamples (0x5 / 0x10005 for a pair on No1) read as style bit 5, never connected: no samples, and Nintendo Switch Sports Resort's
+// fusion never ran. six_style_bit: the style bit of a handle's style index, -1 for an index the host has no style for or a device that style has not (device 2 only for full key and
+// handheld). The styles made of two Joy-Cons (handheld, dual) have two sensors in the host's handles, the others one. A handle reads as connected while its controller is connected
+// in that style; otherwise its entries are zero (not connected) and the count 0. Only player 1's controller shakes (DM_BTN_SHAKE comes from the keyboard, the iPhone and DM_KEYS,
+// all player 1)
+enum { SIX_IDX_FULLKEY = 3, SIX_IDX_HANDHELD = 4, SIX_IDX_JOYDUAL = 5, SIX_IDX_JOYLEFT = 6, SIX_IDX_JOYRIGHT = 7 };
+static int six_style_bit(uint32_t h) {
+    uint32_t idx = h & 0xff, dev = h >> 16 & 0xff;
+    if (idx < SIX_IDX_FULLKEY || idx > SIX_IDX_JOYRIGHT || dev > 2 || (dev == 2 && idx > SIX_IDX_HANDHELD)) return -1;
+    return (int)(idx - SIX_IDX_FULLKEY);   // FullKey .. JoyRight are style bits 0 .. 4
+}
+static int six_connected(uint32_t h) { int b = six_style_bit(h); return b >= 0 && (style_of(h >> 8 & 0xff) >> b & 1); }
+// The style index of a style set as the SDK's utility picks it: the first of FullKey (or GameCube, bit 5), Handheld, JoyDual (or its Joy-Con 2 form, bit 12), JoyLeft (13), JoyRight (14);
+// 0 (no sensor) for none of them
+static uint32_t six_style_index(uint32_t style) {
+    if (style & (STYLE_FULLKEY | 1u << 5)) return SIX_IDX_FULLKEY;
+    if (style & STYLE_HANDHELD) return SIX_IDX_HANDHELD;
+    if (style & (STYLE_JOYDUAL | STYLE_JOYDUAL2)) return SIX_IDX_JOYDUAL;
+    if (style & (STYLE_JOYLEFT | STYLE_JOYLEFT2)) return SIX_IDX_JOYLEFT;
+    if (style & (STYLE_JOYRIGHT | STYLE_JOYRIGHT2)) return SIX_IDX_JOYRIGHT;
+    return 0;
+}
 // The motion behind a handle: a Joy-Con npad's own Joy-Con, else its player's controller; returns whether it is live (else the sensor lies flat), and whether it shakes
 static int six_source(uint32_t h, motion_state *ms, int *shakes) {
     npad_ref ref = npad_resolve(h >> 8 & 0xff);
@@ -886,8 +911,10 @@ static int six_states(SixAxisState *out, int n, uint32_t h) {
 }
 HLE_FORCE("_ZN2nn3hid23GetSixAxisSensorHandlesEPNS0_19SixAxisSensorHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE", "six-axis sensor handles: two for handheld / dual Joy-Cons, one otherwise",
           int, h_hid_SixHandles, uint32_t *h, int n, const uint32_t *id, uint32_t style) {
-    int k = style & (STYLE_HANDHELD | STYLE_JOYDUAL) ? 2 : 1; if (k > n) k = n;
-    for (int i = 0; i < k; i++) h[i] = (uint32_t)(style ? __builtin_ctz(style) : 0) | (*id & 0xff) << 8 | (uint32_t)i << 16;
+    uint32_t idx = six_style_index(style);
+    int k = idx == SIX_IDX_HANDHELD || idx == SIX_IDX_JOYDUAL ? 2 : 1; if (k > n) k = n;
+    uint32_t dev0 = idx == SIX_IDX_JOYRIGHT;   // a right Joy-Con's sensor is device 1, as the SDK's (0x10007)
+    for (int i = 0; i < k; i++) h[i] = idx | (*id & 0xff) << 8 | ((uint32_t)i + dev0) << 16;
     return k > 0 ? k : 0;
 }
 HLE_FORCE("_ZN2nn3hid18StartSixAxisSensorERKNS0_19SixAxisSensorHandleE", "six-axis sensor; always sampling on the host", void, h_hid_SixStart, const uint32_t *h) { (void)h; }
@@ -1030,13 +1057,18 @@ _Static_assert(sizeof(NpadImuSample) == 0x28, "NpadImuSample");
 enum { IMU_RING = 16 };
 #define STANDARD_GRAVITY 9.80665
 static float g_imu_acc_sign = -1, g_imu_gyro_sign = -1;
-static int g_imu_noise = 1;   // DM_IMU_NOISE (imu_sample)
+#define IMU_NOISE_DPS 0.1      // the default noise (see imu_sample)
+#define IMU_NOISE_G 0.00005
+static double g_imu_noise_g = -1, g_imu_noise_dps = -1;   // DM_IMU_NOISE (imu_sample): the spreads in use; set by imu_env_read
 static pthread_once_t g_imu_once = PTHREAD_ONCE_INIT;
 static void imu_env_read(void) {
     const char *e;
     g_imu_acc_sign = (e = getenv("DM_IMU_ACC_SIGN")) && atof(e) > 0 ? 1 : -1;
     g_imu_gyro_sign = (e = getenv("DM_IMU_GYRO_SIGN")) && atof(e) > 0 ? 1 : -1;
-    g_imu_noise = !((e = getenv("DM_IMU_NOISE")) && !atoi(e));
+    // DM_IMU_NOISE: 0 none, "<deg/s>,<mG>" other spreads (for tuning), else the defaults
+    double nd = IMU_NOISE_DPS, ng = IMU_NOISE_G * 1000;
+    if ((e = getenv("DM_IMU_NOISE"))) { if (strchr(e, ',')) sscanf(e, "%lf,%lf", &nd, &ng); else if (!atof(e)) nd = ng = 0; }
+    g_imu_noise_dps = nd >= 0 && nd < 100 ? nd : IMU_NOISE_DPS; g_imu_noise_g = ng >= 0 && ng < 100 ? ng / 1000 : IMU_NOISE_G;
 }
 // Sensor noise. A real IC's samples are never all alike, and the SDK's fusion (NERD's gyro_pointing, sdk+0x700e60) is built for that. With samples that do not change at all
 // (the host's flat controller), the fusion reset itself several times a second (its initialization, which asks GetSixAxisSensorIcInformation, ran 612 times in one Nintendo Switch
@@ -1047,8 +1079,8 @@ static void imu_env_read(void) {
 // accelerations on x and z (m/s^2) is beyond 1e-6 (threshold 0.001 squared, detector +0x11ec), and with 2 mG of white noise it read 5e-5: never still, never calibrated. So the gyro
 // carries 0.1 deg/s (about one step of the IC at 2000 deg/s) and the acceleration 0.05 mG (under one step at 8 G, 0.24 mG), Gaussian, per axis: IMU_NOISE_DPS and IMU_NOISE_G. It is
 // a function of the tick, the device and the axis (a hash), so a tick delivered again reads the same, and two Joy-Cons differ. DM_IMU_NOISE=0 leaves it out
-#define IMU_NOISE_DPS 0.1
-#define IMU_NOISE_G 0.00005
+// (IMU_NOISE_DPS / IMU_NOISE_G are defined above, at the IMU state)
+// On by default: the fusion is the SDK's own code, so every Switch 2 title on this SDK runs into it, and the noise touches only GetNpadImuSamples (GetSixAxisSensorStates keeps exact values)
 static uint64_t imu_mix(uint64_t x) {   // splitmix64's finalizer
     x += 0x9e3779b97f4a7c15ull; x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull; x = (x ^ (x >> 27)) * 0x94d049bb133111ebull; return x ^ (x >> 31);
 }
@@ -1057,35 +1089,23 @@ static double imu_gauss(int64_t tick, uint32_t device, int channel) {   // a sta
     double u1 = ((h >> 11) + 1) * (1.0 / 9007199254740993.0), u2 = (imu_mix(h) >> 11) * (1.0 / 9007199254740992.0);
     return sqrt(-2 * log(u1)) * cos(2 * M_PI * u2);
 }
+void imu_env_reread(void) { pthread_once(&g_imu_once, imu_env_read); imu_env_read(); }   // DM_CTL "env DM_IMU_…" (a race with a sample being made only mixes two settings for one tick)
 static void imu_sample(NpadImuSample *o, int64_t tick, int live, const motion_state *ms, int shakes, uint32_t device) {
     SixAxisState s; six_at(&s, tick, live, ms, shakes);
     o->sampling = tick + 1; o->delta_ns = SIX_PERIOD_NS;
     for (int i = 0; i < 3; i++) {
-        double na = g_imu_noise ? IMU_NOISE_G * imu_gauss(tick, device, i) : 0, ng = g_imu_noise ? IMU_NOISE_DPS / 360 * imu_gauss(tick, device, 3 + i) : 0;
+        double na = g_imu_noise_g > 0 ? g_imu_noise_g * imu_gauss(tick, device, i) : 0, ng = g_imu_noise_dps > 0 ? g_imu_noise_dps / 360 * imu_gauss(tick, device, 3 + i) : 0;
         o->acc[i] = (float)(g_imu_acc_sign * (s.acc[i] + na) * STANDARD_GRAVITY);
         o->gyro[i] = (float)(g_imu_gyro_sign * (s.gyro[i] + ng) * 2 * M_PI);
     }
 }
-// The IMU handle is made by the SDK itself, not by the host: GetSensorFusionHandles → GetNpadImuHandles (sdk+0x6ca570) → nn::hid::utility::GetSixAxisSensorHandle (sdk+0x6d8490),
-// none of which the host takes over. That makes the console's SixAxisSensorHandle: byte 0 the NpadStyleIndex (3 full key or GameCube, 4 handheld, 5 Joy-Con pair, 6 left Joy-Con,
-// 7 right Joy-Con), byte 1 the npad id, byte 2 the device (0 left, 1 right of a pair; 2 a whole controller). The host's own six-axis handles (GetSixAxisSensorHandles) carry the
-// style's bit number in byte 0 instead, which six_connected and six_source read. Read as one of those, the fusion's handle of a Joy-Con pair on No1 (0x5 / 0x10005: style bit 5) was
-// never connected: every GetNpadImuSamples answered 0 samples, the fusion fed nothing (UpdateSensorFusion left at sdk+0x6d777c), never initialized its orientation nor calibrated,
-// and Nintendo Switch Sports Resort's "place the Joy-Con on a flat surface" calibration failed after 30 s every time. imu_host_handle translates the console's handle to the host's
-// (device 2 is the controller's single sensor, the host's device 0); 0 for a style index the host has no style for
-static int imu_host_handle(uint32_t h, uint32_t *out) {
-    static const uint8_t style_bit[8] = {[3] = 0, [4] = 1, [5] = 2, [6] = 3, [7] = 4};
-    uint32_t idx = h & 0xff, dev = h >> 16 & 0xff;
-    if (idx < 3 || idx > 7 || dev > 2) return 0;
-    *out = style_bit[idx] | (h & 0xff00u) | (dev == 2 ? 0 : dev) << 16;
-    return 1;
-}
+// The IMU handle is the SDK's own SixAxisSensorHandle (GetNpadImuHandles → utility::GetSixAxisSensorHandle), in the numbering six_style_bit reads
 HLE_FORCE("_ZN2nn3hid17GetNpadImuSamplesEPNS0_13NpadImuSampleEiNS0_13NpadImuHandleE", "npad IMU samples: the device's six-axis state at the newest 5 ms ticks, oldest first",
           int, h_hid_ImuSamples, void *out, int n, uint32_t imu_handle) {
     pthread_once(&g_imu_once, imu_env_read);
-    int slot, dev; uint32_t handle;
-    if (!out || n <= 0 || six_handle_slot(NULL, imu_handle, &slot, &dev) != RES_OK || !imu_host_handle(imu_handle, &handle) || !six_connected(handle) || !h_hid_ImuIs()) return 0;
-    motion_state ms; int shakes, live = six_source(handle, &ms, &shakes);
+    int slot, dev;
+    if (!out || n <= 0 || six_handle_slot(NULL, imu_handle, &slot, &dev) != RES_OK || !six_connected(imu_handle) || !h_hid_ImuIs()) return 0;
+    motion_state ms; int shakes, live = six_source(imu_handle, &ms, &shakes);
     int64_t now = (int64_t)(guest_ns() / SIX_PERIOD_NS), k = n < IMU_RING ? n : IMU_RING;
     if (k > now + 1) k = now + 1;   // no tick before the guest clock's start
     NpadImuSample *o = out;
@@ -1119,20 +1139,23 @@ HLE_FORCE("_ZN2nn3hid29GetSixAxisSensorIcInformationEPNS0_26SixAxisSensorIcInfor
 HLE_FORCE("_ZN2nn3hid34IsSixAxisSensorDeviceNewlyAssignedERKNS0_19SixAxisSensorHandleE", "six-axis device newly assigned: no", unsigned, h_hid_SixNewly, const uint32_t *h) { (void)h; return 0; }
 HLE_FORCE("_ZN2nn3hid39ResetIsSixAxisSensorDeviceNewlyAssignedERKNS0_19SixAxisSensorHandleE", "six-axis device newly assigned: nothing to clear", void, h_hid_SixNewlyReset, const uint32_t *h) { (void)h; }
 // The fusion's gyro bias calibration (0x744 bytes, cleared at sdk+0x6d7f4c and +0x6d766c), kept by the hid service per device (IHidServer +0x170 Load, +0x168 Store). The fusion
-// stores it once it has calibrated the bias at rest (sdk+0x6d7690, result unused) and loads it at initialization as its initial bias guess, marking the bias calibrated (+0x538); a
-// failed load leaves the fusion to learn the bias itself (sdk+0x6d7f70). The host keeps what the game stores for the run; a device with nothing stored fails with 0xd8ca (hid 202-108;
-// which code a console gives there is not known, the only caller tests for 0)
-#define RES_SIX_CAL_NONE (202u | 108u << 9)
+// stores it once it has calibrated the bias at rest (sdk+0x6d7690, result unused) and loads it at initialization (sdk+0x6d7f64): on success it takes the parameter's first three floats
+// as its initial gyro bias (FullSensorState::SetGyroscopeBiasInitialGuess, sdk+0x6d7f7c) and marks the bias calibrated (+0x538), which UpdateSensorFusion then reports as the
+// calibration being ready (sdk+0x6d7464) and IsSensorFusionCalibrated reads. A console's controllers come with a stored calibration (their factory one, or the last the fusion
+// stored); the host's controllers are ideal sensors whose bias is zero, so a device with nothing stored this run answers that: zeros, a zero bias. It used to fail (0xd8ca), and
+// the fusion had to learn the bias itself, which it never finished on the host: its Kalman filter's parameter test kept failing and resetting the bias estimate
+// (GyroPointingCore::Recover, sdk+0x712aa0, counted at core +0x3cc8: 10 to 25 times a minute), so Nintendo Switch Sports Resort's "place the Joy-Con on a flat surface"
+// calibration failed after 30 s every time and the game warned that controls may lag. It still does: the fusion's stable orientation diverges at rest every 8 to 20 s, and that reset
+// (sdk+0x6d7700) initializes it again without loading this (sdk+0x6d773c); why it diverges on the host's samples is open (docs/reference/services.md)
 enum { SIX_CAL_SIZE = 0x744 };
 static pthread_mutex_t g_six_cal_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint8_t g_six_cal[SIX_NPADS][SIX_DEVICES][SIX_CAL_SIZE], g_six_cal_have[SIX_NPADS][SIX_DEVICES];
 HLE_FORCE("_ZN2nn3hid37LoadSixAxisSensorCalibrationParameterEPNS0_33SixAxisSensorCalibrationParameterERKNS0_19SixAxisSensorHandleE",
-          "six-axis calibration: what the game stored this run, else none", Result, h_hid_SixCalLoad, void *out, const uint32_t *h) {
+          "six-axis calibration: what the game stored this run, else the ideal sensor's (zero bias)", Result, h_hid_SixCalLoad, void *out, const uint32_t *h) {
     int slot, dev; Result r = six_handle_slot("LoadSixAxisSensorCalibrationParameter", *h, &slot, &dev);
     if (r != RES_OK) return r;
     pthread_mutex_lock(&g_six_cal_mu);
-    r = g_six_cal_have[slot][dev] ? RES_OK : RES_SIX_CAL_NONE;
-    if (r == RES_OK) memcpy(out, g_six_cal[slot][dev], SIX_CAL_SIZE);
+    if (g_six_cal_have[slot][dev]) memcpy(out, g_six_cal[slot][dev], SIX_CAL_SIZE); else memset(out, 0, SIX_CAL_SIZE);   // nothing stored: the ideal sensor's, zero bias
     pthread_mutex_unlock(&g_six_cal_mu);
     return r;
 }

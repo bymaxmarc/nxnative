@@ -6,7 +6,9 @@
 // The motion: a backswing (half the swing's angle back, SWING_BACK_S), the swing (the whole angle forward at the given peak speed), a follow-back (half the angle back again,
 // SWING_BACK_S), each a sin^2 speed profile, so the speed and the acceleration are continuous and the controller ends still where it started. The swing's fastest point, the impact,
 // is SWING_BACK_S + half the swing after the start. The controller sits SWING_ARM_M ahead (+y) of the pivot (wrist / elbow), so a turn about x or z also gives it a centripetal and a
-// tangential acceleration; each axis saturates at the sensor's range (SWING_ACC_MAX_G, the IC's 8 G), as a real swing does. A turn about y (the long axis) twists in place
+// tangential acceleration; each axis saturates at the sensor's range (SWING_ACC_MAX_G, the IC's 8 G), as a real swing does. A turn about y (the long axis) twists in place.
+// The cap means the acceleration agrees with the gyro only below it: at 1500 deg/s the centripetal term (21 G at the impact) is clipped to 8 G, so a reader that compared |acc|
+// with the angular velocity would see less pull than the turn implies (a real IC clips the same way; reconsider if a game is found to check it)
 #pragma once
 #include <math.h>
 #include <stdlib.h>

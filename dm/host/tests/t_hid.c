@@ -143,7 +143,7 @@ static void t_npads(void) {
     CHECK(h_hid_Strap() == RES_OK && h_hid_StrapArg(arg) == RES_OK, "both strap guide overloads answer as the player closing the guide");
     CHECK(applet_opens == 12 && applet_depth == 0, "every answer opened and closed its applet");
     arg[0] = 1;
-    CHECK(six_connected(0x0100 | 0) && !six_connected(0x0200 | 0), "player 2 has a six-axis sensor, No3 none");
+    CHECK(six_connected(0x0100 | 3) && !six_connected(0x0200 | 3), "player 2 has a six-axis sensor, No3 none");
 
     // A one-player game ({No1, Handheld}): player 2's controller plays as player 1, No2 reads as not connected
     g_signals = 0; ids((const uint32_t[]){0, NPAD_HANDHELD}, 2);
@@ -578,7 +578,7 @@ static void t_motion_live(void) {
 }
 static void t_motion_hid(void) {
     g_mode = 1; dm_pad_players(3); ids((uint32_t[]){0, 1, NPAD_HANDHELD}, 3); g_phone_mode = 0;
-    uint32_t h = 0; SixAxisState st;   // SixAxisSensorHandle uses the style bit index (FullKey = 0), unlike VibrationDeviceHandle's SDK style = 3.
+    uint32_t h = 3; SixAxisState st;   // full key on No1: style index 3, as the SDK numbers six-axis and vibration handles
     float flat[3] = {0, 0, -1}, tilted[3] = {.5f, 0, -.8660254f}, turn[3] = {0, 0, 2 * (float)M_PI};
     motion_now += 1000000000;
     dm_motion_clear(0);
@@ -709,22 +709,47 @@ static void t_npad_imu_samples(void) {
 // The IMU handles the SDK makes itself (GetNpadImuHandles → utility::GetSixAxisSensorHandle, sdk+0x6d8490, not taken over): NpadStyleIndex in byte 0, device in byte 2. Nintendo
 // Switch Sports Resort supports Handheld | JoyDual (0x6), so the keyboard's player 1 is a Joy-Con pair on No1 and its fusion reads 0x5 and 0x10005: those must have samples
 static void t_imu_sdk_handles(void) {
-    g_mode = 1; dm_pad_players(1); g_phone_mode = 0;
-    uint32_t t;
-    CHECK(imu_host_handle(0x10005, &t) && t == (2u | 1u << 16), "imu handle: Joy-Con pair (5), right device → style bit 2, device 1");
-    CHECK(imu_host_handle(0x20004 | 0x20u << 8, &t) && t == (1u | 0x20u << 8), "imu handle: handheld (4) on 0x20, device 2 → style bit 1, device 0");
-    CHECK(imu_host_handle(0x20003, &t) && t == 0, "imu handle: full key (3), device 2 → style bit 0, device 0");
-    CHECK(imu_host_handle(0x6, &t) && t == 3 && imu_host_handle(0x10007, &t) && t == (4u | 1u << 16), "imu handle: left (6) and right (7) Joy-Cons");
-    CHECK(!imu_host_handle(0x2, &t) && !imu_host_handle(0x8, &t) && !imu_host_handle(0x30005, &t), "imu handle: no style index the host knows, or device 3: none");
+    g_mode = 1; ids((uint32_t[]){0, 1, 2, 3}, 4); dm_pad_players(1); g_phone_mode = 0;
+    setenv("DM_IMU_NOISE", "0", 1); imu_env_read();
+    // The handle numbering (six_style_bit): style index 3..7 → style bits 0..4; device 2 only for full key and handheld (SDK 22's single sensor)
+    CHECK(six_style_bit(0x20003) == 0 && six_style_bit(0x20004) == 1 && six_style_bit(0x10005) == 2 && six_style_bit(0x6) == 3 && six_style_bit(0x10007) == 4, "handles: style index to style bit");
+    CHECK(six_style_bit(0x20005) < 0 && six_style_bit(0x20006) < 0 && six_style_bit(0x20007) < 0, "handles: device 2 is refused for a pair and for a single Joy-Con");
+    CHECK(six_style_bit(0x0) < 0 && six_style_bit(0x2) < 0 && six_style_bit(0x8) < 0 && six_style_bit(0x30003) < 0, "handles: no style index the host knows, or device 3: none");
+    // The host's own handles (GetSixAxisSensorHandles) are in the same numbering, so either kind reaches the IMU
+    uint32_t h[2], id = 0;
+    CHECK(h_hid_SixHandles(h, 2, &id, STYLE_FULLKEY) == 1 && h[0] == 0x3, "host handles: full key on No1 is style index 3");
+    CHECK(h_hid_SixHandles(h, 2, &id, STYLE_JOYDUAL) == 2 && h[0] == 0x5 && h[1] == 0x10005, "host handles: a pair is 0x5 and 0x10005, as the SDK's");
+    CHECK(h_hid_SixHandles(h, 2, &(uint32_t){0x20}, STYLE_HANDHELD) == 2 && h[0] == 0x2004 && h[1] == 0x12004, "host handles: handheld on 0x20, two sensors");
+    CHECK(h_hid_SixHandles(h, 2, &id, STYLE_JOYLEFT) == 1 && h[0] == 0x6 && h_hid_SixHandles(h, 2, &(uint32_t){1}, STYLE_JOYRIGHT) == 1 && h[0] == 0x10107, "host handles: left 0x6, right device 1");
+    CHECK(h_hid_SixHandles(h, 2, &id, STYLE_JOYDUAL2) == 2 && h[0] == 0x5 && h_hid_SixHandles(h, 2, &id, 1u << 9) == 1 && h[0] == 0, "host handles: a Joy-Con 2 pair as a pair; a style without a sensor: index 0");
     uint8_t ring[64]; h_hid_ImuEnable(ring, sizeof ring);
     TestImuSample s[4];
+    CHECK(h_hid_SixHandles(h, 1, &id, STYLE_FULLKEY) == 1 && h_hid_ImuSamples(s, 4, h[0]) == 4 && h_hid_ImuSamples(s, 4, 0x20003) == 4, "imu: the host's full-key handle and the SDK's (device 2) both have samples");
     h_hid_SetStyles(STYLE_HANDHELD | STYLE_JOYDUAL);   // the game's lobby (main+0xa9e940): the keyboard is shown as a pair
     CHECK(h_hid_ImuSamples(s, 4, 0x5) == 4 && h_hid_ImuSamples(s, 4, 0x10005) == 4, "imu: the pair's two SDK handles have samples");
-    CHECK(h_hid_ImuSamples(s, 4, 0x20003) == 0, "imu: no full-key controller then: none");
+    CHECK(h_hid_ImuSamples(s, 4, 0x20003) == 0 && h_hid_ImuSamples(s, 4, 0x20005) == 0, "imu: no full-key controller then, and no device 2 of a pair: none");
     g_mode = 0;
-    CHECK(h_hid_ImuSamples(s, 4, 0x20004 | 0x20u << 8) == 4, "imu: handheld, its SDK handle on 0x20 has samples");
+    CHECK(h_hid_ImuSamples(s, 4, 0x20004 | 0x20u << 8) == 4 && h_hid_ImuSamples(s, 4, 0x4 | 0x20u << 8) == 4, "imu: handheld on 0x20, the SDK's device 2 and the host's device 0");
     g_mode = 1; h_hid_SetStyles(0xffffffffu);
     CHECK(h_hid_ImuSamples(s, 4, 0x20003) == 4 && h_hid_ImuSamples(s, 4, 0x5) == 0, "imu: full key supported: the full-key handle, not the pair's");
+    // Player 2 on No2 with a live controller: its own motion; No3 without a player: none
+    dm_pad_players(3);
+    float a2[3] = {0, 0, -1}, w2[3] = {0, 0, 3.14159265f}; dm_motion_set(1, a2, w2);
+    CHECK(h_hid_ImuSamples(s, 1, 0x20103) == 1 && fabsf(s[0].gyro[2] + 3.14159265f) < 1e-3f, "imu: player 2's npad (No2) reads player 2's motion");
+    CHECK(h_hid_ImuSamples(s, 1, 0x20003) == 1 && s[0].gyro[2] == 0, "imu: player 1's npad does not");
+    CHECK(h_hid_ImuSamples(s, 1, 0x20203) == 0, "imu: No3 has no controller: none");
+    dm_motion_clear(1); dm_pad_players(1);
+    // A pair split by single assignment: the left Joy-Con on No1 (JoyLeft, 0x6), the right one on No2 (JoyRight, 0x10107), each with its own sensor
+    h_hid_SetStyles(STYLE_FULLKEY | STYLE_JOYDUAL | STYLE_JOYLEFT | STYLE_JOYRIGHT);
+    dm_joy_attach(0, 3); h_hid_JoySingle(&(uint32_t){0});
+    float al[3] = {0, 0, -1}, wl[3] = {1, 0, 0}, wr[3] = {0, 1, 0};
+    dm_motion_set_joy(0, 0, al, wl, motion_now); dm_motion_set_joy(0, 1, al, wr, motion_now);
+    CHECK(h_hid_ImuSamples(s, 1, 0x6) == 1 && fabsf(s[0].gyro[0] + 1) < 1e-3f && fabsf(s[0].gyro[1]) < 1e-3f, "imu: JoyLeft on No1 reads the left Joy-Con's sensor");
+    CHECK(h_hid_ImuSamples(s, 1, 0x10107) == 1 && fabsf(s[0].gyro[1] + 1) < 1e-3f && fabsf(s[0].gyro[0]) < 1e-3f, "imu: JoyRight on No2 reads the right Joy-Con's sensor");
+    CHECK(h_hid_ImuSamples(s, 1, 0x5) == 0, "imu: no pair on No1 then");
+    h_hid_JoyDual(&(uint32_t){0}); dm_motion_clear_joy(0, 0); dm_motion_clear_joy(0, 1); dm_joy_attach(0, 0);
+    h_hid_SetStyles(0xffffffffu); ids((uint32_t[]){0, 1, 2, 3, 4, 5, 6, 7}, 8);
+    unsetenv("DM_IMU_NOISE"); imu_env_read();
     h_hid_ImuDisable(); g_phone_mode = -1;
 }
 
@@ -767,6 +792,10 @@ static void t_imu_noise(void) {
     CHECK(again, "imu noise: a tick read again reads the same");
     setenv("DM_IMU_NOISE", "0", 1); imu_env_read();
     CHECK(h_hid_ImuSamples(s, 1, h[0]) == 1 && s[0].gyro[0] == 0 && s[0].acc[2] == 9.80665f, "imu noise: DM_IMU_NOISE=0 leaves it out");
+    setenv("DM_IMU_NOISE", "1,0", 1); imu_env_reread();
+    CHECK(h_hid_ImuSamples(s, 1, h[0]) == 1 && s[0].gyro[0] != 0 && s[0].acc[2] == 9.80665f, "imu noise: DM_IMU_NOISE=<deg/s>,<mG> sets each spread (gyro only here), read again on DM_CTL's env");
+    setenv("DM_IMU_NOISE", "0,0.2", 1); imu_env_reread();
+    CHECK(h_hid_ImuSamples(s, 1, h[0]) == 1 && s[0].gyro[0] == 0 && s[0].acc[2] != 9.80665f && fabsf(s[0].acc[2] - 9.80665f) < 0.02f, "imu noise: acceleration only");
     unsetenv("DM_IMU_NOISE"); imu_env_read();
     h_hid_ImuDisable(); guest_now = 1000000000ull; g_phone_mode = -1;
 }
@@ -828,14 +857,15 @@ static void t_six_ic_info(void) {
     CHECK(ic[0xc8] == 0xAB, "ic information: nothing past 0xc8 written");
     CHECK(!h_hid_SixNewly(&h), "newly assigned: no");
     h_hid_SixNewlyReset(&h);
-    // Calibration: nothing stored fails (the fusion then learns the gyro bias itself); a stored parameter reads back for its device only
-    uint8_t cal[0x744], back[0x744]; memset(back, 0xAB, sizeof back);
+    // Calibration: nothing stored reads the ideal sensor's (all zero: zero bias, so the fusion counts its bias as calibrated); a stored parameter reads back for its device only
+    uint8_t cal[0x744], back[0x744], zero[0x744] = {0}; memset(back, 0xAB, sizeof back);
     for (size_t i = 0; i < sizeof cal; i++) cal[i] = (uint8_t)i;
-    CHECK(h_hid_SixCalLoad(back, &h) != 0 && back[0] == 0xAB, "calibration: none stored, fails and writes nothing");
+    CHECK(h_hid_SixCalLoad(back, &h) == 0 && !memcmp(back, zero, sizeof zero), "calibration: none stored, the ideal sensor's (zero bias), all 0x744 bytes");
     CHECK(h_hid_SixCalStore(&h, cal) == 0, "calibration: stored");
     CHECK(h_hid_SixCalLoad(back, &h) == 0 && !memcmp(back, cal, sizeof cal), "calibration: reads back");
     uint32_t other = 1u << 16; memset(back, 0xAB, sizeof back);
-    CHECK(h_hid_SixCalLoad(back, &other) != 0 && back[0] == 0xAB, "calibration: another device has none");
+    CHECK(h_hid_SixCalLoad(back, &other) == 0 && !memcmp(back, zero, sizeof zero), "calibration: another device has its own (none stored: zero bias)");
+    memset(back, 0xAB, sizeof back);
     uint32_t bad = 9u << 8, dev3 = 3u << 16;   // as the SDK's VerifyValidSixAxisSensorHandle (sdk+0x6d8440)
     CHECK(h_hid_SixCalStore(&bad, cal) == 0x58aca && h_hid_SixCalLoad(back, &bad) == 0x58aca, "calibration: an id that is no npad is refused");
     CHECK(h_hid_SixCalStore(&dev3, cal) == 0xd6ca && back[0] == 0xAB, "calibration: a device index past 2 is refused");

@@ -176,7 +176,7 @@ static void on_key(NSEvent *e, int down) {
     int *rs = c == 123 ? &g_rl : c == 126 ? &g_ru : c == 124 ? &g_rr : c == 125 ? &g_rd : NULL;
     if (rs && (down ? (e.modifierFlags & NSEventModifierFlagShift) != 0 : *rs)) { *rs = down; push(); return; }
     if (c == 9 || c == 11) {   // V / B: one swing per press for motion games played without a motion controller (Nintendo Switch Sports Resort), not repeated while held
-        if (down && !e.isARepeat) { dm_input_swing(2, c == 9 ? 1 : -1); cursor_hide_for_input(); }
+        if (down && !e.isARepeat && !(e.modifierFlags & (NSEventModifierFlagControl | NSEventModifierFlagOption | NSEventModifierFlagCommand))) { dm_input_swing(2, c == 9 ? 1 : -1); cursor_hide_for_input(); }   // not with a modifier (shortcuts)
         return;
     }
     int b = key_bit(c);
