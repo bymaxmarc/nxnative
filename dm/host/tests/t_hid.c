@@ -28,7 +28,10 @@ static int hid_usleep(useconds_t usec) { (void)usec; if (script_hold) script_hol
 int dm_opmode(void) { return g_mode; }
 static uint64_t guest_now = 1000000000ull;   // the guest clock (t_npad_imu_samples moves it)
 uint64_t guest_ns(void) { return guest_now; }
+// The answers' high-water marks (answer_tick) follow the real clock, which never goes back; the tests move the guest clock back and forth, so a test that sets it starts them again
+static void hwm_clear(void) { memset((void *)&g_hwm_states, 0, sizeof g_hwm_states); memset((void *)&g_hwm_imu, 0, sizeof g_hwm_imu); }
 uint64_t now_ns(void) { return motion_now; }
+static _Atomic uint64_t g_test_lag;   // t_live_edges: the guest clock behind the host one (a freeze), as hle_os.c's g_glag
 uint64_t guest_ns_at_host_time(uint64_t host_ns) { return host_ns + guest_now - motion_now; }   // the two test clocks: host now is guest now
 static uint64_t test_frame;   // presented frames (t_rec moves it)
 uint64_t dm_guest_frame(void) { return test_frame; }
@@ -656,7 +659,7 @@ static void t_npad_imu_samples(void) {
     uint32_t h = 0x20003;   // the SDK's own handle (utility::GetSixAxisSensorHandle, sdk+0x6d8490): full key (style index 3) on No1, the whole controller (device 2)
     imu_handle = h;
     TestImuSample s[40], t[40]; memset(s, 0xAB, sizeof s);
-    guest_now = 2000000000ull;   // tick 400
+    hwm_clear(), guest_now = 2000000000ull;   // tick 400
     CHECK(h_hid_ImuSamples(s, 16, h) == 0 && s[0].sampling == (int64_t)0xABABABABABABABABull, "imu: off, no samples and nothing written");
     uint8_t ring[64]; CHECK(h_hid_ImuEnable(ring, sizeof ring) == 0, "imu: on");
     CHECK(h_hid_ImuSamples(s, 1, h) == 1 && imu_numbered(s, 1, 401), "imu: numbered by absolute tick + 1");
@@ -669,8 +672,8 @@ static void t_npad_imu_samples(void) {
     guest_now += 4000000; CHECK(h_hid_ImuSamples(s, 1, h) == 1 && imu_numbered(s, 1, 401), "imu: less than a tick later: the same newest tick");
     guest_now += 1000000 + 2 * 5000000; CHECK(h_hid_ImuSamples(s, 16, h) == 16 && imu_numbered(s, 16, 389), "imu: three ticks later the window moves by three");
     CHECK(h_hid_ImuSamples(s, 0, h) == 0 && h_hid_ImuSamples(NULL, 4, h) == 0, "imu: no room: none");
-    guest_now = 2000000; CHECK(h_hid_ImuSamples(s, 16, h) == 1 && imu_numbered(s, 1, 1), "imu: at the clock's start, the first tick only, number 1");
-    guest_now = 2015000000ull;
+    hwm_clear(), guest_now = 2000000; CHECK(h_hid_ImuSamples(s, 16, h) == 1 && imu_numbered(s, 1, 1), "imu: at the clock's start, the first tick only, number 1");
+    hwm_clear(), guest_now = 2015000000ull;
 
     // A live controller: its acceleration and rotation, converted. 0.5 rev/s about z is pi rad/s; the fusion negates the gyro and the acceleration's output scale (G = -m/s^2 / g)
     float a[3] = {0.5f, 0, -0.8660254f}, w[3] = {0, 0, 3.14159265f};
@@ -693,7 +696,7 @@ static void t_npad_imu_samples(void) {
     CHECK(h_hid_ImuSamples(s, 16, no4) == 0 && s[0].delta_ns == (int64_t)0xABABABABABABABABull, "imu: an npad with no controller: no samples, nothing written");
 
     // Two readers each get the same newest ticks, also at once from two threads
-    guest_now = 3000000000ull;   // tick 600
+    hwm_clear(), guest_now = 3000000000ull;   // tick 600
     CHECK(h_hid_ImuSamples(s, 16, h) == 16 && h_hid_ImuSamples(t, 16, h) == 16 && !memcmp(s, t, 16 * sizeof *s) && imu_numbered(s, 16, 586), "imu: two readers, the same ticks");
     atomic_store(&imu_reader_ok, 0);
     pthread_t th[2]; for (int i = 0; i < 2; i++) pthread_create(&th[i], NULL, imu_reader, NULL);
@@ -704,7 +707,7 @@ static void t_npad_imu_samples(void) {
     CHECK(h_hid_ImuDisable() == 0 && h_hid_ImuSamples(s, 16, h) == 0, "imu: disabled, no samples");
     guest_now += 30 * 5000000ull; h_hid_ImuEnable(ring, sizeof ring);
     CHECK(h_hid_ImuSamples(s, 16, h) == 16 && imu_numbered(s, 16, 616), "imu: on again, numbered by absolute time");
-    h_hid_ImuDisable(); guest_now = 1000000000ull; dm_pad_players(1); g_phone_mode = -1;
+    h_hid_ImuDisable(); hwm_clear(), guest_now = 1000000000ull; dm_pad_players(1); g_phone_mode = -1;
 }
 
 // The IMU handles the SDK makes itself (GetNpadImuHandles → utility::GetSixAxisSensorHandle, sdk+0x6d8490, not taken over): NpadStyleIndex in byte 0, device in byte 2. Nintendo
@@ -775,7 +778,7 @@ static void t_imu_noise(void) {
     double sg = 0, sg2 = 0, sa = 0, sa2 = 0, lag = 0; int differ = 0, again = 1;
     TestImuSample s[16], t[16];
     for (int i = 0; i < N; i++) {
-        guest_now = 5000000000ull + (uint64_t)i * SIX_PERIOD_NS;
+        hwm_clear(), guest_now = 5000000000ull + (uint64_t)i * SIX_PERIOD_NS;
         if (h_hid_ImuSamples(s, 1, h[0]) != 1) { CHECK(0, "imu noise: a sample each tick"); break; }
         gx[i] = s[0].gyro[0]; az[i] = s[0].acc[2];
         sg += gx[i]; sg2 += (double)gx[i] * gx[i]; sa += az[i] - 9.80665; sa2 += (az[i] - 9.80665) * (az[i] - 9.80665);
@@ -796,7 +799,7 @@ static void t_imu_noise(void) {
         CHECK(still, "imu noise: small enough that the SDK's stillness detector finds a still controller still");
     }
     CHECK(differ >= 48, "imu noise: each device has its own");
-    guest_now = 6000000000ull;
+    hwm_clear(), guest_now = 6000000000ull;
     h_hid_ImuSamples(s, 16, h[0]); guest_now += 3 * SIX_PERIOD_NS; h_hid_ImuSamples(t, 16, h[0]);
     for (int i = 3; i < 16; i++) again &= !memcmp(&s[i], &t[i - 3], sizeof s[i]);
     CHECK(again, "imu noise: a tick read again reads the same");
@@ -824,7 +827,7 @@ static void t_imu_noise(void) {
         float a1[3] = {0, 0, -1}, r1[3] = {0}; dm_motion_set(0, a1, r1); dm_motion_clear(0);
         atomic_store(&g_imu_log, -1); unsetenv("DM_IMU_LOG");
     }
-    h_hid_ImuDisable(); guest_now = 1000000000ull; g_phone_mode = -1;
+    h_hid_ImuDisable(); hwm_clear(), guest_now = 1000000000ull; g_phone_mode = -1;
 }
 
 // DM_KEYS / DM_CTL "Swing" (motion_swing.h): the step carries the swing, its press starts it on the guest clock, player 1's six-axis states and npad IMU samples play it (in the IMU's
@@ -840,12 +843,12 @@ static void t_swing(void) {
     free(g_steps); g_steps = NULL; g_nsteps = g_cap_steps = 0;
     uint32_t id = 0, h; h_hid_SixHandles(&h, 1, &id, STYLE_FULLKEY);
     SixAxisState st[2];
-    guest_now = 5000000000ull;
+    hwm_clear(), guest_now = 5000000000ull;
     CHECK(six_states(st, 1, h) == 1 && st[0].acc[2] == -1 && st[0].gyro[2] == 0 && h_hid_SixRest(&h), "before the swing: flat and at rest");
     static key_step one[1]; g_steps = one; g_cap_steps = 0; g_nsteps = 1;
     g_steps[0] = (key_step){.hold = 0.15, .swing = 1, .sw = {2, 1, 1500}};
     keys_main(NULL);   // presses at guest 5 s (the test's usleep does not move the guest clock)
-    guest_now = 5000000000ull + (uint64_t)(swing_impact(1500) * 1e9);
+    hwm_clear(), guest_now = 5000000000ull + (uint64_t)(swing_impact(1500) * 1e9);
     CHECK(six_states(st, 2, h) == 2 && fabsf(st[0].gyro[2] - 1500.f / 360) < 1e-3f && st[0].acc[1] > 7.9f, "at the impact: the swing's peak about z and its centripetal pull");
     CHECK(st[1].sampling == st[0].sampling - 1 && st[1].gyro[2] < st[0].gyro[2] + 1e-6f, "the history holds the swing's earlier ticks");
     CHECK(!h_hid_SixRest(&h), "a swinging sensor is not at rest");
@@ -857,22 +860,22 @@ static void t_swing(void) {
     dm_pad_players(3); uint32_t id2 = 1, h2; h_hid_SixHandles(&h2, 1, &id2, STYLE_FULLKEY);
     CHECK(six_states(st, 1, h2) == 1 && st[0].gyro[2] == 0 && st[0].acc[2] == -1, "player 2's sensor does not swing");
     dm_pad_players(1);
-    guest_now = 5000000000ull + (uint64_t)(swing_duration(1500) * 1e9) + SIX_PERIOD_NS;
+    hwm_clear(), guest_now = 5000000000ull + (uint64_t)(swing_duration(1500) * 1e9) + SIX_PERIOD_NS;
     CHECK(six_states(st, 1, h) == 1 && st[0].acc[2] == -1 && st[0].gyro[2] == 0 && st[0].dir[0] == 1 && h_hid_SixRest(&h), "after the swing: flat and at rest again");
     // A front end's key (dm_input_swing, the Mac's V / B): the same swing from the guest clock's now; an axis that does not exist is ignored
     pthread_mutex_lock(&g_swing_mu); g_swing_set = 0; pthread_mutex_unlock(&g_swing_mu);
     dm_input_swing(3, 1);
     guest_now += (uint64_t)(swing_impact(SWING_DPS_DEFAULT) * 1e9);
     CHECK(six_states(st, 1, h) == 1 && st[0].gyro[2] == 0 && st[0].gyro[0] == 0, "dm_input_swing: no axis 3, no swing");
-    guest_now = 9000000000ull; dm_input_swing(2, -1); guest_now += (uint64_t)(swing_impact(SWING_DPS_DEFAULT) * 1e9);
+    hwm_clear(), guest_now = 9000000000ull; dm_input_swing(2, -1); guest_now += (uint64_t)(swing_impact(SWING_DPS_DEFAULT) * 1e9);
     CHECK(six_states(st, 1, h) == 1 && fabsf(st[0].gyro[2] + (float)(SWING_DPS_DEFAULT / 360)) < 1e-3f, "dm_input_swing(2, -1): a backhand about -z at the default speed");
-    g_nsteps = 0; g_steps = NULL; guest_now = 1000000000ull; g_phone_mode = -1;
+    g_nsteps = 0; g_steps = NULL; hwm_clear(), guest_now = 1000000000ull; g_phone_mode = -1;
     pthread_mutex_lock(&g_swing_mu); g_swing_set = 0; pthread_mutex_unlock(&g_swing_mu);
     unsetenv("DM_IMU_NOISE"); imu_env_read();
 }
 
 // Live motion through the history ring (live_ring): a source at 100 / 125 / 200 / 833 Hz with jittered sample times drives player 1; the IMU answers a game reads once a frame
-// (60 Hz) number their ticks consecutively at 5 ms, end at the newest sample's tick (no tick past the data), and carry the source's signal at each tick's own time,
+// (60 Hz) number their ticks consecutively at 5 ms, end at the clock's tick (the newest sample held past its time), and carry the source's signal at each tick's own time,
 // interpolated (a ramp in the gyro comes out as that ramp, without steps); GetSixAxisSensorStates' history follows the same ticks, newest first
 void *writer(void *arg) {   // t_live_ring's input thread: 1,000 samples 0.1 ms apart, all at or before the fixed host clock
     (void)arg; float a[3] = {0, 0, -1};
@@ -909,19 +912,21 @@ static void t_live_ring(void) {
                     if (i && o[i].sampling != o[i - 1].sampling + 1) ok_num = 0;
                     if (o[i].delta_ns != 5000000) ok_delta = 0;
                     uint64_t tick_t = (uint64_t)(o[i].sampling - 1) * 5000000ull;
-                    if (tick_t > last_sample_t) ok_future = 0;
-                    // inside the data the gyro is the ramp at the tick's own time (the IMU negates it: -rad/s)
-                    if (tick_t > t0 + 100000000ull && fabs(o[i].gyro[2] + ramp_rads(tick_t)) > 1e-3) ok_value = 0;
+                    // inside the data the gyro is the ramp at the tick's own time (the IMU negates it: -rad/s); past the newest sample, that sample held
+                    double want = ramp_rads(tick_t <= last_sample_t ? tick_t : last_sample_t);
+                    if (tick_t > t0 + 100000000ull && fabs(o[i].gyro[2] + want) > 1e-3) ok_value = 0;
                 }
+                if (o[k - 1].sampling != (int64_t)(t / 5000000) + 1) ok_future = 0;   // the answer ends at the clock's tick
                 if (o[k - 1].sampling < prev_last) ok_mono = 0;
                 prev_last = o[k - 1].sampling;
                 SixAxisState st[4]; uint32_t hh = 0x3;
-                if (h_hid_SixStates(st, 4, &hh) != 4 || st[0].sampling != o[k - 1].sampling - 1 || st[1].sampling != st[0].sampling - 1 || fabs(st[0].gyro[2] * 2 * M_PI - ramp_rads((uint64_t)st[0].sampling * 5000000ull)) > 1e-3) ok_states = 0;
+                if (h_hid_SixStates(st, 4, &hh) != 4 || st[0].sampling != o[k - 1].sampling - 1 || st[1].sampling != st[0].sampling - 1 ||
+                    fabs(st[0].gyro[2] * 2 * M_PI - ramp_rads((uint64_t)st[0].sampling * 5000000ull <= last_sample_t ? (uint64_t)st[0].sampling * 5000000ull : last_sample_t)) > 1e-3) ok_states = 0;
             }
         }
         char what[96];
         snprintf(what, sizeof what, "live ring at %.0f Hz: %d answers, consecutive 5 ms ticks", rates[ri], answers); CHECK(ok_num && ok_delta && answers > 50, what);
-        snprintf(what, sizeof what, "live ring at %.0f Hz: no tick past the newest sample, never going back", rates[ri]); CHECK(ok_future && ok_mono, what);
+        snprintf(what, sizeof what, "live ring at %.0f Hz: answers end at the clock's tick, never going back", rates[ri]); CHECK(ok_future && ok_mono, what);
         snprintf(what, sizeof what, "live ring at %.0f Hz: each tick carries the signal at its own time (interpolated, no steps)", rates[ri]); CHECK(ok_value, what);
         snprintf(what, sizeof what, "live ring at %.0f Hz: the six-axis history follows the same ticks, newest first", rates[ri]); CHECK(ok_states, what);
     }
@@ -939,6 +944,77 @@ static void t_live_ring(void) {
     // The ring keeps only LIVE_RING samples: memory is bounded however long a source runs
     CHECK(g_hid_motion[0].count <= LIVE_RING, "live ring: bounded");
     dm_motion_clear_hid(0); h_hid_ImuDisable(); unsetenv("DM_IMU_NOISE"); imu_env_read();
+    guest_now = 1000000000ull; motion_now = 1000000000ull; g_phone_mode = -1;
+}
+
+// The sampling numbers a game reads never go back and keep up with the clock, whatever the live source does: synthetic → live with a first sample stamped late, a player's
+// GameController and HID streams with different latencies taking turns, a game polling faster than the source, a source going stale and coming back, the guest clock's lag
+// changing mid-stream (a freeze), equal and out-of-order stamps. Each read checks: IMU answers and six-axis histories consecutive, ending at the clock's tick or above the last
+// one, and the newest number never below the previous read's
+typedef struct { int64_t imu_last, st_last; int ok_mono, ok_consec, ok_clock, ok_finite; } edge_watch;
+static void edge_read(edge_watch *w) {
+    TestImuSample o[16]; int k = h_hid_ImuSamples(o, 16, 0x20003);
+    int64_t clock_tick = (int64_t)(guest_now / 5000000) + 1;
+    if (k <= 0) { w->ok_consec = 0; return; }
+    for (int i = 1; i < k; i++) if (o[i].sampling != o[i - 1].sampling + 1) w->ok_consec = 0;
+    for (int i = 0; i < k; i++) for (int a = 0; a < 3; a++) if (!isfinite(o[i].acc[a]) || !isfinite(o[i].gyro[a])) w->ok_finite = 0;
+    if (o[k - 1].sampling < w->imu_last) w->ok_mono = 0;
+    if (o[k - 1].sampling < clock_tick) w->ok_clock = 0;
+    w->imu_last = o[k - 1].sampling;
+    SixAxisState st[4]; uint32_t hh = 0x3;
+    if (h_hid_SixStates(st, 4, &hh) != 4 || st[1].sampling != st[0].sampling - 1) w->ok_consec = 0;
+    if (st[0].sampling < w->st_last) w->ok_mono = 0;
+    if (st[0].sampling < clock_tick - 1) w->ok_clock = 0;
+    w->st_last = st[0].sampling;
+}
+static void edge_clocks(uint64_t t) { motion_now = t; guest_now = t - (atomic_load(&g_test_lag)); }
+static void t_live_edges(void) {
+    g_mode = 1; dm_pad_players(1); g_phone_mode = 0; setenv("DM_IMU_NOISE", "0", 1); imu_env_read();
+    uint8_t ring[64]; h_hid_ImuEnable(ring, sizeof ring);
+    dm_motion_clear(0); dm_motion_clear_hid(0); hwm_clear();
+    edge_watch w = {0, 0, 1, 1, 1, 1};
+    float a[3] = {0, 0, -1}, w0[3] = {0, 0, 1};
+    uint64_t t = 200000000000ull; atomic_store(&g_test_lag, 0);
+    // synthetic, then a first live sample stamped 15 ms (3 ticks) late
+    for (int i = 0; i < 10; i++) { edge_clocks(t += 1000000); edge_read(&w); }
+    dm_motion_set_hid(0, a, w0, t - 15000000); edge_read(&w);
+    for (int i = 0; i < 20; i++) { edge_clocks(t += 4000000); dm_motion_set_hid(0, a, w0, t - 15000000); edge_read(&w); }
+    CHECK(w.ok_mono && w.ok_consec && w.ok_clock, "edges: synthetic to live with a late first sample, numbers never go back");
+    // GameController (2 ms late) and HID (20 ms late) streams of player 1 taking turns
+    for (int i = 0; i < 40; i++) {
+        edge_clocks(t += 8000000);
+        if (i % 10 < 5) dm_motion_set(0, a, w0); else dm_motion_clear(0);
+        dm_motion_set_hid(0, a, w0, t - 20000000); edge_read(&w);
+    }
+    CHECK(w.ok_mono && w.ok_consec && w.ok_clock, "edges: GameController and HID streams with different latencies taking turns");
+    dm_motion_clear(0);
+    // polling every 1 ms against a 100 Hz source: the numbers follow the clock, not the source
+    int64_t first = w.imu_last;
+    for (int i = 0; i < 100; i++) { edge_clocks(t += 1000000); if (i % 10 == 0) dm_motion_set_hid(0, a, w0, t - 2000000); edge_read(&w); }
+    CHECK(w.ok_mono && w.ok_clock && w.imu_last - first >= 19, "edges: a game polling faster than its source reads numbers that keep up with the clock");
+    // live → stale (no samples for 400 ms) → live again
+    for (int i = 0; i < 100; i++) { edge_clocks(t += 4000000); edge_read(&w); }
+    for (int i = 0; i < 10; i++) { edge_clocks(t += 4000000); dm_motion_set_hid(0, a, w0, t - 10000000); edge_read(&w); }
+    CHECK(w.ok_mono && w.ok_consec && w.ok_clock, "edges: live, stale, live again");
+    // the guest clock frozen for 50 ms (its lag grows), samples arriving meanwhile, then running again
+    uint64_t frozen = guest_now;
+    for (int i = 0; i < 10; i++) { motion_now = (t += 5000000); dm_motion_set_hid(0, a, w0, t - 3000000); edge_read(&w); }
+    atomic_store(&g_test_lag, motion_now - frozen);
+    for (int i = 0; i < 20; i++) { edge_clocks(t += 4000000); dm_motion_set_hid(0, a, w0, t - 3000000); edge_read(&w); }
+    CHECK(w.ok_mono && w.ok_consec && w.ok_clock && w.ok_finite, "edges: a lag change mid-stream (a freeze) keeps the numbers going");
+    // equal and out-of-order stamps: dropped, nothing goes back
+    edge_clocks(t += 4000000); uint64_t st0 = t - 2000000;
+    dm_motion_set_hid(0, a, w0, st0); dm_motion_set_hid(0, a, w0, st0); dm_motion_set_hid(0, a, w0, st0 - 1000000); edge_read(&w);
+    edge_clocks(t += 4000000); dm_motion_set_hid(0, a, w0, t - 1000000); edge_read(&w);
+    CHECK(w.ok_mono && w.ok_consec && w.ok_clock && w.ok_finite, "edges: equal and out-of-order stamps");
+    // the direction between two samples is a rotation (normalized lerp): orthonormal rows
+    {
+        motion_sample r2[2] = {{.t = 0, .dir = {1, 0, 0, 0, 1, 0, 0, 0, 1}}, {.t = 10, .dir = {0, 1, 0, -1, 0, 0, 0, 0, 1}}}, o2;
+        live_at(r2, 2, 5, &o2);
+        float n0 = o2.dir[0] * o2.dir[0] + o2.dir[1] * o2.dir[1] + o2.dir[2] * o2.dir[2], d01 = o2.dir[0] * o2.dir[3] + o2.dir[1] * o2.dir[4] + o2.dir[2] * o2.dir[5];
+        CHECK(fabsf(n0 - 1) < 1e-4f && fabsf(d01) < 1e-4f && fabsf(o2.dir[0] - 0.7071f) < 1e-3f && fabsf(o2.dir[1] - 0.7071f) < 1e-3f, "edges: the direction halfway between a quarter turn is the eighth turn, a rotation");
+    }
+    atomic_store(&g_test_lag, 0); dm_motion_clear_hid(0); h_hid_ImuDisable(); unsetenv("DM_IMU_NOISE"); imu_env_read();
     guest_now = 1000000000ull; motion_now = 1000000000ull; g_phone_mode = -1;
 }
 
@@ -1061,6 +1137,7 @@ int main(void) {
     t_imu_noise();
     t_imu_sdk_handles();
     t_live_ring();
+    t_live_edges();
     t_six_ic_info();
     t_rec();
     {   // Nmouse with no device (SDK 21's forms): the pointer range is kept, the merged handle 0 takes settings, the standard mouse and the handle queries report nothing
