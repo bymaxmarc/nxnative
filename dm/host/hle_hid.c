@@ -333,6 +333,7 @@ enum { KIND_NONE = 0, KIND_PAD, KIND_DUAL, KIND_LEFT, KIND_RIGHT };
 typedef struct { int pad, kind; } npad_ref;
 static _Atomic uint32_t g_joy_sides[DM_PLAYERS];
 static _Atomic uint32_t g_joy_two[DM_PLAYERS];   // the pad's Joy-Cons are Joy-Con 2s (DM_JOY_2)
+static _Atomic uint32_t g_joy_paired[DM_PLAYERS];   // the pad has held both Joy-Cons since it last held none (six_stream: a half it lost lies flat)
 static _Atomic uint64_t g_joy_btn[DM_PLAYERS][2], g_joy_latch[DM_PLAYERS][2], g_joy_axes[DM_PLAYERS][2];
 static _Atomic uint32_t g_single_mask;               // bit id: the game asked for single assignment on npad No(id + 1)
 static _Atomic uint32_t g_single_keep[DM_PLAYERS];   // 1: the left Joy-Con stays on that npad, 2: the right one, 0: either (the left)
@@ -402,6 +403,7 @@ void dm_joy_attach(int p, uint32_t sides) {
     if (p < 0 || p >= DM_PLAYERS) return;
     atomic_store(&g_joy_two[p], (sides & DM_JOY_2) && (sides & 3) ? 1u : 0u);
     sides &= 3;
+    if (sides == 3 || !sides) atomic_store(&g_joy_paired[p], sides == 3);
     if (atomic_exchange(&g_joy_sides[p], sides) == sides) return;
     if (!sides) for (int s = 0; s < 2; s++) { atomic_store(&g_joy_btn[p][s], 0); atomic_store(&g_joy_axes[p][s], 0); }
     for (uint32_t i = 0; i < DM_PLAYERS; i++) style_changed(i);
@@ -888,9 +890,10 @@ static void live_ring_copy(live_motion *m, uint64_t from, motion_sample *out, un
 }
 // The sample at guest time t from a history (oldest first, n >= 1): interpolated between the samples around t, the oldest before it, the newest held after it (never
 // extrapolated)
-static void live_at(const motion_sample *r, unsigned n, uint64_t t, motion_sample *o) {
-    if (t <= r[0].t) { *o = r[0]; o->t = t; return; }
-    if (t >= r[n - 1].t) { *o = r[n - 1]; o->t = t; return; }
+// Returns 1 when the tick carries no change of its own: held (before the oldest or past the newest sample, or a single sample) or between two samples that read alike
+static int live_at(const motion_sample *r, unsigned n, uint64_t t, motion_sample *o) {
+    if (t <= r[0].t) { *o = r[0]; o->t = t; return 1; }
+    if (t >= r[n - 1].t) { *o = r[n - 1]; o->t = t; return 1; }
     unsigned lo = 0, hi = n - 1;   // r[lo].t < t < r[hi].t: bisect
     while (hi - lo > 1) { unsigned mid = (lo + hi) / 2; if (r[mid].t <= t) lo = mid; else hi = mid; }
     const motion_sample *a = &r[lo], *b = &r[hi];
@@ -902,11 +905,13 @@ static void live_at(const motion_sample *r, unsigned n, uint64_t t, motion_sampl
     // so the direction is always a rotation
     const motion_sample *near = f < 0.5f ? a : b;
     memcpy(o->dir, near->dir, sizeof o->dir);
-    if (b->t - a->t > LIVE_BLEND_MAX_NS) return;
+    int same = !memcmp(a->acc, b->acc, sizeof a->acc) && !memcmp(a->gyro, b->gyro, sizeof a->gyro);
+    if (b->t - a->t > LIVE_BLEND_MAX_NS) return same;
     float R[3][3]; for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) R[i][j] = a->dir[3 * i + j] + (b->dir[3 * i + j] - a->dir[3 * i + j]) * f;
-    for (int j = 0; j < 3; j++) if (R[0][j] * R[0][j] + R[1][j] * R[1][j] + R[2][j] * R[2][j] < 0.25f) return;
+    for (int j = 0; j < 3; j++) if (R[0][j] * R[0][j] + R[1][j] * R[1][j] + R[2][j] * R[2][j] < 0.25f) return same;
     m3_orthonormalize(R);
     for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) o->dir[3 * i + j] = R[i][j];
+    return same;
 }
 // The newest tick an answer reaches: the guest clock's current tick, live or not (a tick past the newest sample holds that sample: a source's latency of a few ticks), and never
 // below the last tick answered for that handle (a high-water mark per handle and kind of answer), so the sampling numbers a game reads never go back: not when another thread
@@ -981,14 +986,25 @@ static uint32_t six_style_index(uint32_t style) {
 // The motion behind a handle: a Joy-Con npad's own Joy-Con, else its player's controller. Fills src with that stream's history (live_ring_copy) and returns its count: 0 when no
 // live stream is fresh (the sensor lies flat). Also whether it shakes
 typedef struct { motion_sample r[LIVE_RING]; unsigned n; } live_hist;
-// The stream behind a handle. A Joy-Con npad reads its own Joy-Con. A whole controller reads its player's merged stream, except a single Joy-Con the game is shown as a pair
-// (pad_style: a game such as Nintendo Switch Sports Resort supports JoyDual but no single Joy-Con style): both of the pair's sensors then read that Joy-Con's own stream, in
-// the frame of a Joy-Con of a pair (upright), as the game takes a JoyDual sensor to be. The merged stream holds it in the frame of a Joy-Con held sideways, a quarter turn
-// away, and the right Joy-Con 2's session showed the pair's handles reading that
+// The stream behind a handle (NULL: the host's flat sensor). A Joy-Con npad reads its own Joy-Con, a real L + R pair the game takes as a pair (KIND_DUAL) each handle its own
+// half. A whole controller reads its player's merged stream, except Joy-Cons the game is shown as a pair (pad_style: a game such as Nintendo Switch Sports Resort supports JoyDual
+// but no single Joy-Con style), which read the Joy-Cons' own streams in the frame of a Joy-Con of a pair (upright), as the game takes a JoyDual sensor to be; the merged stream
+// holds a single Joy-Con in the frame of one held sideways, a quarter turn away. Both halves there (a pair in another player's slot of a one-player game, merged_players): each
+// handle its own half. A single Joy-Con from the start: both handles read it, not one of them a flat sensor, as Switch Sports Resort read device 0 (the left half's) 50 times as
+// often as device 1 with a right Joy-Con alone, so a flat device 0 would leave its racket still. A pair that lost a half: the missing half's handle lies flat, as its sensor is
+// gone, rather than taking the other half's stream mid-game (a jump to another controller's frame)
 static live_motion *six_stream(uint32_t h, npad_ref ref, int pl) {
-    if (ref.kind >= KIND_DUAL) return motion_joy_pick(ref.pad, ref.kind == KIND_LEFT ? 0 : ref.kind == KIND_RIGHT ? 1 : (int)(h >> 16 & 1), NULL);
-    uint32_t sides = pl >= 0 && pl < DM_PLAYERS && joy_active(pl) ? atomic_load(&g_joy_sides[pl]) : 0;
-    if ((sides == 1 || sides == 2) && kind_style(ref, h >> 8 & 0xff) == STYLE_JOYDUAL) return motion_joy_pick(pl, sides == 2, NULL);
+    int dev = (int)(h >> 16 & 1);
+    if (ref.kind >= KIND_DUAL) return motion_joy_pick(ref.pad, ref.kind == KIND_LEFT ? 0 : ref.kind == KIND_RIGHT ? 1 : dev, NULL);
+    if (pl >= 0 && pl < DM_PLAYERS && kind_style(ref, h >> 8 & 0xff) == STYLE_JOYDUAL) {
+        uint32_t src = 1u << pl | (pl ? 0 : merged_players());
+        pthread_once(&g_motion_once, motion_env);
+        for (int q = 0; q < DM_PLAYERS; q++) if (src >> q & 1 && joy_active(q)) {
+            uint32_t sides = atomic_load(&g_joy_sides[q]); int side = sides == 3 ? dev : sides == 2;
+            if (sides != 3 && side != dev && atomic_load(&g_joy_paired[q])) return NULL;
+            if (!g_motion_off && motion_copy(&g_joy_motion[q][side], NULL)) return &g_joy_motion[q][side];
+        }
+    }
     return motion_pick(pl, NULL);
 }
 static unsigned six_source(uint32_t h, uint64_t from, live_hist *src, int *shakes) {   // from: the oldest tick's guest time the answer needs
@@ -1011,9 +1027,9 @@ static int six_offset_known(uint32_t h) {
     return have;
 }
 // The state at a tick: from the live history (live_at) while there is one, else the host's own (flat, shaken or swung)
-static void six_at(SixAxisState *s, int64_t samp, const live_hist *src, int shakes) {
-    if (src->n) { motion_sample ms; live_at(src->r, src->n, (uint64_t)samp * SIX_PERIOD_NS, &ms); six_sample_live(s, samp, &ms, shakes); }
-    else six_sample(s, samp, shakes);
+static int six_at(SixAxisState *s, int64_t samp, const live_hist *src, int shakes) {   // returns live_at's "no change of its own" (0 for the host's own samples)
+    if (src->n) { motion_sample ms; int held = live_at(src->r, src->n, (uint64_t)samp * SIX_PERIOD_NS, &ms); six_sample_live(s, samp, &ms, shakes); return held; }
+    six_sample(s, samp, shakes); return 0;
 }
 static int six_states(SixAxisState *out, int n, uint32_t h) {
     if (n <= 0) return 0;
@@ -1177,6 +1193,7 @@ enum { IMU_RING = 16 };
 static float g_imu_acc_sign = -1, g_imu_gyro_sign = -1;
 #define IMU_NOISE_DPS 0.1      // the default noise (see imu_sample)
 #define IMU_NOISE_G 0.00005
+#define IMU_DITHER_SCALE 0.1     // held live ticks: a tenth of the host noise (0.01 deg/s, 0.005 mG), under a real controller's floor; DM_IMU_NOISE scales or removes it too
 static motion_map g_imu_axes = {{0, 1, 2}, {1, 1, 1}, 1, 1};   // DM_IMU_AXES (imu_sample)
 static double g_imu_noise_g = -1, g_imu_noise_dps = -1;   // DM_IMU_NOISE (imu_sample): the spreads in use; set by imu_env_read
 static pthread_once_t g_imu_once = PTHREAD_ONCE_INIT;
@@ -1205,7 +1222,11 @@ static void imu_env_read(void) {
 // must stay small: the stillness detector (GyroPointingStateDetector::UpdateMovingDetection, sdk+0x736260) calls the controller moving when the lag-1 autocovariance of the last 64
 // accelerations on x and z (m/s^2) is beyond 1e-6 (threshold 0.001 squared, detector +0x11ec), and with 2 mG of white noise it read 5e-5: never still, never calibrated. So the gyro
 // carries 0.1 deg/s (about one step of the IC at 2000 deg/s) and the acceleration 0.05 mG (under one step at 8 G, 0.24 mG), Gaussian, per axis: IMU_NOISE_DPS and IMU_NOISE_G. It is
-// a function of the tick, the device and the axis (a hash), so a tick delivered again reads the same, and two Joy-Cons differ. DM_IMU_NOISE=0 leaves it out
+// a function of the tick, the device and the axis (a hash), so a tick delivered again reads the same, and two Joy-Cons differ. DM_IMU_NOISE=0 leaves it out.
+// A live controller carries its own noise, so its interpolated ticks are left as they are; a tick with no change of its own (live_at: held past the newest sample or before the
+// oldest, a single sample, or between two samples that read alike) gets a tenth of it (IMU_DITHER_SCALE: 0.01 deg/s, 0.005 mG), so the game never reads a run of identical ticks.
+// Held ticks are most of them: the game reads up to now and a sample lands only every 30 ms (Joy-Con 2) or 15 ms (DualSense), so in the first real-controller session 76 to 79% of
+// the Joy-Con 2's ticks were held, in runs of 4 to 9, and 58% of the DualSense's
 // (IMU_NOISE_DPS / IMU_NOISE_G are defined above, at the IMU state)
 // On by default: the fusion is the SDK's own code, so every Switch 2 title on this SDK runs into it, and the noise touches only GetNpadImuSamples (GetSixAxisSensorStates keeps exact values)
 static uint64_t imu_mix(uint64_t x) {   // splitmix64's finalizer
@@ -1218,12 +1239,14 @@ static double imu_gauss(int64_t tick, uint32_t device, int channel) {   // a sta
 }
 void imu_env_reread(void) { pthread_once(&g_imu_once, imu_env_read); imu_env_read(); }   // DM_CTL "env DM_IMU_…" (a race with a sample being made only mixes two settings for one tick)
 static void imu_sample(NpadImuSample *o, int64_t tick, const live_hist *src, int shakes, uint32_t device) {
-    SixAxisState s; six_at(&s, tick, src, shakes);
+    SixAxisState s; int held = six_at(&s, tick, src, shakes);
     o->sampling = tick + 1; o->delta_ns = SIX_PERIOD_NS;
     for (int i = 0; i < 3; i++) {
-        // the noise only on the host's own samples: a live controller's carry their own (a Joy-Con 2 at rest: 0.4..0.7 mG, 0.04..0.06 deg/s; a DualSense 3..5 mG, 0.05..0.2 deg/s)
-        int add = !src->n;
-        double na = add && g_imu_noise_g > 0 ? g_imu_noise_g * imu_gauss(tick, device, i) : 0, ng = add && g_imu_noise_dps > 0 ? g_imu_noise_dps / 360 * imu_gauss(tick, device, 3 + i) : 0;
+        // The host's own samples get the full noise. A live controller's carry their own (a Joy-Con 2 at rest: 0.4..0.7 mG, 0.04..0.06 deg/s; a DualSense 3..5 mG, 0.05..0.2
+        // deg/s) and keep it untouched where they are interpolated; a tick that holds a sample (past the newest: a 33 Hz Joy-Con 2 holds about six ticks, a 67 Hz DualSense three;
+        // a single-sample history) or lies between two that read alike would repeat the same values, which the fusion is not made for: it gets a dither under the real floor
+        double fg = !src->n ? 1 : held ? IMU_DITHER_SCALE : 0;
+        double na = fg > 0 && g_imu_noise_g > 0 ? fg * g_imu_noise_g * imu_gauss(tick, device, i) : 0, ng = fg > 0 && g_imu_noise_dps > 0 ? fg * g_imu_noise_dps / 360 * imu_gauss(tick, device, 3 + i) : 0;
         o->acc[i] = (float)(g_imu_acc_sign * (s.acc[i] + na) * STANDARD_GRAVITY);
         o->gyro[i] = (float)(g_imu_gyro_sign * (s.gyro[i] + ng) * 2 * M_PI);
     }

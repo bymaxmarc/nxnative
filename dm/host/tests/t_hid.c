@@ -1085,8 +1085,82 @@ static void t_single_joy_as_pair(void) {
     h_hid_SetStyles(STYLE_FULLKEY | STYLE_JOYDUAL | STYLE_JOYLEFT | STYLE_JOYRIGHT);
     CHECK(h_hid_GetStyle(&(uint32_t){0}) == STYLE_JOYRIGHT && h_hid_ImuSamples(q, 1, 0x10007) == 1 && fabsf(q[0].gyro[1] + 0.7f) < 1e-4f, "a game with JoyRight: its own stream, as before");
     unsetenv("DM_IMU_NOISE"); imu_env_read();
-    CHECK(h_hid_ImuSamples(q, 1, 0x10007) == 1 && q[0].gyro[1] == -0.7f && q[0].gyro[0] == 0 && q[0].acc[2] == 9.80665f, "live samples get no added noise (the controller has its own)");
+    {   // interpolated live ticks are untouched; held ones (past the newest sample) get a dither under the real floor, so no two ticks in a row are alike
+        dm_motion_clear_joy(0, 1); float w1[3] = {0, 0.7f, 0}, w2[3] = {0, 0.8f, 0};
+        motion_now = guest_now = (t += 1000000000ull); dm_motion_set_joy(0, 1, a, w1, t - 20000000); dm_motion_set_joy(0, 1, a, w2, t - 10000000);
+        TestImuSample r[4]; CHECK(h_hid_ImuSamples(r, 4, 0x10007) == 4, "dither: four ticks");
+        // ticks at t-15, -10 (the newest sample), -5, 0 ms: the first is interpolated exactly, the newest-sample tick and those after it are held and dithered
+        CHECK(fabsf(r[0].gyro[1] + 0.75f) < 1e-6f, "dither: an interpolated tick is the controller's own value, untouched");
+        int alike = 0; for (int i = 1; i < 4; i++) alike |= !memcmp(&r[i].gyro, &r[i - 1].gyro, sizeof r[i].gyro) || !memcmp(&r[i].acc, &r[i - 1].acc, sizeof r[i].acc);
+        CHECK(!alike && fabsf(r[3].gyro[1] + 0.8f) < 1e-3f && fabsf(r[3].acc[2] - 9.80665f) < 1e-3f, "dither: held ticks differ from each other, and stay at the held value");
+    }
     dm_motion_clear_joy(0, 1); dm_motion_clear_hid(0); dm_joy_attach(0, 0); h_hid_SetStyles(0xffffffffu); h_hid_ImuDisable(); guest_now = motion_now = 1000000000ull; g_phone_mode = -1;
+}
+
+// Joy-Cons shown as a pair (Switch Sports Resort's styles: Handheld | JoyDual). A real pair is KIND_DUAL, each handle its own half; a pair that loses a half leaves the missing
+// half's handle flat (no jump to the other controller); a pair in another slot of a one-player game (merged into player 1) also gives each handle its own half
+static void t_pair_halves(void) {
+    g_mode = 1; dm_pad_players(1); g_phone_mode = 0; hwm_clear(); setenv("DM_IMU_NOISE", "0", 1); imu_env_read();
+    uint32_t ids_was = atomic_load(&g_ids_supported);
+    uint64_t t = 600000000000ull; motion_now = guest_now = t;
+    uint8_t ring[64]; h_hid_ImuEnable(ring, sizeof ring);
+    h_hid_SetStyles(STYLE_HANDHELD | STYLE_JOYDUAL);
+    float a[3] = {0, 0, -1}, wl[3] = {0, 0.3f, 0}, wr[3] = {0, 0.7f, 0};
+    TestImuSample q[1];
+    dm_joy_attach(0, 3); dm_motion_set_joy(0, 0, a, wl, t); dm_motion_set_joy(0, 1, a, wr, t);
+    CHECK(npad_resolve(0).kind == KIND_DUAL, "a real L + R pair in a JoyDual game resolves as KIND_DUAL");
+    CHECK(h_hid_ImuSamples(q, 1, 0x5) == 1 && fabsf(q[0].gyro[1] + 0.3f) < 1e-4f, "pair: device 0 reads the left Joy-Con");
+    CHECK(h_hid_ImuSamples(q, 1, 0x10005) == 1 && fabsf(q[0].gyro[1] + 0.7f) < 1e-4f, "pair: device 1 reads the right Joy-Con");
+    dm_joy_attach(0, 2);   // the left one goes away
+    CHECK(h_hid_ImuSamples(q, 1, 0x10005) == 1 && fabsf(q[0].gyro[1] + 0.7f) < 1e-4f, "lost half: the right handle keeps its own Joy-Con");
+    CHECK(h_hid_ImuSamples(q, 1, 0x5) == 1 && fabsf(q[0].gyro[1]) < 1e-4f && fabsf(q[0].acc[2] - 9.80665f) < 1e-3f, "lost half: the left handle lies flat, not the right Joy-Con's stream");
+    dm_joy_attach(0, 0); dm_joy_attach(0, 2);   // a right Joy-Con alone from the start
+    CHECK(h_hid_ImuSamples(q, 1, 0x5) == 1 && fabsf(q[0].gyro[1] + 0.7f) < 1e-4f, "single Joy-Con from the start: both handles read it again");
+    dm_joy_attach(0, 0); dm_motion_clear_joy(0, 0); dm_motion_clear_joy(0, 1);
+    // A one-player game with the pair on player 2: player 1 (no Joy-Cons) is shown as JoyDual, each handle reads its half
+    ids((const uint32_t[]){0, NPAD_HANDHELD}, 2); dm_pad_players(0x3);
+    dm_joy_attach(1, 3); dm_motion_set_joy(1, 0, a, wl, t); dm_motion_set_joy(1, 1, a, wr, t); dm_motion_set_hid(1, a, (float[3]){0.5f, 0, 0}, t);
+    CHECK(h_hid_ImuSamples(q, 1, 0x5) == 1 && fabsf(q[0].gyro[1] + 0.3f) < 1e-4f && fabsf(q[0].gyro[0]) < 1e-4f, "merged pair: device 0 reads player 2's left Joy-Con");
+    CHECK(h_hid_ImuSamples(q, 1, 0x10005) == 1 && fabsf(q[0].gyro[1] + 0.7f) < 1e-4f, "merged pair: device 1 reads its right Joy-Con");
+    dm_joy_attach(1, 2);   // the left one goes away there too
+    CHECK(h_hid_ImuSamples(q, 1, 0x5) == 1 && fabsf(q[0].gyro[1]) < 1e-4f && fabsf(q[0].gyro[0]) < 1e-4f, "merged pair that lost a half: the left handle lies flat");
+    dm_joy_attach(1, 0); dm_joy_attach(1, 2);   // a single right Joy-Con in player 2's slot: both handles read it, not the sideways merged stream
+    CHECK(h_hid_ImuSamples(q, 1, 0x5) == 1 && fabsf(q[0].gyro[1] + 0.7f) < 1e-4f && fabsf(q[0].gyro[0]) < 1e-4f, "merged single Joy-Con: its own stream (the upright frame), not the merged one");
+    dm_joy_attach(1, 0); dm_motion_clear_joy(1, 0); dm_motion_clear_joy(1, 1); dm_motion_clear_hid(1);
+    dm_pad_players(1); atomic_store(&g_ids_supported, ids_was);
+    unsetenv("DM_IMU_NOISE"); imu_env_read();
+    h_hid_SetStyles(0xffffffffu); h_hid_ImuDisable(); guest_now = motion_now = 1000000000ull; g_phone_mode = -1;
+}
+
+// A still, clean live source (identical samples, as a quantized sensor at rest) at 33 and 67 Hz: the game never gets two identical ticks in a row, and the values stay within the dither
+static void t_live_still_dither(void) {
+    g_mode = 1; dm_pad_players(1); g_phone_mode = 0; hwm_clear(); unsetenv("DM_IMU_NOISE"); imu_env_read();
+    uint8_t ring[64]; h_hid_ImuEnable(ring, sizeof ring);
+    static const double rates[2] = {33, 67};
+    for (int ri = 0; ri < 2; ri++) {
+        uint64_t t0 = 500000000000ull + (uint64_t)ri * 10000000000ull, period = (uint64_t)(1e9 / rates[ri]), next = t0, nf = t0 + 50000000;
+        dm_motion_clear_hid(0); hwm_clear();
+        float a[3] = {0.01f, -0.11f, -0.99f}, w[3] = {0.001f, -0.002f, 0.0005f};
+        int run_ok = 1, val_ok = 1; TestImuSample prev; int have = 0; int64_t last_num = 0;
+        for (uint64_t t = t0; t < t0 + 1000000000ull; t += 500000) {
+            motion_now = guest_now = t;
+            if (t >= next) { dm_motion_set_hid(0, a, w, t - 8000000); next += period; }
+            if (t >= nf) {
+                nf += 16666667; TestImuSample q[16]; int k = h_hid_ImuSamples(q, 16, 0x20003);
+                for (int i = 0; i < k; i++) {
+                    if (q[i].sampling <= last_num) continue;   // a tick the fusion took already
+                    if (have && !memcmp(q[i].acc, prev.acc, sizeof prev.acc) && !memcmp(q[i].gyro, prev.gyro, sizeof prev.gyro)) run_ok = 0;
+                    // the rest learner may take the gyro offset away (an HID source), so check each tick against the one before: the dither is all that moves
+                    if (have && (fabsf(q[i].acc[2] - prev.acc[2]) > 1e-3f || fabsf(q[i].gyro[0] - prev.gyro[0]) > 1e-3f)) val_ok = 0;
+                    prev = q[i]; have = 1; last_num = q[i].sampling;
+                }
+            }
+        }
+        char what[96];
+        snprintf(what, sizeof what, "still clean source at %.0f Hz: never two identical ticks in a row", rates[ri]); CHECK(run_ok, what);
+        snprintf(what, sizeof what, "still clean source at %.0f Hz: ticks move by no more than the dither", rates[ri]); CHECK(val_ok, what);
+    }
+    dm_motion_clear_hid(0); h_hid_ImuDisable(); guest_now = motion_now = 1000000000ull; g_phone_mode = -1;
 }
 
 // Six-axis sensor information the fusion's initialization reads (sdk+0x6d7e28): 0xc8 bytes (sdk+0x6d7e58 copies them), gyro half then acceleration half
@@ -1210,6 +1284,8 @@ int main(void) {
     t_live_edges();
     t_live_rest();
     t_single_joy_as_pair();
+    t_live_still_dither();
+    t_pair_halves();
     t_six_ic_info();
     t_rec();
     {   // Nmouse with no device (SDK 21's forms): the pointer range is kept, the merged handle 0 takes settings, the standard mouse and the handle queries report nothing
