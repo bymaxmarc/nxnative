@@ -22,7 +22,7 @@ A Switch 2 game: update v65536, which holds the whole game (packed from a NUP wi
 ## Frame rate
 
 - **60 fps, present interval 1.** In the tennis match (M2 Max, window, 240 Hz screen): frame time p50 16.67 / p95 17.2 ms, NVN submit about 6.8 ms and GPU about 12 ms a frame, CPU about 145% of one core, no frame dropped on screen. The game sets interval 2 for a few frames around scene loads.
-- **Scene loads.** The first frame of a scene draws every texture the scene loaded: 855 textures (908 MB) for the court behind the sport menu, 245-250 ms, nearly all of it on the submit thread making the textures and their memory resident ([Two source buffers for each staged upload from a large pool](../../../docs/reference/memory.md#two-source-buffers-for-each-staged-upload-from-a-large-pool)). Smaller loads: 92 textures about 110 ms, 340 about 135 ms. Making the textures when the game registers them removed the court frame's hitch, but the game registers about 13,800 packaged textures at boot that it never draws (GPU memory 3.0 → 6.5 GB), so the host does not do that.
+- **Scene loads.** The first frame of a scene draws every texture the scene loaded: 855 textures (908 MB) for the court behind the sport menu, 224-232 ms, nearly all of it on the submit thread, about 150 ms of it committing the residency set: the new textures, their staging and their source buffers, about 0.04 ms per MB while the GPU runs the previous frames ([Two source buffers for each staged upload from a large pool](../../../docs/reference/memory.md#two-source-buffers-for-each-staged-upload-from-a-large-pool), [Residency changes waited for another thread's commit](../../../docs/reference/memory.md#residency-changes-waited-for-another-threads-commit)). Smaller loads: 92 textures about 110 ms, 340 about 135 ms. Making the textures when the game registers them removed the court frame's hitch, but the game registers about 13,800 packaged textures at boot that it never draws (GPU memory 3.0 → 6.5 GB), so the host does not do that.
 - **Boot.** One frame about 7 s in runs 250 ms on the GPU: the game draws 1,657 render passes in it, 400 of them one-draw 256x32 RGBA16F passes of up to 1.8 ms each. The next frame waits for it.
 - **When measuring:** a run's screenshots (`DM_NVN_SHOT`) each cost a frame of 120-190 ms. On a 75 Hz screen (seen in unattended runs) 60 fps shows as one frame of 26.7 ms in every four, by the screen's rate, not the game. Heavy compiles beside the game (an offline pipeline archive build) took a session from 60 to 22-40 fps: the game's main thread spins on its workers, which then lack CPU.
 
@@ -46,7 +46,7 @@ A Switch 2 game: update v65536, which holds the whole game (packed from a NUP wi
 - The shader defects above.
 - Motion controls: only the sensor-fusion service path is checked ([Switch 2 hid calls that open the hid service](../../../docs/reference/services.md#switch-2-hid-calls-that-open-the-hid-service)); a match played with motion input is not.
 - Sports other than tennis are not checked in a scripted route.
-- The 250 ms frames of scene loads; the boot frame.
+- The 225 ms first frame of the court and the other scene loads; the boot frame.
 - iPhone and iPad: no IPA built.
 
 ## Found on this game
