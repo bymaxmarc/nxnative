@@ -759,12 +759,16 @@ HLE_FORCE("_ZN2nn2fs18IsSaveDataExistingENS_13ApplicationIdERKNS_7account3UidE",
 // data of that application and user (IsSaveDataExisting above says it exists, and on the console the system creates it at the first launch). Nintendo Switch Sports Resort mounts
 // its own save as SaveReadOnly at boot; refused, the game aborted at the first boot that found an account save (main+0x349d880 checks that the mount it reads from is named
 // SaveReadOnly, and calls the abort at main+0x3917260 otherwise), so every run after its first save stopped about 48 s in
+// Without a save folder it answers TargetNotFound, as before, and the game's own MountSaveData stops the run with the reason
 static Result mount_own_save_ro(const char *name) {
     const char *d = getenv("DM_SAVE");
-    if (!d) die("DM_SAVE is not set: point it at a writable copy of a save directory");
+    if (!d || !*d) { LOG("[RED] fs read-only mount of this game's save data %s: DM_SAVE is not set, answered as no save data", name); return 0x7d402u; }   // fs ResultTargetNotFound
     char dd[1024]; strlcpy(dd, d, sizeof dd); size_t L = strlen(dd); while (L > 1 && dd[L - 1] == '/') dd[--L] = 0;
     save_sync_mount(dd, DM_GAME_ID);   // the cloud's save comes in before anything reads the committed one (the first mount does it, as for MountSaveData)
-    mkdir(dd, 0755);                   // a first launch has no committed save yet: an empty one, as the console's new save data
+    // A first launch has no committed save yet: an empty one, as the console's new save data. The folder is checked here, since mount_ex would stop on a missing one as on missing game files
+    struct stat st;
+    if (mkdir(dd, 0755) && errno != EEXIST) { LOG("[RED] fs read-only mount of this game's save data %s: cannot create the save folder %s (errno=%d), answered as no save data", name, dd, errno); return 0x7d402u; }
+    if (stat(dd, &st) || !S_ISDIR(st.st_mode)) { LOG("[RED] fs read-only mount of this game's save data %s: the save folder %s is not a folder, answered as no save data", name, dd); return 0x7d402u; }
     return mount_ex(name, dd, 1, 0);
 }
 HLE_FORCE("_ZN2nn2fs21MountSaveDataReadOnlyEPKcNS_13ApplicationIdERKNS_7account3UidE", "fsp-srv; this game's own save data read-only (the committed save); another program's: none", Result, h_fs_MountSaveRO, const char *name, uint64_t app, const void *uid) { dm_thread_service_request();

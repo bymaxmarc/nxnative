@@ -97,6 +97,10 @@ int main(void) {
     snprintf(p, sizeof p, "%s/fresh", root); setenv("DM_SAVE", p, 1);
     CHECK(h_fs_MountSaveRO("FreshRO", DM_GAME_PROGRAM_ID, NULL) == RES_OK && h_fs_GetEntryType(&type, "FreshRO:/") == RES_OK && type == ENT_DIR,
           "a first launch with no committed save mounts an empty one");
+    unsetenv("DM_SAVE");
+    CHECK(h_fs_MountSaveRO("NoSaveRO", DM_GAME_PROGRAM_ID, NULL) == 0x7d402u, "no save folder (DM_SAVE unset): TargetNotFound, no exit");
+    snprintf(p, sizeof p, "%s/afile", root); FILE *af = fopen(p, "w"); if (af) fclose(af); setenv("DM_SAVE", p, 1);   // a file, not a folder
+    CHECK(h_fs_MountSaveRO("FileRO", DM_GAME_PROGRAM_ID, NULL) == 0x7d402u, "a save path that is a file: TargetNotFound, no exit");
     setenv("DM_SAVE", save, 1);
     CHECK(h_fs_CreateDirectory("save:/Trail/") == RES_OK && listed("save:/", "Trail", ENT_DIR), "a trailing slash on create directory does not become an empty name");
     CHECK(h_fs_CreateFile("save:/.dm-case-1", 0) == RES_OK && write_text("save:/.dm-case-1", "real"), "a real guest name with the alias prefix can be created");
