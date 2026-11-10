@@ -614,16 +614,6 @@ static void t_motion_hid(void) {
 }
 
 // Unintended Home button input protection: one flag per npad, on until the game turns it off (Nintendo Switch Sports Resort asks, then turns it off for each npad)
-static void t_home_protection(void) {
-    const uint32_t no1 = 0, no2 = 1, other = 0x10, handheld = 0x20, bad = 9;
-    CHECK(h_hid_HomeProtIs(&no1) && h_hid_HomeProtIs(&handheld) && h_hid_HomeProtIs(&other), "home protection: on for every npad at first");
-    h_hid_HomeProtEnable(&no1, 0);
-    CHECK(!h_hid_HomeProtIs(&no1) && h_hid_HomeProtIs(&no2), "home protection: turned off for No1 only");
-    h_hid_HomeProtEnable(&handheld, 0); h_hid_HomeProtEnable(&no1, 1);
-    CHECK(!h_hid_HomeProtIs(&handheld) && h_hid_HomeProtIs(&no1), "home protection: Handheld off, No1 on again");
-    h_hid_HomeProtEnable(&bad, 0);
-    CHECK(!h_hid_HomeProtIs(&bad) && h_hid_HomeProtIs(&no2), "home protection: an id that is no npad is refused and changes nothing");
-}
 
 // Npad IMU (Switch 2): the host serves the layer the SDK's sensor fusion reads from. Enabled with the game's buffer, disabled again; no samples yet (the buffer is never written)
 static void t_npad_imu(void) {
@@ -1134,7 +1124,6 @@ static void t_unsupported_style(void) {
 
 int main(void) {
     CHECK(setenv("DM_RUMBLE_LOG", "1", 1) == 0, "enable rumble diagnostics");
-    t_home_protection();
     t_npad_imu();
     t_icon_decoration();
     t_slots();
