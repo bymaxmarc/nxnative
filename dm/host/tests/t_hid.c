@@ -713,7 +713,7 @@ static void t_imu_sdk_handles(void) {
     setenv("DM_IMU_NOISE", "0", 1); imu_env_read();
     // The handle numbering (six_style_bit): style index 3..7 → style bits 0..4; device 2 only for full key and handheld (SDK 22's single sensor)
     CHECK(six_style_bit(0x20003) == 0 && six_style_bit(0x20004) == 1 && six_style_bit(0x10005) == 2 && six_style_bit(0x6) == 3 && six_style_bit(0x10007) == 4, "handles: style index to style bit");
-    CHECK(six_style_bit(0x20005) < 0 && six_style_bit(0x20006) < 0 && six_style_bit(0x20007) < 0, "handles: device 2 is refused for a pair and for a single Joy-Con");
+    CHECK(six_style_bit(0x20005) == 2 && six_style_bit(0x20006) == 3 && six_style_bit(0x20007) == 4, "handles: device 2 is taken for every style (SDKs differ in the device they give)");
     CHECK(six_style_bit(0x0) < 0 && six_style_bit(0x2) < 0 && six_style_bit(0x8) < 0 && six_style_bit(0x30003) < 0, "handles: no style index the host knows, or device 3: none");
     // The host's own handles (GetSixAxisSensorHandles) are in the same numbering, so either kind reaches the IMU
     uint32_t h[2], id = 0;
@@ -721,17 +721,26 @@ static void t_imu_sdk_handles(void) {
     CHECK(h_hid_SixHandles(h, 2, &id, STYLE_JOYDUAL) == 2 && h[0] == 0x5 && h[1] == 0x10005, "host handles: a pair is 0x5 and 0x10005, as the SDK's");
     CHECK(h_hid_SixHandles(h, 2, &(uint32_t){0x20}, STYLE_HANDHELD) == 2 && h[0] == 0x2004 && h[1] == 0x12004, "host handles: handheld on 0x20, two sensors");
     CHECK(h_hid_SixHandles(h, 2, &id, STYLE_JOYLEFT) == 1 && h[0] == 0x6 && h_hid_SixHandles(h, 2, &(uint32_t){1}, STYLE_JOYRIGHT) == 1 && h[0] == 0x10107, "host handles: left 0x6, right device 1");
-    CHECK(h_hid_SixHandles(h, 2, &id, STYLE_JOYDUAL2) == 2 && h[0] == 0x5 && h_hid_SixHandles(h, 2, &id, 1u << 9) == 1 && h[0] == 0, "host handles: a Joy-Con 2 pair as a pair; a style without a sensor: index 0");
+    CHECK(h_hid_SixHandles(h, 2, &id, STYLE_JOYDUAL2) == 2 && h[0] == 0x5 && h_hid_SixHandles(h, 2, &id, 1u << 9) == 0, "host handles: a Joy-Con 2 pair as a pair; a style without a sensor: none");
     uint8_t ring[64]; h_hid_ImuEnable(ring, sizeof ring);
     TestImuSample s[4];
     CHECK(h_hid_SixHandles(h, 1, &id, STYLE_FULLKEY) == 1 && h_hid_ImuSamples(s, 4, h[0]) == 4 && h_hid_ImuSamples(s, 4, 0x20003) == 4, "imu: the host's full-key handle and the SDK's (device 2) both have samples");
     h_hid_SetStyles(STYLE_HANDHELD | STYLE_JOYDUAL);   // the game's lobby (main+0xa9e940): the keyboard is shown as a pair
     CHECK(h_hid_ImuSamples(s, 4, 0x5) == 4 && h_hid_ImuSamples(s, 4, 0x10005) == 4, "imu: the pair's two SDK handles have samples");
-    CHECK(h_hid_ImuSamples(s, 4, 0x20003) == 0 && h_hid_ImuSamples(s, 4, 0x20005) == 0, "imu: no full-key controller then, and no device 2 of a pair: none");
+    CHECK(h_hid_ImuSamples(s, 4, 0x20003) == 0, "imu: no full-key controller then: none");
+    {   // an SDK-built pair handle with device 2 reads as the pair's device 0 (six_source takes the side from bit 0), through the six-axis states as through the IMU
+        SixAxisState st6[2];
+        CHECK(h_hid_ImuSamples(s, 4, 0x20005) == 4 && six_states(st6, 2, 0x20005) == 2 && st6[0].acc[2] == -1, "six-axis: a pair's device-2 handle has states and samples");
+        uint32_t two = 0x20005; CHECK(h_hid_SixStates(st6, 1, &two) == 1, "GetSixAxisSensorStates through it");
+    }
+    // Several styles in one set: the style the npad is shown in, two handles when the set holds a two-sensor style
+    CHECK(h_hid_SixHandles(h, 2, &id, STYLE_FULLKEY | STYLE_JOYDUAL) == 2 && h[0] == 0x5 && h[1] == 0x10005 && six_connected(h[0]), "host handles: FullKey | JoyDual while shown as a pair: the pair's two");
+    CHECK(h_hid_SixHandles(h, 1, &id, STYLE_FULLKEY | STYLE_JOYDUAL) == 1, "host handles: never more than asked");
     g_mode = 0;
     CHECK(h_hid_ImuSamples(s, 4, 0x20004 | 0x20u << 8) == 4 && h_hid_ImuSamples(s, 4, 0x4 | 0x20u << 8) == 4, "imu: handheld on 0x20, the SDK's device 2 and the host's device 0");
     g_mode = 1; h_hid_SetStyles(0xffffffffu);
     CHECK(h_hid_ImuSamples(s, 4, 0x20003) == 4 && h_hid_ImuSamples(s, 4, 0x5) == 0, "imu: full key supported: the full-key handle, not the pair's");
+    CHECK(h_hid_SixHandles(h, 2, &id, STYLE_FULLKEY | STYLE_JOYDUAL) == 2 && h[0] == 0x3 && h[1] == 0x10003 && six_connected(h[0]) && six_connected(h[1]), "host handles: FullKey | JoyDual while shown as full key: full key, two handles as before");
     // Player 2 on No2 with a live controller: its own motion; No3 without a player: none
     dm_pad_players(3);
     float a2[3] = {0, 0, -1}, w2[3] = {0, 0, 3.14159265f}; dm_motion_set(1, a2, w2);
@@ -792,6 +801,12 @@ static void t_imu_noise(void) {
     CHECK(again, "imu noise: a tick read again reads the same");
     setenv("DM_IMU_NOISE", "0", 1); imu_env_read();
     CHECK(h_hid_ImuSamples(s, 1, h[0]) == 1 && s[0].gyro[0] == 0 && s[0].acc[2] == 9.80665f, "imu noise: DM_IMU_NOISE=0 leaves it out");
+    setenv("DM_IMU_NOISE", "0.5", 1); imu_env_reread();
+    CHECK(g_imu_noise_dps == 0.05 && g_imu_noise_g == IMU_NOISE_G / 2, "imu noise: a single number scales the defaults");
+    setenv("DM_IMU_NOISE", "lots", 1); imu_env_reread();
+    CHECK(g_imu_noise_dps == IMU_NOISE_DPS && g_imu_noise_g == IMU_NOISE_G, "imu noise: a value that is no number keeps the defaults (and logs)");
+    setenv("DM_IMU_NOISE", "1,-2", 1); imu_env_reread();
+    CHECK(g_imu_noise_dps == IMU_NOISE_DPS && g_imu_noise_g == IMU_NOISE_G, "imu noise: a negative spread keeps the defaults");
     setenv("DM_IMU_NOISE", "1,0", 1); imu_env_reread();
     CHECK(h_hid_ImuSamples(s, 1, h[0]) == 1 && s[0].gyro[0] != 0 && s[0].acc[2] == 9.80665f, "imu noise: DM_IMU_NOISE=<deg/s>,<mG> sets each spread (gyro only here), read again on DM_CTL's env");
     setenv("DM_IMU_NOISE", "0,0.2", 1); imu_env_reread();
@@ -866,6 +881,12 @@ static void t_six_ic_info(void) {
     uint32_t other = 1u << 16; memset(back, 0xAB, sizeof back);
     CHECK(h_hid_SixCalLoad(back, &other) == 0 && !memcmp(back, zero, sizeof zero), "calibration: another device has its own (none stored: zero bias)");
     memset(back, 0xAB, sizeof back);
+    {   // one sensor, one parameter: the host's full-key handle (device 0) and the SDK's (device 2) store and load the same
+        uint32_t host0 = 0x3, sdk2 = 0x20003; uint8_t cal2[0x744]; memset(cal2, 0x5A, sizeof cal2);
+        CHECK(h_hid_SixCalStore(&sdk2, cal2) == 0 && h_hid_SixCalLoad(back, &host0) == 0 && !memcmp(back, cal2, sizeof cal2), "calibration: stored through device 2, loaded through device 0");
+        CHECK(h_hid_SixCalStore(&host0, cal) == 0 && h_hid_SixCalLoad(back, &sdk2) == 0 && !memcmp(back, cal, sizeof cal), "calibration: and the other way");
+        memset(back, 0xAB, sizeof back);
+    }
     uint32_t bad = 9u << 8, dev3 = 3u << 16;   // as the SDK's VerifyValidSixAxisSensorHandle (sdk+0x6d8440)
     CHECK(h_hid_SixCalStore(&bad, cal) == 0x58aca && h_hid_SixCalLoad(back, &bad) == 0x58aca, "calibration: an id that is no npad is refused");
     CHECK(h_hid_SixCalStore(&dev3, cal) == 0xd6ca && back[0] == 0xAB, "calibration: a device index past 2 is refused");

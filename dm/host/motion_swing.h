@@ -26,8 +26,10 @@
 typedef struct { int axis; double sign, peak_dps; int lift; } swing_spec;   // axis 0 x, 1 y, 2 z; sign +1 / -1 (right-handed about the axis); peak in deg/s (a lift: in G)
 
 // "Swing", "Swing-z", "Swingx@1800": the axis with its sign (a "+" is read too, though DM_KEYS cuts its keys at "+") (default +z: lying flat, a turn counterclockwise seen from above) and the peak speed. Returns 0 on anything else
-// A lift ("Lift", "Lift-z", "Liftx@4"): the controller moved along one of its axes without turning, accelerated then braked over LIFT_S (a sine of acceleration, so it ends still,
-// moved by about 2 cm at the default 3 G), as a quick upward flick that tosses a ball; the peak after "@" in G (LIFT_G_MIN..SWING_ACC_MAX_G)
+// A lift ("Lift", "Lift-z", "Liftx@4"): the controller moved along one of its own axes without turning, toward + (or - with the sign) of that axis: +z is out of its face, up
+// when it lies flat. It is accelerated then braked over LIFT_S (a sine of acceleration A sin(2 pi t / T), so it ends still, moved by A T^2 / (2 pi): about 42 cm at the default
+// 3 G), as a quick upward flick that tosses a ball. The reading on that axis is the gravity direction less the acceleration (lifting up flat: -1 - A while it speeds up, -1 + A
+// while it brakes), capped at the IC's 8 G; the peak after "@" in G (LIFT_G_MIN..SWING_ACC_MAX_G)
 #define LIFT_S 0.3
 #define LIFT_G_DEFAULT 3.0
 #define LIFT_G_MIN 0.2
@@ -67,7 +69,7 @@ static inline int swing_pose(const swing_spec *sp, double t, float acc[3], float
     acc[2] = -1; dir[0] = dir[4] = dir[8] = 1;
     if (sp->lift) {   // no turn: the gravity direction less the acceleration along the axis, a sine over LIFT_S
         if (!(t >= 0 && t < LIFT_S)) return 0;
-        acc[sp->axis] -= (float)(sp->sign * sp->peak_dps * sin(2 * M_PI * t / LIFT_S));
+        acc[sp->axis] = (float)fmax(-SWING_ACC_MAX_G, fmin(SWING_ACC_MAX_G, acc[sp->axis] - sp->sign * sp->peak_dps * sin(2 * M_PI * t / LIFT_S)));   // the IC saturates
         return 1;
     }
     double S = swing_seconds(sp->peak_dps), T = swing_duration(sp->peak_dps), big = SWING_DEG * M_PI / 180;

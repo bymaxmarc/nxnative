@@ -122,6 +122,10 @@ static void swing_checks(void) {
         CHECK(swing_pose(&up, 3 * LIFT_S / 4, a, g, an, d) && fabsf(a[2] - 2) < 1e-4f, "lift: braking, -1 + 3 G");
         CHECK(!swing_pose(&up, LIFT_S, a, g, an, d) && a[2] == -1, "lift: done after LIFT_S, at rest");
         CHECK(swing_spec_duration(&up) == LIFT_S && swing_spec_impact(&up) == LIFT_S / 4, "lift: its length and its strongest push");
+        swing_spec hard = {2, 1, 8, 1};
+        CHECK(swing_pose(&hard, LIFT_S / 4, a, g, an, d) && a[2] == -(float)SWING_ACC_MAX_G, "lift: 8 G up flat would read -9 G: capped at the IC's -8 G");
+        swing_spec down = {2, -1, 2, 1};
+        CHECK(swing_pose(&down, LIFT_S / 4, a, g, an, d) && fabsf(a[2] - 1) < 1e-4f, "lift down (-z): lighter, -1 + 2 G");
     }
     float acc[3], gyro[3], ang[3], dir[9];
     swing_spec z = {2, 1, 1500};

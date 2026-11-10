@@ -871,14 +871,14 @@ static void six_sample(SixAxisState *s, int64_t samp, int shakes) {
 // the npad id, byte 2 the device (0 the left and 1 the right sensor of two; SDK 22 gives a full-key or handheld controller's single sensor device 2). The host's own handles
 // (GetSixAxisSensorHandles below) use the same numbering, so a handle from either reads the same everywhere. They used to carry the style's bit number in byte 0, and the SDK's IMU
 // handles that the fusion passes to GetNpadImuSamples (0x5 / 0x10005 for a pair on No1) read as style bit 5, never connected: no samples, and Nintendo Switch Sports Resort's
-// fusion never ran. six_style_bit: the style bit of a handle's style index, -1 for an index the host has no style for or a device that style has not (device 2 only for full key and
-// handheld). The styles made of two Joy-Cons (handheld, dual) have two sensors in the host's handles, the others one. A handle reads as connected while its controller is connected
+// fusion never ran. six_style_bit: the style bit of a handle's style index, -1 for an index the host has no style for or a device past 2 (any style takes devices 0 to 2, as the
+// host's check always did: SDKs differ in which device they give a style, and six_source picks a pair's side from bit 0 of the device). The styles made of two Joy-Cons (handheld, dual) have two sensors in the host's handles, the others one. A handle reads as connected while its controller is connected
 // in that style; otherwise its entries are zero (not connected) and the count 0. Only player 1's controller shakes (DM_BTN_SHAKE comes from the keyboard, the iPhone and DM_KEYS,
 // all player 1)
 enum { SIX_IDX_FULLKEY = 3, SIX_IDX_HANDHELD = 4, SIX_IDX_JOYDUAL = 5, SIX_IDX_JOYLEFT = 6, SIX_IDX_JOYRIGHT = 7 };
 static int six_style_bit(uint32_t h) {
     uint32_t idx = h & 0xff, dev = h >> 16 & 0xff;
-    if (idx < SIX_IDX_FULLKEY || idx > SIX_IDX_JOYRIGHT || dev > 2 || (dev == 2 && idx > SIX_IDX_HANDHELD)) return -1;
+    if (idx < SIX_IDX_FULLKEY || idx > SIX_IDX_JOYRIGHT || dev > 2) return -1;
     return (int)(idx - SIX_IDX_FULLKEY);   // FullKey .. JoyRight are style bits 0 .. 4
 }
 static int six_connected(uint32_t h) { int b = six_style_bit(h); return b >= 0 && (style_of(h >> 8 & 0xff) >> b & 1); }
@@ -910,13 +910,16 @@ static int six_states(SixAxisState *out, int n, uint32_t h) {
     for (int i = 0; i < n; i++) six_at(&out[i], samp - i, live, &ms, shakes);
     return n;
 }
+// A style set of several styles (FullKey | JoyDual, as a game that takes either passes) gets the style the npad's controller is shown in, when it is one of them (else the first, as
+// the SDK's utility); two handles when the set holds a style made of two Joy-Cons (handheld, dual), as the host always answered; none for a set with no style that has a sensor
 HLE_FORCE("_ZN2nn3hid23GetSixAxisSensorHandlesEPNS0_19SixAxisSensorHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE", "six-axis sensor handles: two for handheld / dual Joy-Cons, one otherwise",
           int, h_hid_SixHandles, uint32_t *h, int n, const uint32_t *id, uint32_t style) {
-    uint32_t idx = six_style_index(style);
-    int k = idx == SIX_IDX_HANDHELD || idx == SIX_IDX_JOYDUAL ? 2 : 1; if (k > n) k = n;
+    uint32_t shown = six_style_index(style & style_of(*id & 0xff)), idx = shown ? shown : six_style_index(style);
+    if (!idx || n <= 0) return 0;
+    int k = style & (STYLE_HANDHELD | STYLE_JOYDUAL | STYLE_JOYDUAL2) ? 2 : 1; if (k > n) k = n;
     uint32_t dev0 = idx == SIX_IDX_JOYRIGHT;   // a right Joy-Con's sensor is device 1, as the SDK's (0x10007)
     for (int i = 0; i < k; i++) h[i] = idx | (*id & 0xff) << 8 | ((uint32_t)i + dev0) << 16;
-    return k > 0 ? k : 0;
+    return k;
 }
 HLE_FORCE("_ZN2nn3hid18StartSixAxisSensorERKNS0_19SixAxisSensorHandleE", "six-axis sensor; always sampling on the host", void, h_hid_SixStart, const uint32_t *h) { (void)h; }
 // Merged mouse pointer (Nmouse, Switch 2 SDKs; Pokemon Pokopia, main+0x11251dc). The SDK opens the hid service itself in InitializeNmouse, which the host does not serve (abort 0xe15). No device
@@ -1066,10 +1069,15 @@ static void imu_env_read(void) {
     const char *e;
     g_imu_acc_sign = (e = getenv("DM_IMU_ACC_SIGN")) && atof(e) > 0 ? 1 : -1;
     g_imu_gyro_sign = (e = getenv("DM_IMU_GYRO_SIGN")) && atof(e) > 0 ? 1 : -1;
-    // DM_IMU_NOISE: 0 none, "<deg/s>,<mG>" other spreads (for tuning), else the defaults
-    double nd = IMU_NOISE_DPS, ng = IMU_NOISE_G * 1000;
-    if ((e = getenv("DM_IMU_NOISE"))) { if (strchr(e, ',')) sscanf(e, "%lf,%lf", &nd, &ng); else if (!atof(e)) nd = ng = 0; }
-    g_imu_noise_dps = nd >= 0 && nd < 100 ? nd : IMU_NOISE_DPS; g_imu_noise_g = ng >= 0 && ng < 100 ? ng / 1000 : IMU_NOISE_G;
+    // DM_IMU_NOISE: "<deg/s>,<mG>" sets both spreads (for tuning); a single number scales the defaults (0 none, 1 the defaults); anything else keeps the defaults, with a log line
+    double nd = IMU_NOISE_DPS, ng = IMU_NOISE_G * 1000, f; char tail;
+    if ((e = getenv("DM_IMU_NOISE")) && *e) {
+        double a, b;
+        if (sscanf(e, "%lf,%lf%c", &a, &b, &tail) == 2 && a >= 0 && a < 100 && b >= 0 && b < 100) { nd = a; ng = b; }
+        else if (!strchr(e, ',') && sscanf(e, "%lf%c", &f, &tail) == 1 && f >= 0 && f < 1000) { nd *= f; ng *= f; }
+        else LOG("[RED] DM_IMU_NOISE=%s is neither <deg/s>,<mG> nor a scale (0 to 1000): the default noise (%g deg/s, %g mG)", e, nd, ng);
+    }
+    g_imu_noise_dps = nd; g_imu_noise_g = ng / 1000;
 }
 // Sensor noise. A real IC's samples are never all alike, and the SDK's fusion (NERD's gyro_pointing, sdk+0x700e60) is built for that. With samples that do not change at all
 // (the host's flat controller), the fusion reset itself several times a second (its initialization, which asks GetSixAxisSensorIcInformation, ran 612 times in one Nintendo Switch
@@ -1151,11 +1159,15 @@ HLE_FORCE("_ZN2nn3hid39ResetIsSixAxisSensorDeviceNewlyAssignedERKNS0_19SixAxisSe
 enum { SIX_CAL_SIZE = 0x744 };
 static pthread_mutex_t g_six_cal_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint8_t g_six_cal[SIX_NPADS][SIX_DEVICES][SIX_CAL_SIZE], g_six_cal_have[SIX_NPADS][SIX_DEVICES];
+// One sensor, one stored parameter: the SDK names a full-key or handheld controller's sensor device 2 where the host's handles name it device 0, so device 2 keeps its parameter
+// under device 0 (a store through either handle is what a load through the other reads)
+static int six_cal_dev(int dev) { return dev == 2 ? 0 : dev; }
 HLE_FORCE("_ZN2nn3hid37LoadSixAxisSensorCalibrationParameterEPNS0_33SixAxisSensorCalibrationParameterERKNS0_19SixAxisSensorHandleE",
           "six-axis calibration: what the game stored this run, else the ideal sensor's (zero bias)", Result, h_hid_SixCalLoad, void *out, const uint32_t *h) {
     int slot, dev; Result r = six_handle_slot("LoadSixAxisSensorCalibrationParameter", *h, &slot, &dev);
     if (r != RES_OK) return r;
     pthread_mutex_lock(&g_six_cal_mu);
+    dev = six_cal_dev(dev);
     if (g_six_cal_have[slot][dev]) memcpy(out, g_six_cal[slot][dev], SIX_CAL_SIZE); else memset(out, 0, SIX_CAL_SIZE);   // nothing stored: the ideal sensor's, zero bias
     pthread_mutex_unlock(&g_six_cal_mu);
     return r;
@@ -1165,6 +1177,7 @@ HLE_FORCE("_ZN2nn3hid38StoreSixAxisSensorCalibrationParameterERKNS0_19SixAxisSen
     int slot, dev; Result r = six_handle_slot("StoreSixAxisSensorCalibrationParameter", *h, &slot, &dev);
     if (r != RES_OK) return r;
     pthread_mutex_lock(&g_six_cal_mu);
+    dev = six_cal_dev(dev);
     memcpy(g_six_cal[slot][dev], in, SIX_CAL_SIZE); g_six_cal_have[slot][dev] = 1;
     pthread_mutex_unlock(&g_six_cal_mu);
     return RES_OK;
