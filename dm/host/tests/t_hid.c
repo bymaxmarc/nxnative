@@ -1113,10 +1113,14 @@ static void t_pair_half_pause(void) {
     dm_motion_set_joy(0, 1, a, wr, t); dm_motion_set_hid(0, a, side, t);
     CHECK(h_hid_ImuSamples(q, 1, 0x5) == 1 && fabsf(q[0].gyro[0]) < 1e-4f && fabsf(q[0].gyro[1]) < 1e-4f, "paused half: flat, not the merged stream's sideways frame");
     CHECK(h_hid_ImuSamples(q, 1, 0x10005) == 1 && fabsf(q[0].gyro[1] + 0.7f) < 1e-4f, "paused half: the other half keeps its own");
+    for (int i = 0; i < 50; i++) { motion_now = guest_now = (t += 100000000ull); dm_motion_set_joy(0, 1, a, wr, t); dm_motion_set_hid(0, a, side, t); }   // 5 s more
+    CHECK(h_hid_ImuSamples(q, 1, 0x5) == 1 && fabsf(q[0].gyro[0]) < 1e-4f && fabsf(q[0].gyro[1]) < 1e-4f, "paused half: still flat after 5 s, no cliff to the merged stream");
     dm_motion_set_joy(0, 0, a, wl, t);
     CHECK(h_hid_ImuSamples(q, 1, 0x5) == 1 && fabsf(q[0].gyro[1] + 0.3f) < 1e-4f, "paused half: its own again once it reports");
+    dm_joy_attach(0, 1); motion_now = guest_now = (t += 1000000);   // the right one detached: the left alone (no single style, shown as a pair), its own stream on both handles
+    dm_motion_set_joy(0, 0, a, wl, t); dm_motion_set_hid(0, a, side, t);
+    CHECK(h_hid_ImuSamples(q, 1, 0x10005) == 1 && fabsf(q[0].gyro[0]) < 1e-4f, "a detached half: not the merged stream either (the pair lost it: flat)");
     dm_joy_attach(0, 0); dm_motion_clear_joy(0, 0); dm_motion_clear_joy(0, 1);
-    for (int s2 = 0; s2 < 2; s2++) { pthread_mutex_lock(&g_joy_motion[0][s2].mu); g_joy_motion[0][s2].received_ns = 0; pthread_mutex_unlock(&g_joy_motion[0][s2].mu); }
     dm_joy_attach(0, 3); motion_now = guest_now = (t += 1000000);   // Joy-Cons whose controller gives no per-Joy-Con motion: the merged stream
     dm_motion_set_hid(0, a, side, t);
     CHECK(h_hid_ImuSamples(q, 1, 0x5) == 1 && fabsf(q[0].gyro[0] + 0.5f) < 1e-4f, "no per-Joy-Con motion at all: the merged stream, as before");
@@ -1203,6 +1207,56 @@ static void t_live_delay(void) {
     setenv("DM_IMU_DELAY", "0", 1); unsetenv("DM_IMU_NOISE"); imu_env_read();
     h_hid_ImuDisable(); guest_now = motion_now = 1000000000ull; g_phone_mode = -1;
 }
+// A stream swapped behind a handle (a one-player game: player 2's controller takes over from player 1's, motion_pick) with a different delay (33 Hz Joy-Con-like, then 67 Hz),
+// the game reading on through the swap, or pausing its reads for just under or just over LIVE_DELAY_IDLE_NS (1 s): the data it takes never goes back, and while it reads on,
+// never jumps ahead (the delay slews from 34 to 17 ms)
+static void swap_run(double pause_s, delay_stats *st) {
+    const uint64_t t0 = 820000000000ull + (uint64_t)(pause_s * 1e10), frame = 16666667, swap = t0 + 2000000000ull, pause_end = swap + (uint64_t)(pause_s * 1e9), end = pause_end + 1000000000ull;
+    dm_motion_clear_hid(0); dm_motion_clear_hid(1); hwm_clear();
+    float a[3] = {0, 0, -1};
+    uint32_t rng = 777; uint64_t next = t0, nf = t0 + frame, prev_d = 0, prev_t = 0; int64_t last = 0; double prev_data = -1;
+    for (uint64_t t = t0; t < end; t += 500000) {
+        motion_now = guest_now = t;
+        if (t >= next) {   // the sample's time: up to 4 ms before now (its transport)
+            uint64_t stamp = t - delay_rng(&rng) % 4000000; float w[3] = {0, (float)((double)(int64_t)(stamp - t0) / 1e9), 0};
+            dm_motion_set_hid(t < swap ? 0 : 1, a, w, stamp); next += t < swap ? 30303030ull : 14925373ull;
+        }
+        if (t < nf) continue;
+        nf += frame;
+        if (t >= swap && t < pause_end) continue;   // the game reads nothing
+        TestImuSample q[16]; int k = h_hid_ImuSamples(q, 16, 0x20003);
+        uint64_t d = applied_delay(&g_hwm_imu, 0x20003);
+        // the delay moves at most 5% of the time since the last read (a read after more than 1 s takes its target at once)
+        if (prev_t && t - prev_t <= 1000000000ull && (d > prev_d ? d - prev_d : prev_d - d) > (uint64_t)((double)(t - prev_t) * 0.05) + 1000) st->jump++;
+        if (d < st->delay_min) st->delay_min = d;
+        if (d > st->delay_max) st->delay_max = d;
+        prev_d = d; prev_t = t;
+        for (int i = 0; i < k; i++) {
+            if (q[i].sampling <= last) continue;
+            last = q[i].sampling;
+            if (-q[i].gyro[1] < prev_data - 2e-5) st->back++;
+            prev_data = -q[i].gyro[1]; st->total++;
+        }
+    }
+    dm_motion_clear_hid(0); dm_motion_clear_hid(1);
+}
+static void t_live_delay_swap(void) {
+    g_mode = 1; dm_pad_players(1); g_phone_mode = 0; setenv("DM_IMU_NOISE", "0", 1); unsetenv("DM_IMU_DELAY"); imu_env_read();
+    uint32_t ids_was = atomic_load(&g_ids_supported);
+    ids((const uint32_t[]){0, NPAD_HANDHELD}, 2); dm_pad_players(0x3);
+    uint8_t ring[64]; h_hid_ImuEnable(ring, sizeof ring);
+    static const double pauses[3] = {0, 0.99, 1.01};
+    for (int i = 0; i < 3; i++) {
+        delay_stats st = {0, 0, 0, 0, 0, ~0ull, 0}; swap_run(pauses[i], &st);
+        char what[200]; snprintf(what, sizeof what, "stream swapped behind the handle, reads paused %.2f s: the data never goes back (%u), the delay (%.1f..%.1f ms) slewed between reads (%u jumps)",
+                                 pauses[i], st.back, st.delay_min / 1e6, st.delay_max / 1e6, st.jump);
+        CHECK(st.total > 100 && !st.back && !st.jump && st.delay_max > 30000000ull && applied_delay(&g_hwm_imu, 0x20003) < 20000000ull, what);
+    }
+    dm_pad_players(1); atomic_store(&g_ids_supported, ids_was);
+    setenv("DM_IMU_DELAY", "0", 1); unsetenv("DM_IMU_NOISE"); imu_env_read();
+    h_hid_ImuDisable(); guest_now = motion_now = 1000000000ull; g_phone_mode = -1;
+}
+
 // The six-axis states path (GetSixAxisSensorStates) reads the newest state each frame: no delay by default (DM_SIX_DELAY=0), only the IMU path's; DM_SIX_DELAY sets its own
 static void t_live_delay_paths(void) {
     g_mode = 1; dm_pad_players(1); g_phone_mode = 0; hwm_clear(); setenv("DM_IMU_NOISE", "0", 1);
@@ -1439,6 +1493,7 @@ int main(void) {
     t_pair_halves();
     t_live_delay();
     t_live_delay_paths();
+    t_live_delay_swap();
     t_live_pinned();
     t_pair_half_pause();
     t_six_ic_info();

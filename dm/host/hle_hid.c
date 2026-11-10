@@ -334,6 +334,7 @@ typedef struct { int pad, kind; } npad_ref;
 static _Atomic uint32_t g_joy_sides[DM_PLAYERS];
 static _Atomic uint32_t g_joy_two[DM_PLAYERS];   // the pad's Joy-Cons are Joy-Con 2s (DM_JOY_2)
 static _Atomic uint32_t g_joy_paired[DM_PLAYERS];   // the pad has held both Joy-Cons since it last held none (six_stream: a half it lost lies flat)
+static _Atomic uint32_t g_joy_reported[DM_PLAYERS];   // bit side: that Joy-Con has reported its own motion since it was attached (joy_own)
 static _Atomic uint64_t g_joy_btn[DM_PLAYERS][2], g_joy_latch[DM_PLAYERS][2], g_joy_axes[DM_PLAYERS][2];
 static _Atomic uint32_t g_single_mask;               // bit id: the game asked for single assignment on npad No(id + 1)
 static _Atomic uint32_t g_single_keep[DM_PLAYERS];   // 1: the left Joy-Con stays on that npad, 2: the right one, 0: either (the left)
@@ -404,6 +405,7 @@ void dm_joy_attach(int p, uint32_t sides) {
     atomic_store(&g_joy_two[p], (sides & DM_JOY_2) && (sides & 3) ? 1u : 0u);
     sides &= 3;
     if (sides == 3 || !sides) atomic_store(&g_joy_paired[p], sides == 3);
+    atomic_fetch_and(&g_joy_reported[p], sides);   // a Joy-Con taken away has reported nothing yet when it comes back
     if (atomic_exchange(&g_joy_sides[p], sides) == sides) return;
     if (!sides) for (int s = 0; s < 2; s++) { atomic_store(&g_joy_btn[p][s], 0); atomic_store(&g_joy_axes[p][s], 0); }
     for (uint32_t i = 0; i < DM_PLAYERS; i++) style_changed(i);
@@ -831,7 +833,7 @@ void dm_motion_set(int p, const float acc[3], const float rot[3]) { motion_set(p
 void dm_motion_set_switch(int p, const float acc[3], const float rot[3]) { motion_set(p, acc, rot, 1, 0); }
 void dm_motion_set_hid(int p, const float acc[3], const float rot[3], uint64_t t) { if (t) motion_set(p, acc, rot, 2, t); }
 void dm_motion_set_joy(int p, int side, const float acc[3], const float rot[3], uint64_t t) {
-    if (t && p >= 0 && p < DM_PLAYERS && (side == 0 || side == 1)) motion_set_to(&g_joy_motion[p][side], p, acc, rot, 2, t);
+    if (t && p >= 0 && p < DM_PLAYERS && (side == 0 || side == 1)) { atomic_fetch_or(&g_joy_reported[p], 1u << side); motion_set_to(&g_joy_motion[p][side], p, acc, rot, 2, t); }
 }
 void dm_motion_clear_joy(int p, int side) {
     if (p < 0 || p >= DM_PLAYERS || (side != 0 && side != 1)) return;
@@ -871,16 +873,13 @@ static live_motion *motion_pick(int p, motion_state *out) {
     return best;
 }
 static int motion_live(int p, motion_state *out) { return motion_pick(p, out) != NULL; }
-// One Joy-Con's sensor: its own stream while fresh; NULL (the host's flat sensor) while that stream only paused (it reported within JOY_OWN_RECENT_NS: a Joy-Con 2 skipping
-// reports), as the pad's merged stream holds the controller in another frame (a sideways Joy-Con's, a quarter turn away); else the pad's merged one (a controller that reports
-// no per-Joy-Con motion)
-#define JOY_OWN_RECENT_NS 3000000000ull
-static int joy_own(int p, int side) {   // 1: its own stream is fresh, 0: it paused, -1: none
-    live_motion *m = &g_joy_motion[p][side];
+// One Joy-Con's sensor: its own stream while fresh; NULL (the host's flat sensor) once it has reported its own motion and is still attached but its stream went quiet (a
+// Joy-Con 2 skipping reports, for any length of time), as the pad's merged stream holds the controller in another frame (a sideways Joy-Con's, a quarter turn away); else
+// the pad's merged one (a controller that reports no per-Joy-Con motion, or a Joy-Con not attached)
+static int joy_own(int p, int side) {   // 1: its own stream is fresh, 0: it went quiet, -1: none
     pthread_once(&g_motion_once, motion_env); if (g_motion_off) return -1;
-    if (motion_copy(m, NULL)) return 1;
-    pthread_mutex_lock(&m->mu); uint64_t r = m->received_ns; pthread_mutex_unlock(&m->mu);
-    return r && now_ns() - r <= JOY_OWN_RECENT_NS ? 0 : -1;
+    if (motion_copy(&g_joy_motion[p][side], NULL)) return 1;
+    return atomic_load(&g_joy_reported[p]) >> side & atomic_load(&g_joy_sides[p]) >> side & 1 ? 0 : -1;
 }
 static live_motion *motion_joy_pick(int p, int side, motion_state *out) {
     if (p < 0 || p >= DM_PLAYERS || (side != 0 && side != 1)) return motion_pick(p, out);
@@ -1050,7 +1049,9 @@ static live_motion *six_stream(uint32_t h, npad_ref ref, int pl) {
         for (int q = 0; q < DM_PLAYERS; q++) if (src >> q & 1 && joy_active(q)) {
             uint32_t sides = atomic_load(&g_joy_sides[q]); int side = sides == 3 ? dev : sides == 2;
             if (sides != 3 && side != dev && atomic_load(&g_joy_paired[q])) return NULL;
-            if (!g_motion_off && motion_copy(&g_joy_motion[q][side], NULL)) return &g_joy_motion[q][side];
+            int own = joy_own(q, side);
+            if (own > 0) return &g_joy_motion[q][side];
+            if (!own) return NULL;   // it went quiet: flat, not the merged stream's frame
         }
     }
     return motion_pick(pl, NULL);
