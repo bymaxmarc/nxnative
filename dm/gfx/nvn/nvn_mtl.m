@@ -8308,7 +8308,7 @@ static void slow_check(SlowWatch *w, int64_t after_ms) {
         if (done) return;
         uint64_t ns = bp_now() - w->t0; atomic_fetch_add(&g_slow_told, 1);
         MLOG("[RED] %s still compiling after %.0f s", w->what.UTF8String, ns / 1e9);
-        slow_check(w, (int64_t)(ns / 1000000));   // next when its time has doubled
+        slow_check(w, MAX((int64_t)(ns / 1000000), 1));   // next when its time has doubled (at least 1 ms on: g_slow_ms 0 would re-arm at once)
     });
 }
 static SlowWatch *slow_begin(NSString *what) { SlowWatch *w = [SlowWatch new]; w->what = what; w->t0 = bp_now(); w->lock = OS_UNFAIR_LOCK_INIT; slow_check(w, g_slow_ms); return w; }
@@ -8329,6 +8329,7 @@ static uint64_t slow_end(SlowWatch *w) {   // the compile's time
 // kernels, which have no note. A miss costs a lookup of a fraction of a millisecond per file. g_cps_arch, g_cps_run, g_cps_built: compute pipelines taken from the
 // bundle, from this device's files, built (the prewarm's last lines); g_cps_look_ns, g_cps_build_ns: the time looking up, building
 static _Atomic uint64_t g_cps_arch, g_cps_run, g_cps_built, g_cps_look_ns, g_cps_build_ns;
+static _Atomic uint64_t g_cps_async, g_cps_skipped;   // dispatches' pipelines built off the submit thread, dispatches skipped while theirs was not built (cps_get)
 static void arch_note_new(void);
 static dispatch_queue_t arch_harvest_q(void) {   // one capture at a time, at utility QoS: a network shader's compile can take seconds, beside the game's frames
     static dispatch_queue_t q; static dispatch_once_t once;
@@ -8355,16 +8356,23 @@ static void arch_harvest(MTL4PipelineDescriptor *d, int compact) {
         }
     } });
 }
-// A compute pipeline whose MTLDevice build took SLOW_COMPILE_MS or more, captured for the archive into a flush period of its own, on a queue of no one else's, and written as a
+// A compute pipeline whose MTLDevice build took SLOW_COMPILE_MS or more, captured for the archive into a flush period of its own, on a serial queue of its own (arch_solo_q: a
+// capture that never returns holds back only the solo captures after it), and written as a
 // file of its own when the capture returns. Its capture compiles it whole again, which can take as long: in the shared period on the serial harvest queue it would hold back that
 // period's file (every pipeline captured beside it, up to ARCH_PERIOD_MAX) and every later capture of a compute or mesh pipeline. The period is handed to the writer only once the
 // compile has returned, so a quit (mtl_arch_save, which waits for g_arch_pending) never waits for it either. Such pipelines are few: a file each costs a lookup of a fraction
-// of a millisecond. g_arch_solo: such files written
+// of a millisecond, and each period has its own serializer (its own gpuarchiver-* folder in the user cache folder, as every period has) and its file a .keys index. g_arch_solo:
+// such files written
 static _Atomic uint64_t g_arch_solo;
 static void arch_write(ArchEpoch *ep);
+static dispatch_queue_t arch_solo_q(void) {   // one such capture at a time: each is a whole compile of a shader the compiler takes long over, so a burst of them (Switch Sports: five within seconds) must not start as many at once beside the game
+    static dispatch_queue_t q; static dispatch_once_t once;
+    dispatch_once(&once, ^{ q = dispatch_queue_create("dm.nvn.arch-solo", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0)); });
+    return q;
+}
 static void arch_harvest_solo(MTL4ComputePipelineDescriptor *d, NSString *key) {
     if (!d || !arch_capturing()) return;
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ @autoreleasepool {
+    dispatch_async(arch_solo_q(), ^{ @autoreleasepool {
         ArchEpoch *ep = ep_new();
         if (!ep) { MLOG("[RED] pipeline archive: Metal made no compiler for compute pipeline %s's own flush period: not kept in the pipeline archive", key.UTF8String); return; }
         SlowWatch *w = slow_begin([NSString stringWithFormat:@"compute pipeline %@ (its capture for the pipeline archive)", key]);
@@ -8800,11 +8808,12 @@ void mtl_pso_line(char *o, size_t n) {
     o2 += snprintf(o + o2, n > o2 ? n - o2 : 0, "; draws that waited:");
     for (int i = 0; i < 5; i++) if (g_pw_n[i] > pn[i]) o2 += snprintf(o + o2, n > o2 ? n - o2 : 0, " %s %llu / %.1f ms,", g_pw_why[i], (unsigned long long)(g_pw_n[i] - pn[i]), (g_pw_ns[i] - pns[i]) / 1e6);
     memcpy(pn, g_pw_n, sizeof pn); memcpy(pns, g_pw_ns, sizeof pns);
-    static uint64_t pca, pcr, pcb, pcl, pcn; uint64_t ca = g_cps_arch, cr = g_cps_run, cb = g_cps_built, cl = g_cps_look_ns, cn = g_cps_build_ns;   // compute pipelines (cps_new)
-    if (ca > pca || cr > pcr || cb > pcb)
-        snprintf(o + o2, n > o2 ? n - o2 : 0, "; compute pipelines from the archive bundled with the app %llu, from this device's archive %llu, built %llu (%.1f ms looking up, %.1f ms building)",
-                 (unsigned long long)(ca - pca), (unsigned long long)(cr - pcr), (unsigned long long)(cb - pcb), (cl - pcl) / 1e6, (cn - pcn) / 1e6);
-    pca = ca; pcr = cr; pcb = cb; pcl = cl; pcn = cn;
+    static uint64_t pca, pcr, pcb, pcl, pcn, pck; uint64_t ca = g_cps_arch, cr = g_cps_run, cb = g_cps_built, cl = g_cps_look_ns, cn = g_cps_build_ns, ck = g_cps_skipped;   // compute pipelines (cps_new, cps_get)
+    if (ca > pca || cr > pcr || cb > pcb || ck > pck)
+        snprintf(o + o2, n > o2 ? n - o2 : 0, "; compute pipelines from the archive bundled with the app %llu, from this device's archive %llu, built %llu (%.1f ms looking up, %.1f ms building), "
+                 "dispatches skipped while their pipeline was built %llu",
+                 (unsigned long long)(ca - pca), (unsigned long long)(cr - pcr), (unsigned long long)(cb - pcb), (cl - pcl) / 1e6, (cn - pcn) / 1e6, (unsigned long long)(ck - pck));
+    pca = ca; pcr = cr; pcb = cb; pcl = cl; pcn = cn; pck = ck;
 }
 
 // ---- Prebuild: the base of every shader pair of the game, into the pipeline archive ----
@@ -13550,34 +13559,48 @@ static id<MTL4ComputeCommandEncoder> dispatch_enc(void) {
     return e;
 }
 // A dispatch's compute pipeline, on the submit thread. One already made (g_cps) or in the archive (the bundle, this device's files: cps_look) is taken at once, as before. Any
-// other is built off the submit thread (cps_build on a global queue): the first dispatch that needs it waits for the build up to g_cps_wait_ms (CPS_WAIT_MS), as long as a build
-// took there before, so a pipeline that builds in time runs in the same submission as before; past that the dispatch is skipped, and so is every later dispatch of the shader
-// until the build returns, without waiting and without asking for another build. Before, the build ran on the submit thread and the replay waited for it however long it took:
-// Nintendo Switch Sports Resort (frame ~3,100, about 80 s after its intro) hung there for good, the "NVN queue replay" thread in -[_MTLDevice newComputePipelineStateWithFunction:
-// error:] → MTLCompilerScheduler::buildRequest waiting on the compiler service for more than 25 s and still in it minutes later (a `sample`), the game's main thread in
-// nvnSyncWait for a fence the replay never reached and the presentation thread on the queue's lock. Skipping is what the replay can do with a pipeline it does not have: a render
+// other is built off the submit thread (cps_build on a global queue). The first dispatch that needs it waits for the build up to g_cps_wait_ms (CPS_WAIT_MS), so a pipeline
+// that builds in that time runs in the same submission as before; past that the dispatch is skipped, and so is every later dispatch of the shader until the build returns,
+// without waiting and without asking for another build. The wait is one budget for a burst: after a whole wait ran out, a first dispatch in the next CPS_QUIET_X times the wait
+// time does not wait at all (and a skip there does not extend that time): Nintendo Switch Sports Resort met five such shaders within seconds, and 5 s for each was 25 s
+// of the submit thread. Before, the build ran on the submit thread and the replay waited for it however long it took: Switch Sports (frame ~3,100, about 80 s after its intro)
+// hung there for good, the "NVN queue replay" thread in -[_MTLDevice newComputePipelineStateWithFunction:error:] → MTLCompilerScheduler::buildRequest waiting on the
+// compiler service for more than 25 s and still in it minutes later (a `sample`), the game's main thread in nvnSyncWait for a fence the replay never reached and the
+// presentation thread on the queue's lock; with this its shaders took 9 to more than 40 s each. Skipping is what the replay can do with a pipeline it does not have: a render
 // draw waits for its pipeline (pso_get_), or draws with a stand-in, but a compute shader has none, and a replay that waits for a compile that never returns stops the game.
-// What the skipped dispatches would have written is missing until the pipeline is there; the log says so once per shader ("[RED] compute pipeline <key> not built after N ms")
-// and again when it is ("... built after N s: its dispatches run again"). The build itself is named while it runs (slow_begin). DM_NVN_CPS_WAIT_MS sets the wait (0: none)
-enum { CPS_WAIT_MS = 5000 };
+// A workaround for Apple's compiler: it also skips the dispatches of a build that would have returned in 5-40 s, and what they would have written is missing until the
+// pipeline is there. The log says so once per shader ("[RED] compute pipeline <key> not built after N ms"), again when it is ("... built after N s: its dispatches run
+// again (M skipped meanwhile)"), and at quit for one never built (cps_at_exit); the build itself is named while it runs (slow_begin). DM_NVN_CPS_WAIT_MS sets the wait
+// (0: none, every such dispatch is skipped until its pipeline is there)
+enum { CPS_WAIT_MS = 5000, CPS_QUIET_X = 2 };
 static int g_cps_wait_ms = -1;   // the tests set it
-static _Atomic uint64_t g_cps_async, g_cps_skipped;   // pipelines built off the submit thread, dispatches skipped while theirs was not built
-@interface CpsJob : NSObject { @public dispatch_group_t done; id<MTLComputePipelineState> ps; NSError *err; uint64_t t0, skipped; int waited; } @end
+static uint64_t g_cps_quiet_until;   // a whole wait ran out: until then a first dispatch does not wait (submit thread; the tests clear it)
+@interface CpsJob : NSObject { @public dispatch_group_t done; id<MTLComputePipelineState> ps; NSError *err; NSString *key; uint64_t t0; _Atomic uint64_t skipped; int waited; } @end
 @implementation CpsJob @end
+static NSMutableSet<CpsJob *> *g_cps_jobs; static os_unfair_lock g_cps_jobs_lock = OS_UNFAIR_LOCK_INIT;   // jobs no dispatch has taken yet, for the report at quit
 static int cps_wait_ms(void) {
     if (g_cps_wait_ms < 0) { const char *e = getenv("DM_NVN_CPS_WAIT_MS"); g_cps_wait_ms = e && *e ? atoi(e) : CPS_WAIT_MS; if (g_cps_wait_ms < 0) g_cps_wait_ms = CPS_WAIT_MS; }
     return g_cps_wait_ms;
 }
+static void cps_at_exit(void) {   // a pipeline never built (its compile still under way): how long, and how many dispatches it cost
+    os_unfair_lock_lock(&g_cps_jobs_lock); NSArray<CpsJob *> *jobs = g_cps_jobs.allObjects; os_unfair_lock_unlock(&g_cps_jobs_lock);
+    for (CpsJob *job in jobs) if (dispatch_group_wait(job->done, DISPATCH_TIME_NOW))
+        MLOG("[RED] compute pipeline %s not built at exit: still compiling after %.1f s, %llu dispatches skipped", job->key.UTF8String, (bp_now() - job->t0) / 1e9, (unsigned long long)atomic_load(&job->skipped));
+}
 static CpsJob *cps_start(NvShader *cs, MTL4ComputePipelineDescriptor *d) {
     CpsJob *job = [CpsJob new]; job->done = dispatch_group_create(); job->t0 = bp_now();
-    id<MTLFunction> f = cs->fn; NSString *key = @(cs->key[0] ? cs->key : cs->builtin ? cs->builtin : "-");
+    id<MTLFunction> f = cs->fn; NSString *key = job->key = @(cs->key[0] ? cs->key : cs->builtin ? cs->builtin : "-");
     atomic_fetch_add(&g_cps_async, 1);
+    os_unfair_lock_lock(&g_cps_jobs_lock);
+    if (!g_cps_jobs) { g_cps_jobs = [NSMutableSet set]; atexit(cps_at_exit); }
+    [g_cps_jobs addObject:job]; os_unfair_lock_unlock(&g_cps_jobs_lock);
     dispatch_group_async(job->done, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ @autoreleasepool {
         NSError *e = nil; id<MTLComputePipelineState> ps = cps_build(f, d, key, &e);
         job->ps = ps; job->err = e;   // read by the submit thread only after the group's wait says the block is done
     } });
     return job;
 }
+static int cps_first_wait_ms(void) { return bp_now() < g_cps_quiet_until ? 0 : cps_wait_ms(); }   // what a first dispatch may wait
 static id<MTLComputePipelineState> cps_get(NvShader *cs) {
     const void *k = (__bridge const void *)cs;
     id<MTLComputePipelineState> ps = hm_get_id(&g_cps, &k);
@@ -13588,15 +13611,20 @@ static id<MTLComputePipelineState> cps_get(NvShader *cs) {
         if (!ps) job = cs->cps_job = cps_start(cs, d);
     }
     if (job) {
-        int first = !job->waited, ms = first ? cps_wait_ms() : 0; job->waited = 1;
+        int first = !job->waited, ms = first ? cps_first_wait_ms() : 0; job->waited = 1;
         if (dispatch_group_wait(job->done, ms > 0 ? dispatch_time(DISPATCH_TIME_NOW, (int64_t)ms * NSEC_PER_MSEC) : DISPATCH_TIME_NOW)) {
-            if (first) { g_bp_pso_n++; g_bp_pso_ns += bp_now() - bt;
-                MLOG("[RED] compute pipeline %s not built after %d ms: its dispatches are skipped until it is, the replay goes on", cs->key, ms); }
-            job->skipped++; atomic_fetch_add(&g_cps_skipped, 1);
+            if (first) {
+                uint64_t now = bp_now(); g_bp_pso_n++; g_bp_pso_ns += now - bt;
+                if (ms > 0) { g_cps_quiet_until = now + (uint64_t)CPS_QUIET_X * (uint64_t)ms * 1000000ull; }   // a whole wait ran out: the quiet time begins
+                MLOG("[RED] compute pipeline %s not built after %d ms%s: its dispatches are skipped until it is, the replay goes on", cs->key, ms,
+                     ms || !cps_wait_ms() ? "" : " (no wait: another compute pipeline's wait ran out just before)");
+            }
+            atomic_fetch_add(&job->skipped, 1); atomic_fetch_add(&g_cps_skipped, 1);
             return nil;
         }
         ps = job->ps; e = job->err; cs->cps_job = nil;
-        if (job->skipped && ps) MLOG("compute pipeline %s built after %.1f s: its dispatches run again (%llu skipped meanwhile)", cs->key, (bp_now() - job->t0) / 1e9, (unsigned long long)job->skipped);
+        os_unfair_lock_lock(&g_cps_jobs_lock); [g_cps_jobs removeObject:job]; os_unfair_lock_unlock(&g_cps_jobs_lock);
+        if (job->skipped && ps) MLOG("compute pipeline %s built after %.1f s: its dispatches run again (%llu skipped meanwhile)", cs->key, (bp_now() - job->t0) / 1e9, (unsigned long long)atomic_load(&job->skipped));
     }
     if (!job || !job->skipped) { g_bp_pso_n++; g_bp_pso_ns += bp_now() - bt; }
     if (!ps) { cs->cps_failed = 1; MLOG("[RED] failed to create compute pipeline for %s: %s (its dispatches are skipped)", cs->key, e.localizedDescription.UTF8String); return nil; }
