@@ -32,7 +32,9 @@ uint64_t guest_ns(void) { return guest_now; }
 static void hwm_clear(void) { memset((void *)&g_hwm_states, 0, sizeof g_hwm_states); memset((void *)&g_hwm_imu, 0, sizeof g_hwm_imu); }
 uint64_t now_ns(void) { return motion_now; }
 static _Atomic uint64_t g_test_lag;   // t_live_edges: the guest clock behind the host one (a freeze), as hle_os.c's g_glag
-uint64_t guest_ns_at_host_time(uint64_t host_ns) { return host_ns + guest_now - motion_now; }   // the two test clocks: host now is guest now
+static int g_test_pinned;   // t_live_pinned: a frozen or DM_DETCLOCK guest clock, every host time mapped to the guest's now
+uint64_t guest_ns_at_host_time(uint64_t host_ns) { return g_test_pinned ? guest_now : host_ns + guest_now - motion_now; }   // the two test clocks: host now is guest now
+int guest_clock_pinned(void) { return g_test_pinned; }
 static uint64_t test_frame;   // presented frames (t_rec moves it)
 uint64_t dm_guest_frame(void) { return test_frame; }
 // The touchscreen as the game would read it: the first finger, and whether one was put down since the last read (a touch's Start is reported once, hle_touch.c)
@@ -1097,22 +1099,49 @@ static void t_single_joy_as_pair(void) {
     dm_motion_clear_joy(0, 1); dm_motion_clear_hid(0); dm_joy_attach(0, 0); h_hid_SetStyles(0xffffffffu); h_hid_ImuDisable(); guest_now = motion_now = 1000000000ull; g_phone_mode = -1;
 }
 
+// An intact pair whose one half pauses (a Joy-Con 2 skipping reports past the stale time): that half's handle lies flat, not the pad's merged stream (a sideways frame); a pad
+// whose Joy-Cons never reported their own motion still gets the merged one
+static void t_pair_half_pause(void) {
+    g_mode = 1; dm_pad_players(1); g_phone_mode = 0; hwm_clear(); setenv("DM_IMU_NOISE", "0", 1); imu_env_read();
+    uint64_t t = 800000000000ull; motion_now = guest_now = t;
+    uint8_t ring[64]; h_hid_ImuEnable(ring, sizeof ring);
+    h_hid_SetStyles(STYLE_HANDHELD | STYLE_JOYDUAL);
+    float a[3] = {0, 0, -1}, wl[3] = {0, 0.3f, 0}, wr[3] = {0, 0.7f, 0}, side[3] = {0.5f, 0, 0};
+    TestImuSample q[1];
+    dm_joy_attach(0, 3); dm_motion_set_joy(0, 0, a, wl, t); dm_motion_set_joy(0, 1, a, wr, t); dm_motion_set_hid(0, a, side, t);
+    motion_now = guest_now = (t += 400000000ull);   // 400 ms on: the right one and the merged stream go on, the left one paused
+    dm_motion_set_joy(0, 1, a, wr, t); dm_motion_set_hid(0, a, side, t);
+    CHECK(h_hid_ImuSamples(q, 1, 0x5) == 1 && fabsf(q[0].gyro[0]) < 1e-4f && fabsf(q[0].gyro[1]) < 1e-4f, "paused half: flat, not the merged stream's sideways frame");
+    CHECK(h_hid_ImuSamples(q, 1, 0x10005) == 1 && fabsf(q[0].gyro[1] + 0.7f) < 1e-4f, "paused half: the other half keeps its own");
+    dm_motion_set_joy(0, 0, a, wl, t);
+    CHECK(h_hid_ImuSamples(q, 1, 0x5) == 1 && fabsf(q[0].gyro[1] + 0.3f) < 1e-4f, "paused half: its own again once it reports");
+    dm_joy_attach(0, 0); dm_motion_clear_joy(0, 0); dm_motion_clear_joy(0, 1);
+    for (int s2 = 0; s2 < 2; s2++) { pthread_mutex_lock(&g_joy_motion[0][s2].mu); g_joy_motion[0][s2].received_ns = 0; pthread_mutex_unlock(&g_joy_motion[0][s2].mu); }
+    dm_joy_attach(0, 3); motion_now = guest_now = (t += 1000000);   // Joy-Cons whose controller gives no per-Joy-Con motion: the merged stream
+    dm_motion_set_hid(0, a, side, t);
+    CHECK(h_hid_ImuSamples(q, 1, 0x5) == 1 && fabsf(q[0].gyro[0] + 0.5f) < 1e-4f, "no per-Joy-Con motion at all: the merged stream, as before");
+    dm_joy_attach(0, 0); dm_motion_clear_hid(0); unsetenv("DM_IMU_NOISE"); imu_env_read();
+    h_hid_SetStyles(0xffffffffu); h_hid_ImuDisable(); guest_now = motion_now = 1000000000ull; g_phone_mode = -1;
+}
+
 // Playout delay (DM_IMU_DELAY, motion_lag): a live stream at 33 Hz (Joy-Con 2: sample times from the controller's clock, arrivals up to 4 ms late) or 67 Hz (GameController:
-// sample times are the jittered arrivals). The signal is a ramp of the gyro (1 rad/s per second), so a tick interpolated between two real samples reads exactly the ramp at its
-// time minus the delay, and a held tick reads less. The game reads 16 ticks every 16.7 ms and takes each tick once (by sampling number), as the fusion does
-typedef struct { unsigned total, held, bad_seq; uint64_t delay_min, delay_max; } delay_stats;
+// sample times are the jittered arrivals). The signal is a ramp of the gyro (1 rad/s per second of sample time), so a tick reads its data time: exactly the ramp at its time
+// minus the delay when it lies between two real samples, less when it holds one. The game reads 16 ticks every 16.7 ms and takes each tick once (by sampling number), as the
+// fusion does
+typedef struct { unsigned total, held, bad_seq, back, jump; uint64_t delay_min, delay_max; } delay_stats;
 static uint32_t delay_rng(uint32_t *x) { *x = *x * 1664525u + 1013904223u; return *x >> 8; }
-// delays: the DM_IMU_DELAY values to switch through, one per second ("" for auto); counts ticks after the first half second of each
-static delay_stats live_delay_run(double hz, int joy_clock, const char *const *delays, int nd, uint64_t t0) {
-    delay_stats st = {0, 0, 0, ~0ull, 0};
-    const uint64_t period = (uint64_t)(1e9 / hz), jitter = 4000000, frame = 16666667;
+static uint64_t applied_delay(tick_hwm *w, uint32_t h) { int at = hwm_slot(w, h); return at < 0 ? 0 : atomic_load(&w->delay[at]); }
+// delays: the DM_IMU_DELAY values to switch through, one per segment of seg_s seconds ("" for auto); counts the ticks after the first settle_s of each segment
+static delay_stats live_delay_run(double hz, int joy_clock, const char *const *delays, int nd, double seg_s, double settle_s, uint64_t t0) {
+    delay_stats st = {0, 0, 0, 0, 0, ~0ull, 0};
+    const uint64_t period = (uint64_t)(1e9 / hz), jitter = 4000000, frame = 16666667, seg_ns = (uint64_t)(seg_s * 1e9);
     uint32_t rng = 12345; uint64_t stamp = t0, arr = t0 + (joy_clock ? delay_rng(&rng) % jitter : 0), nf = t0 + frame;
     if (!joy_clock) stamp = arr;
     dm_motion_clear_hid(0); hwm_clear();
     float a[3] = {0, 0, -1};
-    int64_t last = 0; int seg = -1;
-    for (uint64_t t = t0; t < t0 + (uint64_t)nd * 1000000000ull; t += 500000) {
-        int now_seg = (int)((t - t0) / 1000000000ull);
+    int64_t last = 0; int seg = -1; double prev_data = -1; int prev_interp = 0;
+    for (uint64_t t = t0; t < t0 + (uint64_t)nd * seg_ns; t += 500000) {
+        int now_seg = (int)((t - t0) / seg_ns);
         if (now_seg != seg) { seg = now_seg; if (*delays[seg]) setenv("DM_IMU_DELAY", delays[seg], 1); else unsetenv("DM_IMU_DELAY"); imu_env_read(); }
         motion_now = guest_now = t;
         while (arr <= t) {
@@ -1123,15 +1152,19 @@ static delay_stats live_delay_run(double hz, int joy_clock, const char *const *d
         if (t < nf) continue;
         nf += frame;
         TestImuSample q[16]; int k = h_hid_ImuSamples(q, 16, 0x20003);
-        int64_t cfg = atomic_load(&g_live_delay_cfg); uint64_t d = cfg >= 0 ? (uint64_t)cfg : g_hid_motion[0].lag.delay_ns;
+        uint64_t d = applied_delay(&g_hwm_imu, 0x20003);
         for (int i = 0; i < k; i++) {
             if (q[i].sampling <= last) continue;
             if (last && q[i].sampling != last + 1) st.bad_seq++;
             last = q[i].sampling;
             uint64_t tau = (uint64_t)(q[i].sampling - 1) * SIX_PERIOD_NS;
-            if (tau < t0 + (uint64_t)seg * 1000000000ull + 500000000ull) continue;   // the first half second of each setting: the stream's delay is still settling
-            double expect = -((double)(tau - d) - (double)t0) / 1e9;
-            st.total++; if (fabs(q[i].gyro[1] - expect) > 2e-5) st.held++;
+            double data = -q[i].gyro[1], expect = ((double)(tau - d) - (double)t0) / 1e9;
+            int interp = fabs(data - expect) < 2e-5;
+            if (prev_data >= 0 && data < prev_data - 2e-5) st.back++;   // the data a game takes never goes back (replayed)
+            if (prev_data >= 0 && interp && prev_interp && data - prev_data > 0.006) st.jump++;   // nor skips ahead: 5 ms a tick, 5% more while the delay settles
+            prev_data = data; prev_interp = interp;
+            if (tau < t0 + (uint64_t)seg * seg_ns + (uint64_t)(settle_s * 1e9)) continue;
+            st.total++; if (!interp) st.held++;
             if (d < st.delay_min) st.delay_min = d;
             if (d > st.delay_max) st.delay_max = d;
         }
@@ -1142,30 +1175,76 @@ static delay_stats live_delay_run(double hz, int joy_clock, const char *const *d
 static void t_live_delay(void) {
     g_mode = 1; dm_pad_players(1); g_phone_mode = 0; setenv("DM_IMU_NOISE", "0", 1);
     uint8_t ring[64]; h_hid_ImuEnable(ring, sizeof ring);
-    char what[128];
+    char what[160];
     static const double rates[2] = {33, 67};
     for (int ri = 0; ri < 2; ri++) {
-        const char *autod[] = {"", "", ""};
-        delay_stats st = live_delay_run(rates[ri], ri == 0, autod, 3, 700000000000ull + (uint64_t)ri * 10000000000ull);
+        const char *autod[] = {""};
+        delay_stats st = live_delay_run(rates[ri], ri == 0, autod, 1, 3, 1, 700000000000ull + (uint64_t)ri * 10000000000ull);
         snprintf(what, sizeof what, "delay auto at %.0f Hz: %u of %u ticks held (under 2%%), the rest exactly between their two samples", rates[ri], st.held, st.total);
-        CHECK(st.total > 250 && st.held * 50 < st.total, what);
+        CHECK(st.total > 350 && st.held * 50 < st.total, what);
         snprintf(what, sizeof what, "delay auto at %.0f Hz: %.3f..%.3f ms, about one sample interval, at most 40", rates[ri], st.delay_min / 1e6, st.delay_max / 1e6);
-        CHECK(st.delay_min >= (uint64_t)(1e9 / rates[ri]) && st.delay_max <= 40000000ull && st.delay_max <= (uint64_t)(1e9 / rates[ri]) + 4500000ull, what);   // the spacing, the 4 ms jitter and the 0.5 ms step the test delivers at
-        CHECK(!st.bad_seq, "delay auto: the game's ticks are contiguous");
+        CHECK(st.delay_min >= (uint64_t)(1e9 / rates[ri]) && st.delay_max <= 40000000ull && st.delay_max <= (uint64_t)(1e9 / rates[ri]) + 4500000ull, what);   // the spacing, the 4 ms jitter, the test's 0.5 ms step
+        CHECK(!st.bad_seq && !st.back && !st.jump, "delay auto: the ticks contiguous, their data never replayed nor skipped (the delay slews in from the stream's start)");
         const char *off[] = {"0"};
-        delay_stats so = live_delay_run(rates[ri], ri == 0, off, 1, 720000000000ull + (uint64_t)ri * 10000000000ull);
+        delay_stats so = live_delay_run(rates[ri], ri == 0, off, 1, 1, 0.5, 720000000000ull + (uint64_t)ri * 10000000000ull);
         snprintf(what, sizeof what, "DM_IMU_DELAY=0 at %.0f Hz: read at the present, %u of %u ticks hold the newest sample (the staircase)", rates[ri], so.held, so.total);
         CHECK(so.held * 3 > so.total, what);
     }
     const char *fixed[] = {"40"};
-    delay_stats sf = live_delay_run(33, 1, fixed, 1, 740000000000ull);
+    delay_stats sf = live_delay_run(33, 1, fixed, 1, 1, 0.5, 740000000000ull);
     snprintf(what, sizeof what, "DM_IMU_DELAY=40: every tick reads the signal 40 ms late (%u of %u)", sf.total - sf.held, sf.total);
     CHECK(sf.total > 50 && !sf.held && sf.delay_min == 40000000ull, what);
     const char *sw[] = {"", "0", "40", "", "12"};
-    delay_stats ss = live_delay_run(67, 0, sw, 5, 760000000000ull);
-    CHECK(ss.total > 400 && !ss.bad_seq, "switching the delay (auto, 0, 40, auto, 12) keeps the sampling numbers contiguous, never back");
+    delay_stats ss = live_delay_run(67, 0, sw, 5, 1, 0.9, 760000000000ull);
+    CHECK(ss.total > 50 && !ss.bad_seq, "switching the delay (auto, 0, 40, auto, 12) keeps the sampling numbers contiguous, never back");
+    CHECK(!ss.back && !ss.jump, "switching the delay: the data a game takes never goes back nor jumps ahead (slewed at 5%)");
+    snprintf(what, sizeof what, "switching the delay: slewed to the last setting within its second (%.1f ms)", applied_delay(&g_hwm_imu, 0x20003) / 1e6);
+    CHECK(applied_delay(&g_hwm_imu, 0x20003) == 12000000ull, what);
     setenv("DM_IMU_DELAY", "0", 1); unsetenv("DM_IMU_NOISE"); imu_env_read();
     h_hid_ImuDisable(); guest_now = motion_now = 1000000000ull; g_phone_mode = -1;
+}
+// The six-axis states path (GetSixAxisSensorStates) reads the newest state each frame: no delay by default (DM_SIX_DELAY=0), only the IMU path's; DM_SIX_DELAY sets its own
+static void t_live_delay_paths(void) {
+    g_mode = 1; dm_pad_players(1); g_phone_mode = 0; hwm_clear(); setenv("DM_IMU_NOISE", "0", 1);
+    unsetenv("DM_IMU_DELAY"); unsetenv("DM_SIX_DELAY"); imu_env_read();
+    CHECK(atomic_load(&g_live_delay_cfg[0]) == 0 && atomic_load(&g_live_delay_cfg[1]) == -1, "delay defaults: the states path none, the IMU path the stream's own");
+    uint8_t ring[64]; h_hid_ImuEnable(ring, sizeof ring);
+    uint64_t t0 = 780000000000ull; float a[3] = {0, 0, -1};
+    for (int i = 0; i < 40; i++) { uint64_t t = t0 + (uint64_t)i * 30000000ull; motion_now = guest_now = t; float w[3] = {0, (float)(i * 0.03), 0}; dm_motion_set_hid(0, a, w, t); }
+    motion_now = guest_now += 20000000;   // 20 ms after the newest sample (1.17 rad/s at its time)
+    SixAxisState six[1]; TestImuSample q[1];
+    const float rev = (float)(1 / (2 * M_PI));   // the states carry revolutions a second
+    CHECK(six_states(six, 1, 0x20003) == 1 && fabsf(six[0].gyro[1] - 1.17f * rev) < 1e-5f, "states path: the newest sample, no delay");
+    CHECK(h_hid_ImuSamples(q, 1, 0x20003) == 1 && q[0].gyro[1] > -1.17f + 1e-3f, "IMU path: delayed (data from before the newest sample)");
+    setenv("DM_SIX_DELAY", "30", 1); setenv("DM_IMU_DELAY", "0", 1); imu_env_read(); hwm_clear();
+    // 30 ms late: 10 ms before the newest sample, two thirds of the way from 1.14 to 1.17
+    CHECK(six_states(six, 1, 0x20003) == 1 && fabsf(six[0].gyro[1] - 1.16f * rev) < 1e-4f, "DM_SIX_DELAY=30: the states path 30 ms late");
+    CHECK(h_hid_ImuSamples(q, 1, 0x20003) == 1 && fabsf(q[0].gyro[1] + 1.17f) < 1e-4f, "DM_IMU_DELAY=0: the IMU path at the present (the newest sample)");
+    setenv("DM_SIX_DELAY", "x", 1); imu_env_read();
+    CHECK(atomic_load(&g_live_delay_cfg[0]) == 0, "DM_SIX_DELAY not a number: none, with a log line");
+    unsetenv("DM_SIX_DELAY"); setenv("DM_IMU_DELAY", "0", 1); unsetenv("DM_IMU_NOISE"); imu_env_read();
+    dm_motion_clear_hid(0); h_hid_ImuDisable(); guest_now = motion_now = 1000000000ull; g_phone_mode = -1;
+}
+// A frozen or DM_DETCLOCK guest clock maps every sample to one time: the answers carry the newest sample, not the oldest, whatever the delay
+static void t_live_pinned(void) {
+    g_mode = 1; dm_pad_players(1); g_phone_mode = 0; hwm_clear(); setenv("DM_IMU_NOISE", "0", 1); unsetenv("DM_IMU_DELAY"); imu_env_read();
+    uint8_t ring[64]; h_hid_ImuEnable(ring, sizeof ring);
+    uint64_t t0 = 790000000000ull; float a[3] = {0, 0, -1};
+    for (int i = 0; i < 20; i++) { uint64_t t = t0 + (uint64_t)i * 30000000ull; motion_now = guest_now = t; float w[3] = {0, (float)i, 0}; dm_motion_set_hid(0, a, w, t); }
+    TestImuSample q[16]; h_hid_ImuSamples(q, 16, 0x20003);
+    CHECK(applied_delay(&g_hwm_imu, 0x20003) > 0, "pinned: the delay was in use before the freeze");
+    g_test_pinned = 1; motion_now += 10000000;   // the host goes on, the guest clock stays
+    int k = h_hid_ImuSamples(q, 16, 0x20003), newest = 1;
+    for (int i = 0; i < k; i++) newest &= fabsf(q[i].gyro[1] + 19.f) < 1e-4f;
+    CHECK(k > 0 && newest, "pinned: every tick carries the newest sample, not the oldest");
+    CHECK(applied_delay(&g_hwm_imu, 0x20003) == 0, "pinned: no delay");
+    setenv("DM_IMU_DELAY", "40", 1); imu_env_read();
+    k = h_hid_ImuSamples(q, 16, 0x20003); newest = 1;
+    for (int i = 0; i < k; i++) newest &= fabsf(q[i].gyro[1] + 19.f) < 1e-4f;
+    CHECK(k > 0 && newest, "pinned with DM_IMU_DELAY=40: still the newest sample");
+    g_test_pinned = 0;
+    setenv("DM_IMU_DELAY", "0", 1); unsetenv("DM_IMU_NOISE"); imu_env_read();
+    dm_motion_clear_hid(0); h_hid_ImuDisable(); guest_now = motion_now = 1000000000ull; g_phone_mode = -1;
 }
 
 // Joy-Cons shown as a pair (Switch Sports Resort's styles: Handheld | JoyDual). A real pair is KIND_DUAL, each handle its own half; a pair that loses a half leaves the missing
@@ -1359,6 +1438,9 @@ int main(void) {
     t_live_still_dither();
     t_pair_halves();
     t_live_delay();
+    t_live_delay_paths();
+    t_live_pinned();
+    t_pair_half_pause();
     t_six_ic_info();
     t_rec();
     {   // Nmouse with no device (SDK 21's forms): the pointer range is kept, the merged handle 0 takes settings, the standard mouse and the handle queries report nothing

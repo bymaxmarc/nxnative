@@ -276,7 +276,7 @@ static void *ctl_main(void *arg) {
                 if (!strncmp(line, "cvari ", 6)) { void dm_ctl_cvar_i32(uint64_t off, int32_t v); char *e2; uint64_t off = strtoull(line + 6, &e2, 16); dm_ctl_cvar_i32(off, (int32_t)strtol(e2, NULL, 0)); continue; }
                 if (!strncmp(line, "cvarf ", 6)) { void dm_ctl_cvar_f32(uint64_t off, float v); char *e2; uint64_t off = strtoull(line + 6, &e2, 16); dm_ctl_cvar_f32(off, strtof(e2, NULL)); continue; }
                 if (!strncmp(line, "env ", 4)) { char *eq = strchr(line + 4, '='); if (eq) { *eq = 0; setenv(line + 4, eq + 1, 1); LOG("DM_CTL: env %s=%s", line + 4, eq + 1);
-                                                     if (!strncmp(line + 4, "DM_IMU_", 7)) { void imu_env_reread(void); imu_env_reread(); } } continue; }   // the IMU's switches are read again
+                                                     if (!strncmp(line + 4, "DM_IMU_", 7) || !strcmp(line + 4, "DM_SIX_DELAY")) { void imu_env_reread(void); imu_env_reread(); } } continue; }   // the IMU's switches are read again
                 if (!strncmp(line, "texdump ", 8)) { void dm_gfx_texdump_next(const char *path); dm_gfx_texdump_next(line + 8); LOG("DM_CTL: colour targets of the next frame → %s (as DM_NVN_TEXDUMP)", line + 8); continue; }
                 if (!strncmp(line, "passdump ", 9)) { void dm_gfx_passdump_next(long n); dm_gfx_passdump_next(atol(line + 9)); LOG("DM_CTL: passes of the next %ld frames (as DM_NVN_PASSDUMP)", atol(line + 9)); continue; }
                 if (!strncmp(line, "drag ", 5)) {   // one finger, a step every 8 ms
@@ -746,7 +746,7 @@ static int shaking(uint64_t t) { return t >= atomic_load(&g_shake_t0) && t < ato
 // Switch frame, DmGamepad.m): while a player's samples keep arriving (within
 // MOTION_STALE_NS on the host clock) their six-axis sensor reports them (motion_fusion.h) instead of lying flat; a shake (DM_BTN_SHAKE) still adds its side-to-side acceleration.
 // Each stream keeps its last LIVE_RING samples, stamped on the guest clock (live_ring): a history read or an IMU answer gives each 5 ms tick the sample at that tick's time,
-// interpolated between the two around it, played back a sample interval late (DM_IMU_DELAY, live_ring_copy) so the ticks up to the clock's (answer_tick) lie between samples
+// interpolated between the two around it, the IMU samples played back a sample interval late (DM_IMU_DELAY, six_source) so the ticks up to the clock's (answer_tick) lie between samples
 // that have arrived, the newest held past its time only when a report stalls, so the SDK's sensor fusion gets a 200 Hz stream
 // whatever the source's rate (GameController 60 to 1000 Hz, a Pro or Joy-Con 2 report's samples, the phone) and nothing made up beyond the newest sample. Before, every tick of an answer carried the newest
 // sample, so the fusion saw a staircase of repeated samples. DM_MOTION=0 ignores live motion; DM_MOTION_AXES / DM_MOTION_ACC_SIGN map Apple's axes (motion_fusion.h);
@@ -819,7 +819,7 @@ static void motion_set_to(live_motion *m, int p, const float acc[3], const float
         LOG("[hid] motion player 1 (%s): acc %+.2f %+.2f %+.2f G, gyro %+.3f %+.3f %+.3f rev/s (flat and still should read acc 0 0 -1)",
             source == 1 ? "phone" : source == 2 ? "controller HID" : "controller", m->st.acc[0], m->st.acc[1], m->st.acc[2], m->st.gyro[0], m->st.gyro[1], m->st.gyro[2]);
     }
-    if (m->last_ns) motion_lag_add(&m->lag, now - m->last_ns);   // how long after the last sample's time this one arrived: the delay the stream needs (live_ring_copy)
+    if (m->last_ns) motion_lag_add(&m->lag, now - m->last_ns);   // how long after the last sample's time this one arrived: the delay the stream needs (six_source)
     m->last_ns = t; m->received_ns = now;
     if (!m->count) m->head = 0;   // a new stream (reset above) starts its history again
     motion_sample *r = &m->ring[(m->head + m->count) % LIVE_RING];
@@ -871,28 +871,38 @@ static live_motion *motion_pick(int p, motion_state *out) {
     return best;
 }
 static int motion_live(int p, motion_state *out) { return motion_pick(p, out) != NULL; }
-// One Joy-Con's sensor: its own stream while fresh, else the pad's merged one (a controller that reports no per-Joy-Con motion)
+// One Joy-Con's sensor: its own stream while fresh; NULL (the host's flat sensor) while that stream only paused (it reported within JOY_OWN_RECENT_NS: a Joy-Con 2 skipping
+// reports), as the pad's merged stream holds the controller in another frame (a sideways Joy-Con's, a quarter turn away); else the pad's merged one (a controller that reports
+// no per-Joy-Con motion)
+#define JOY_OWN_RECENT_NS 3000000000ull
+static int joy_own(int p, int side) {   // 1: its own stream is fresh, 0: it paused, -1: none
+    live_motion *m = &g_joy_motion[p][side];
+    pthread_once(&g_motion_once, motion_env); if (g_motion_off) return -1;
+    if (motion_copy(m, NULL)) return 1;
+    pthread_mutex_lock(&m->mu); uint64_t r = m->received_ns; pthread_mutex_unlock(&m->mu);
+    return r && now_ns() - r <= JOY_OWN_RECENT_NS ? 0 : -1;
+}
 static live_motion *motion_joy_pick(int p, int side, motion_state *out) {
-    if (p >= 0 && p < DM_PLAYERS && (side == 0 || side == 1)) { pthread_once(&g_motion_once, motion_env); if (!g_motion_off && motion_copy(&g_joy_motion[p][side], out)) return &g_joy_motion[p][side]; }
-    return motion_pick(p, out);
+    if (p < 0 || p >= DM_PLAYERS || (side != 0 && side != 1)) return motion_pick(p, out);
+    int own = joy_own(p, side);
+    if (own > 0 && (!out || motion_copy(&g_joy_motion[p][side], out))) return &g_joy_motion[p][side];
+    return own == 0 ? NULL : motion_pick(p, out);
 }
 // A stream's history from guest time `from` on, copied under its lock while the stream is still fresh (the input thread holds that lock only to add a sample): the newest samples
-// back to the first at or before `from` (one before the window, for interpolating its start), oldest first, their times turned into guest ns with the guest clock's lag now
-// and played back *delay ns late (DM_IMU_DELAY: the stream's own motion_lag by default, so the ticks up to the present lie between samples that have arrived); *n of them, 0
-// when the stream went stale. The times only shift by the current lag and delay, so they stay in order through a freeze or DM_DETCLOCK (which pins them all to its clock).
-// Only the data is late: the ticks keep their sampling numbers (answer_tick), so changing the delay never takes them back
-static _Atomic int64_t g_live_delay_cfg = -1;   // DM_IMU_DELAY (imu_env_read): a fixed delay in ns, -1 for each stream's own
-static void live_ring_copy(live_motion *m, uint64_t from, motion_sample *out, unsigned *n, uint64_t *delay) {
-    int64_t cfg = atomic_load(&g_live_delay_cfg);
+// back to the first at or before `from` (one before the window, for interpolating its start), oldest first, their times turned into guest ns with the guest clock's lag now;
+// *n of them, 0 when the stream went stale, and *lag the playout delay the stream needs (motion_lag). The times only shift by the current lag, so they stay in order through
+// a change of lag. A frozen or DM_DETCLOCK guest clock (guest_clock_pinned) maps every sample to one time, so only the newest is copied: the state now
+static void live_ring_copy(live_motion *m, uint64_t from, motion_sample *out, unsigned *n, uint64_t *lag) {
+    int pinned = guest_clock_pinned();
     pthread_mutex_lock(&m->mu);
-    unsigned k = 0; uint64_t d = cfg >= 0 ? (uint64_t)cfg : m->lag.delay_ns;
+    unsigned k = 0; *lag = m->lag.delay_ns;
     if (m->last_ns && now_ns() - m->received_ns <= MOTION_STALE_NS) {
-        while (k < m->count) { k++; if (guest_ns_at_host_time(m->ring[(m->head + m->count - k) % LIVE_RING].t) + d <= from) break; }
+        while (k < m->count) { k++; if (pinned || guest_ns_at_host_time(m->ring[(m->head + m->count - k) % LIVE_RING].t) <= from) break; }
         for (unsigned i = 0; i < k; i++) out[i] = m->ring[(m->head + m->count - k + i) % LIVE_RING];
     }
     pthread_mutex_unlock(&m->mu);
-    for (unsigned i = 0; i < k; i++) out[i].t = guest_ns_at_host_time(out[i].t) + d;
-    *n = k; *delay = d;
+    for (unsigned i = 0; i < k; i++) out[i].t = guest_ns_at_host_time(out[i].t);
+    *n = k;
 }
 // The sample at guest time t from a history (oldest first, n >= 1): interpolated between the samples around t, the oldest before it, the newest held after it (never
 // extrapolated)
@@ -925,20 +935,51 @@ static int live_at(const motion_sample *r, unsigned n, uint64_t t, motion_sample
 // between a controller's GameController and HID streams with different latencies, took the numbers back, and a game polling faster than its controller reported read the same
 // numbers again, then a jump when the controller stopped. HWM_SLOTS handles per kind; an unknown handle past them goes by the clock alone
 enum { HWM_SLOTS = 64, HWM_BACK_TICKS = 200 };   // 200 ticks: 1 s
-typedef struct { _Atomic uint32_t key[HWM_SLOTS]; _Atomic int64_t tick[HWM_SLOTS]; } tick_hwm;
+// Each slot also keeps the playout delay last applied to that handle and when (answer_delay)
+typedef struct { _Atomic uint32_t key[HWM_SLOTS]; _Atomic int64_t tick[HWM_SLOTS]; _Atomic uint64_t delay[HWM_SLOTS], delay_at[HWM_SLOTS]; } tick_hwm;
 static tick_hwm g_hwm_states, g_hwm_imu;
-static int64_t answer_tick(tick_hwm *w, uint32_t h, int64_t now_tick) {
+static int hwm_slot(tick_hwm *w, uint32_t h) {   // the handle's slot, taken on first use; -1 when all are taken
     uint32_t key = h | 1u << 31;   // never 0 (a free slot)
     for (unsigned i = 0, at = (h * 2654435761u) % HWM_SLOTS; i < HWM_SLOTS; i++, at = (at + 1) % HWM_SLOTS) {
         uint32_t k = atomic_load(&w->key[at]);
         if (!k) { uint32_t z = 0; if (!atomic_compare_exchange_strong(&w->key[at], &z, key) && z != key) continue; k = key; }
-        if (k != key) continue;
+        if (k == key) return (int)at;
+    }
+    return -1;
+}
+static int64_t answer_tick(tick_hwm *w, uint32_t h, int64_t now_tick) {
+    int at = hwm_slot(w, h);
+    if (at >= 0) {
         int64_t prev = atomic_load(&w->tick[at]);
         // a mark more than HWM_BACK_TICKS ahead of the clock means the clock went back (a reset, a restored state): start again from the clock, not pinned to the old mark
         while ((prev < now_tick || prev - now_tick > HWM_BACK_TICKS) && !atomic_compare_exchange_weak(&w->tick[at], &prev, now_tick)) {}
         return prev > now_tick && prev - now_tick <= HWM_BACK_TICKS ? prev : now_tick;
     }
     return now_tick;
+}
+// The playout delay an answer applies to a live stream's data (not to its sampling numbers): the target (DM_IMU_DELAY / DM_SIX_DELAY, else the stream's motion_lag) reached at
+// no more than LIVE_DELAY_SLEW of the guest time passed since the handle's last answer. A delay that jumped between answers would replay or skip the stream's data (the numbers
+// stay monotone, but data time minus tick time jumps: 25 ms at 300 deg/s is 7.5 degrees); slewed under 1, the data time of the ticks a game takes keeps going forward, 5% faster
+// or slower while the delay settles (a new stream, a stale restart, another stream behind the handle). The first answer, one after a second without any, or one after the clock
+// went back takes the target at once: nothing was fed just before it to jump from
+#define LIVE_DELAY_SLEW 0.05
+#define LIVE_DELAY_MAX_NS MOTION_LAG_MAX_NS   // the most either path delays (DM_IMU_DELAY / DM_SIX_DELAY are bounded by it too)
+// DM_SIX_DELAY / DM_IMU_DELAY (imu_env_read): each path's delay in ns, -1 for the stream's own (motion_lag). GetSixAxisSensorStates [0] defaults to none: a Switch 1 game
+// reads the newest state each frame (aiming, steering), so a delay only adds latency, and a few held ticks cost it nothing. GetNpadImuSamples [1] defaults to the stream's own:
+// the SDK's sensor fusion integrates every tick
+static _Atomic int64_t g_live_delay_cfg[2] = {0, -1};
+#define LIVE_DELAY_IDLE_NS 1000000000ull
+static uint64_t answer_delay(tick_hwm *w, uint32_t h, uint64_t target, uint64_t now) {
+    int at = hwm_slot(w, h);
+    if (at < 0) return target;
+    uint64_t prev = atomic_load(&w->delay[at]), when = atomic_load(&w->delay_at[at]), d = target;
+    if (when && now >= when && now - when <= LIVE_DELAY_IDLE_NS) {
+        uint64_t step = (uint64_t)((double)(now - when) * LIVE_DELAY_SLEW);
+        if (target > prev + step) d = prev + step;
+        else if (target + step < prev) d = prev - step;
+    }
+    atomic_store(&w->delay[at], d); atomic_store(&w->delay_at[at], now ? now : 1);
+    return d;
 }
 static void six_sample_live(SixAxisState *s, int64_t samp, const motion_sample *ms, int shakes) {
     memset(s, 0, sizeof *s);
@@ -991,7 +1032,7 @@ static uint32_t six_style_index(uint32_t style) {
 }
 // The motion behind a handle: a Joy-Con npad's own Joy-Con, else its player's controller. Fills src with that stream's history (live_ring_copy) and returns its count: 0 when no
 // live stream is fresh (the sensor lies flat). Also whether it shakes
-typedef struct { motion_sample r[LIVE_RING]; unsigned n; uint64_t delay; } live_hist;   // delay: the playout delay its times carry (live_ring_copy)
+typedef struct { motion_sample r[LIVE_RING]; unsigned n; uint64_t delay; } live_hist;   // delay: the playout delay its times carry (six_source)
 static pthread_once_t g_imu_once; static void imu_env_read(void);   // DM_IMU_DELAY and the rest (below, at the IMU state)
 // The stream behind a handle (NULL: the host's flat sensor). A Joy-Con npad reads its own Joy-Con, a real L + R pair the game takes as a pair (KIND_DUAL) each handle its own
 // half. A whole controller reads its player's merged stream, except Joy-Cons the game is shown as a pair (pad_style: a game such as Nintendo Switch Sports Resort supports JoyDual
@@ -1014,14 +1055,24 @@ static live_motion *six_stream(uint32_t h, npad_ref ref, int pl) {
     }
     return motion_pick(pl, NULL);
 }
-static unsigned six_source(uint32_t h, uint64_t from, live_hist *src, int *shakes) {   // from: the oldest tick's guest time the answer needs
+// The history behind a handle for an answer (w: g_hwm_states or g_hwm_imu, whose handle slots keep the delay), played back late by the path's delay (answer_delay): every
+// time moved d later, so a tick at the present lies between two samples that have arrived. None on a pinned guest clock (live_ring_copy keeps only the newest sample)
+static unsigned six_source(uint32_t h, uint64_t from, live_hist *src, int *shakes, tick_hwm *w) {   // from: the oldest tick's guest time the answer needs
     npad_ref ref = npad_resolve(h >> 8 & 0xff);
     int pl = ref.kind >= KIND_DUAL ? ref.pad : player_of(h >> 8 & 0xff);
     *shakes = pl == 0 && ref.kind < KIND_DUAL;
     live_motion *m = six_stream(h, ref, pl);
     src->n = 0; src->delay = 0;
+    if (!m) return 0;
     pthread_once(&g_imu_once, imu_env_read);
-    if (m) live_ring_copy(m, from, src->r, &src->n, &src->delay);
+    uint64_t lag; live_ring_copy(m, from > LIVE_DELAY_MAX_NS ? from - LIVE_DELAY_MAX_NS : 0, src->r, &src->n, &lag);
+    if (!src->n) return 0;
+    int64_t cfg = atomic_load(&g_live_delay_cfg[w == &g_hwm_imu]);
+    uint64_t d = 0;
+    if (guest_clock_pinned()) answer_delay(w, h, 0, 0);   // none, and the first answer after takes its target at once (nothing to slew from)
+    else d = answer_delay(w, h, cfg >= 0 ? (uint64_t)cfg : lag, guest_ns());
+    for (unsigned i = 0; i < src->n; i++) src->r[i].t += d;
+    src->delay = d;
     return src->n;
 }
 // Whether the sensor behind a handle reads without a gyro offset: the host's own (no live source), a HID or Joy-Con 2 stream (their front ends take off the offset they
@@ -1044,7 +1095,7 @@ static int six_states(SixAxisState *out, int n, uint32_t h) {
     if (!six_connected(h)) { memset(out, 0, sizeof *out * (size_t)n); return 0; }
     static _Thread_local live_hist src;   // 10 KB: off the guest thread's stack
     int64_t samp = answer_tick(&g_hwm_states, h, (int64_t)(guest_ns() / SIX_PERIOD_NS)), first = samp - n + 1;
-    int shakes; six_source(h, first > 0 ? (uint64_t)first * SIX_PERIOD_NS : 0, &src, &shakes);
+    int shakes; six_source(h, first > 0 ? (uint64_t)first * SIX_PERIOD_NS : 0, &src, &shakes, &g_hwm_states);
     for (int i = 0; i < n; i++) six_at(&out[i], samp - i, &src, shakes);
     return n;
 }
@@ -1205,7 +1256,14 @@ static float g_imu_acc_sign = -1, g_imu_gyro_sign = -1;
 static motion_map g_imu_axes = {{0, 1, 2}, {1, 1, 1}, 1, 1};   // DM_IMU_AXES (imu_sample)
 static double g_imu_noise_g = -1, g_imu_noise_dps = -1;   // DM_IMU_NOISE (imu_sample): the spreads in use; set by imu_env_read
 static pthread_once_t g_imu_once = PTHREAD_ONCE_INIT;
-#define LIVE_DELAY_FIXED_MAX_MS 40   // DM_IMU_DELAY's bound: an IMU answer reaches back 80 ms, and the ring holds 128 ms at 1 kHz
+static int64_t live_delay_env(const char *name, int64_t dflt) {   // a delay switch: -1 auto, else ns; dflt when unset or not valid (with a log line)
+    const char *e = getenv(name); double f; char tail;
+    if (!e || !*e) return dflt;
+    if (!strcmp(e, "auto")) return -1;
+    if (sscanf(e, "%lf%c", &f, &tail) == 1 && f >= 0 && f * 1e6 <= (double)LIVE_DELAY_MAX_NS) return (int64_t)(f * 1e6);
+    LOG("[RED] %s=%s is neither auto nor 0 to %llu ms: %s", name, e, (unsigned long long)(LIVE_DELAY_MAX_NS / 1000000), dflt < 0 ? "auto" : "none");
+    return dflt;
+}
 static void imu_env_read(void) {
     const char *e;
     g_imu_acc_sign = (e = getenv("DM_IMU_ACC_SIGN")) && atof(e) > 0 ? 1 : -1;
@@ -1222,13 +1280,10 @@ static void imu_env_read(void) {
     // DM_IMU_AXES=<map> ("x,-z,y"): a signed permutation of the axes of every IMU sample the game gets, acceleration and rotation alike (rotation times its determinant, so
     // a mirror stays a proper rotation), for trying another frame with a real controller without a rebuild; default x,y,z
     if (!motion_map_parse(&g_imu_axes, getenv("DM_IMU_AXES"))) LOG("[RED] DM_IMU_AXES=%s is not like \"x,-z,y\": x,y,z", getenv("DM_IMU_AXES"));
-    // DM_IMU_DELAY: a live stream's playout delay (live_ring_copy); unset or "auto" each stream's own (motion_lag), 0 none (the ticks past the newest sample hold it), <ms> fixed
-    int64_t dl = -1;
-    if ((e = getenv("DM_IMU_DELAY")) && *e && strcmp(e, "auto")) {
-        if (sscanf(e, "%lf%c", &f, &tail) == 1 && f >= 0 && f <= LIVE_DELAY_FIXED_MAX_MS) dl = (int64_t)(f * 1e6);
-        else LOG("[RED] DM_IMU_DELAY=%s is neither auto nor 0 to %d ms: each stream's own delay", e, LIVE_DELAY_FIXED_MAX_MS);
-    }
-    atomic_store(&g_live_delay_cfg, dl);
+    // DM_IMU_DELAY (GetNpadImuSamples, default auto) and DM_SIX_DELAY (GetSixAxisSensorStates, default 0): a live stream's playout delay (six_source); "auto" the stream's
+    // own (motion_lag), 0 none (ticks past the newest sample hold it), <ms> fixed
+    atomic_store(&g_live_delay_cfg[1], live_delay_env("DM_IMU_DELAY", -1));
+    atomic_store(&g_live_delay_cfg[0], live_delay_env("DM_SIX_DELAY", 0));
 }
 // Sensor noise. A real IC's samples are never all alike, and the SDK's fusion (NERD's gyro_pointing, sdk+0x700e60) is built for that. With samples that do not change at all
 // (the host's flat controller), the fusion reset itself several times a second (its initialization, which asks GetSixAxisSensorIcInformation, ran 612 times in one Nintendo Switch
@@ -1280,7 +1335,7 @@ HLE_FORCE("_ZN2nn3hid17GetNpadImuSamplesEPNS0_13NpadImuSampleEiNS0_13NpadImuHand
     int64_t now = answer_tick(&g_hwm_imu, imu_handle, (int64_t)(guest_ns() / SIX_PERIOD_NS)), k = n < IMU_RING ? n : IMU_RING;
     if (k > now + 1) k = now + 1;   // no tick before the guest clock's start
     if (k <= 0) return 0;
-    int shakes; unsigned live = six_source(imu_handle, (uint64_t)(now - k + 1) * SIX_PERIOD_NS, &src, &shakes);
+    int shakes; unsigned live = six_source(imu_handle, (uint64_t)(now - k + 1) * SIX_PERIOD_NS, &src, &shakes, &g_hwm_imu);
     NpadImuSample *o = out;
     int held = 0; for (int64_t i = 0; i < k; i++) held += imu_sample(&o[i], now - k + 1 + i, &src, shakes, imu_handle >> 8 & 0xffff);
     static _Atomic uint64_t out_count;
