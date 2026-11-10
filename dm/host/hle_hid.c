@@ -1221,7 +1221,9 @@ static void imu_sample(NpadImuSample *o, int64_t tick, const live_hist *src, int
     SixAxisState s; six_at(&s, tick, src, shakes);
     o->sampling = tick + 1; o->delta_ns = SIX_PERIOD_NS;
     for (int i = 0; i < 3; i++) {
-        double na = g_imu_noise_g > 0 ? g_imu_noise_g * imu_gauss(tick, device, i) : 0, ng = g_imu_noise_dps > 0 ? g_imu_noise_dps / 360 * imu_gauss(tick, device, 3 + i) : 0;
+        // the noise only on the host's own samples: a live controller's carry their own (a Joy-Con 2 at rest: 0.4..0.7 mG, 0.04..0.06 deg/s; a DualSense 3..5 mG, 0.05..0.2 deg/s)
+        int add = !src->n;
+        double na = add && g_imu_noise_g > 0 ? g_imu_noise_g * imu_gauss(tick, device, i) : 0, ng = add && g_imu_noise_dps > 0 ? g_imu_noise_dps / 360 * imu_gauss(tick, device, 3 + i) : 0;
         o->acc[i] = (float)(g_imu_acc_sign * (s.acc[i] + na) * STANDARD_GRAVITY);
         o->gyro[i] = (float)(g_imu_gyro_sign * (s.gyro[i] + ng) * 2 * M_PI);
     }
