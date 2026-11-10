@@ -1173,7 +1173,8 @@ HLE_FORCE("_ZN2nn3hid39ResetIsSixAxisSensorDeviceNewlyAssignedERKNS0_19SixAxisSe
 // the fusion had to learn the bias itself, which it never finished on the host: its Kalman filter's parameter test kept failing and resetting the bias estimate
 // (GyroPointingCore::Recover, sdk+0x712aa0, counted at core +0x3cc8: 10 to 25 times a minute), so Nintendo Switch Sports Resort's "place the Joy-Con on a flat surface"
 // calibration failed after 30 s every time and the game warned that controls may lag. It still does: the fusion's stable orientation diverges at rest every 8 to 20 s, and that reset
-// (sdk+0x6d7700) initializes it again without loading this (sdk+0x6d773c); why it diverges on the host's samples is open (docs/reference/services.md)
+// (sdk+0x6d7700) initializes it again without loading this (sdk+0x6d773c), and once the controller is still the flag is overwritten by the Kalman filter's own readiness
+// (sdk+0x6d7460), which never comes; why the filter does not converge on the host's samples is open (docs/reference/services.md)
 enum { SIX_CAL_SIZE = 0x744 };
 static pthread_mutex_t g_six_cal_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint8_t g_six_cal[SIX_NPADS][SIX_DEVICES][SIX_CAL_SIZE], g_six_cal_have[SIX_NPADS][SIX_DEVICES];
