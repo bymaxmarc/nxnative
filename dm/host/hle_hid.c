@@ -756,10 +756,17 @@ static int shaking(uint64_t t) { return t >= atomic_load(&g_shake_t0) && t < ato
 // Live motion (dm_motion_set: a controller's gyro and accelerometer, front_mac.m / DmGamepad.m through motion_apple.h; dm_motion_set_switch: the iPhone's own, already in the
 // Switch frame, DmGamepad.m): while a player's samples keep arriving (within
 // MOTION_STALE_NS on the host clock) their six-axis sensor reports them (motion_fusion.h) instead of lying flat; a shake (DM_BTN_SHAKE) still adds its side-to-side acceleration.
-// Every history entry is the newest sample, numbered by time. DM_MOTION=0 ignores live motion; DM_MOTION_AXES / DM_MOTION_ACC_SIGN map Apple's axes (motion_fusion.h);
+// Each stream keeps its last LIVE_RING samples, stamped on the guest clock (live_ring): a history read or an IMU answer gives each 5 ms tick the sample at that tick's time,
+// interpolated between the two around it, and ends at the newest sample's tick (live_ticks), so the SDK's sensor fusion gets a 200 Hz stream whatever the source's rate
+// (GameController 60 to 1000 Hz, a Pro or Joy-Con 2 report's samples, the phone) and nothing from after the newest sample. Before, every tick of an answer carried the newest
+// sample, so the fusion saw a staircase of repeated samples. DM_MOTION=0 ignores live motion; DM_MOTION_AXES / DM_MOTION_ACC_SIGN map Apple's axes (motion_fusion.h);
 // DM_MOTION_GAIN sets the tilt correction (default 0.5); DM_MOTION_LOG=1 logs player 1's mapped sample once a second, for checking the axes
 enum { MOTION_STALE_NS = 300000000 };
-typedef struct { pthread_mutex_t mu; motion_state st; uint64_t last_ns, received_ns, logged; } live_motion;
+// LIVE_RING samples cover 128 ms at 1 kHz and 1.28 s at 100 Hz, more than the 16 ticks (80 ms) an IMU answer reaches back at any source rate the host sees; 80 bytes each,
+// about 340 KB for every stream of every player
+enum { LIVE_RING = 128 };
+typedef struct { uint64_t t; float acc[3], gyro[3], angle[3], dir[9]; } motion_sample;   // t: guest ns; the SixAxisSensorState fields (motion_fill)
+typedef struct { pthread_mutex_t mu; motion_state st; uint64_t last_ns, received_ns, logged; motion_sample ring[LIVE_RING]; unsigned head, count; } live_motion;
 static live_motion g_motion[DM_PLAYERS] = {[0 ... DM_PLAYERS - 1] = {.mu = PTHREAD_MUTEX_INITIALIZER}};
 static live_motion g_hid_motion[DM_PLAYERS] = {[0 ... DM_PLAYERS - 1] = {.mu = PTHREAD_MUTEX_INITIALIZER}};
 static live_motion g_joy_motion[DM_PLAYERS][2] = {[0 ... DM_PLAYERS - 1] = {[0 ... 1] = {.mu = PTHREAD_MUTEX_INITIALIZER}}};   // each Joy-Con's own sensor (dm_motion_set_joy)
@@ -800,7 +807,7 @@ static void motion_set_to(live_motion *m, int p, const float acc[3], const float
     uint64_t now = now_ns(), t = sample_ns ? sample_ns : now;
     if (!t || t > now || now - t > MOTION_STALE_NS) return;
     pthread_mutex_lock(&m->mu);
-    if (!m->last_ns || now - m->received_ns > MOTION_STALE_NS) { motion_reset(&m->st); m->last_ns = 0; }
+    if (!m->last_ns || now - m->received_ns > MOTION_STALE_NS) { motion_reset(&m->st); m->last_ns = 0; m->count = 0; }
     if (m->last_ns && t <= m->last_ns) { pthread_mutex_unlock(&m->mu); return; }
     float dt = m->last_ns && t > m->last_ns ? (float)((double)(t - m->last_ns) / 1e9) : 0;
     motion_update(&m->st, source ? &identity : &g_motion_map, acc, rot, dt, g_motion_gain);
@@ -810,6 +817,10 @@ static void motion_set_to(live_motion *m, int p, const float acc[3], const float
             source == 1 ? "phone" : source == 2 ? "controller HID" : "controller", m->st.acc[0], m->st.acc[1], m->st.acc[2], m->st.gyro[0], m->st.gyro[1], m->st.gyro[2]);
     }
     m->last_ns = t; m->received_ns = now;
+    if (!m->count) m->head = 0;   // a new stream (reset above) starts its history again
+    motion_sample *r = &m->ring[(m->head + m->count) % LIVE_RING];
+    r->t = guest_ns_at_host_time(t); motion_fill(&m->st, r->acc, r->gyro, r->angle, r->dir);
+    if (m->count < LIVE_RING) m->count++; else m->head = (m->head + 1) % LIVE_RING;
     pthread_mutex_unlock(&m->mu);
 }
 void dm_motion_set(int p, const float acc[3], const float rot[3]) { motion_set(p, acc, rot, 0, 0); }
@@ -838,30 +849,58 @@ static uint64_t motion_copy(live_motion *m, motion_state *out) {   // copies a s
     pthread_mutex_unlock(&m->mu);
     return t;
 }
-static int motion_live(int p, motion_state *out) {
-    if (p < 0 || p >= DM_PLAYERS) return 0;
+// The live stream behind player p (its controller's GameController stream, else its HID one; in a one-player game the freshest of every merged player's; player 1 the phone as
+// DM_PHONE_MOTION says), with a copy of its state; NULL while none is fresh
+static live_motion *motion_pick(int p, motion_state *out) {
+    if (p < 0 || p >= DM_PLAYERS) return NULL;
     pthread_once(&g_motion_once, motion_env);
-    if (!p && g_phone_mode > 0) return motion_copy(&g_phone_motion, out) != 0;
+    if (!p && g_phone_mode > 0) return motion_copy(&g_phone_motion, out) ? &g_phone_motion : NULL;
     // Match the button path: in a one-player game, a controller in another slot also drives player 1.
-    uint32_t src = p ? 1u << p : 1u | merged_players(); uint64_t newest = 0;
+    uint32_t src = p ? 1u << p : 1u | merged_players(); uint64_t newest = 0; live_motion *best = NULL;
     for (int i = 0; i < DM_PLAYERS; i++) if (src >> i & 1) {
-        motion_state st; uint64_t t = motion_copy(&g_motion[i], &st);
-        if (!t) t = motion_copy(&g_hid_motion[i], &st);
-        if (t > newest) { newest = t; *out = st; }
+        motion_state st; live_motion *m = &g_motion[i]; uint64_t t = motion_copy(m, &st);
+        if (!t) { m = &g_hid_motion[i]; t = motion_copy(m, &st); }
+        if (t > newest) { newest = t; *out = st; best = m; }
     }
-    if (newest) return 1;
-    return !p && g_phone_mode < 0 && motion_copy(&g_phone_motion, out);
+    if (best) return best;
+    return !p && g_phone_mode < 0 && motion_copy(&g_phone_motion, out) ? &g_phone_motion : NULL;
 }
+static int motion_live(int p, motion_state *out) { return motion_pick(p, out) != NULL; }
 // One Joy-Con's sensor: its own stream while fresh, else the pad's merged one (a controller that reports no per-Joy-Con motion)
-static int motion_joy(int p, int side, motion_state *out) {
-    if (p >= 0 && p < DM_PLAYERS && (side == 0 || side == 1)) { pthread_once(&g_motion_once, motion_env); if (!g_motion_off && motion_copy(&g_joy_motion[p][side], out)) return 1; }
-    return motion_live(p, out);
+static live_motion *motion_joy_pick(int p, int side, motion_state *out) {
+    if (p >= 0 && p < DM_PLAYERS && (side == 0 || side == 1)) { pthread_once(&g_motion_once, motion_env); if (!g_motion_off && motion_copy(&g_joy_motion[p][side], out)) return &g_joy_motion[p][side]; }
+    return motion_pick(p, out);
 }
-static void six_sample_live(SixAxisState *s, int64_t samp, const motion_state *ms, int shakes) {
+// A stream's history, copied under its lock (the input thread holds that lock only to add a sample): oldest first, *n of them
+static void live_ring_copy(live_motion *m, motion_sample *out, unsigned *n) {
+    pthread_mutex_lock(&m->mu);
+    *n = m->count;
+    for (unsigned i = 0; i < m->count; i++) out[i] = m->ring[(m->head + i) % LIVE_RING];
+    pthread_mutex_unlock(&m->mu);
+}
+// The sample at guest time t from a history (oldest first, n >= 1): interpolated between the samples around t, the oldest before it, the newest after it (never extrapolated);
+// direction from the nearer of the two
+static void live_at(const motion_sample *r, unsigned n, uint64_t t, motion_sample *o) {
+    if (t <= r[0].t) { *o = r[0]; o->t = t; return; }
+    if (t >= r[n - 1].t) { *o = r[n - 1]; o->t = t; return; }
+    unsigned lo = 0, hi = n - 1;   // r[lo].t < t < r[hi].t: bisect
+    while (hi - lo > 1) { unsigned mid = (lo + hi) / 2; if (r[mid].t <= t) lo = mid; else hi = mid; }
+    const motion_sample *a = &r[lo], *b = &r[hi];
+    float f = (float)((double)(t - a->t) / (double)(b->t - a->t));
+    *o = f < 0.5f ? *a : *b; o->t = t;
+    for (int i = 0; i < 3; i++) { o->acc[i] = a->acc[i] + (b->acc[i] - a->acc[i]) * f; o->gyro[i] = a->gyro[i] + (b->gyro[i] - a->gyro[i]) * f; o->angle[i] = a->angle[i] + (b->angle[i] - a->angle[i]) * f; }
+}
+// The newest tick a live answer reaches: the guest clock's current tick, or the newest sample's when that is older (no tick past the data)
+static int64_t live_last_tick(const motion_sample *r, unsigned n, int64_t now_tick) {
+    if (!n) return now_tick;
+    int64_t last = (int64_t)(r[n - 1].t / SIX_PERIOD_NS);
+    return last < now_tick ? last : now_tick;
+}
+static void six_sample_live(SixAxisState *s, int64_t samp, const motion_sample *ms, int shakes) {
     memset(s, 0, sizeof *s);
     uint64_t t = (uint64_t)samp * SIX_PERIOD_NS;
     s->delta_ns = SIX_PERIOD_NS; s->sampling = samp; s->attributes = 1;
-    motion_fill(ms, s->acc, s->gyro, s->angle, s->dir);
+    memcpy(s->acc, ms->acc, sizeof s->acc); memcpy(s->gyro, ms->gyro, sizeof s->gyro); memcpy(s->angle, ms->angle, sizeof s->angle); memcpy(s->dir, ms->dir, sizeof s->dir);
     if (shakes && shaking(t)) s->acc[0] += (float)(SHAKE_G * sin(2 * M_PI * SHAKE_HZ * (double)(t - atomic_load(&g_shake_t0)) / 1e9));
 }
 static void six_sample(SixAxisState *s, int64_t samp, int shakes) {
@@ -906,22 +945,31 @@ static uint32_t six_style_index(uint32_t style) {
     if (style & (STYLE_JOYRIGHT | STYLE_JOYRIGHT2)) return SIX_IDX_JOYRIGHT;
     return 0;
 }
-// The motion behind a handle: a Joy-Con npad's own Joy-Con, else its player's controller; returns whether it is live (else the sensor lies flat), and whether it shakes
-static int six_source(uint32_t h, motion_state *ms, int *shakes) {
+// The motion behind a handle: a Joy-Con npad's own Joy-Con, else its player's controller. Fills src with that stream's history (live_ring_copy) and returns its count: 0 when no
+// live stream is fresh (the sensor lies flat). Also whether it shakes
+typedef struct { motion_sample r[LIVE_RING]; unsigned n; } live_hist;
+static unsigned six_source(uint32_t h, live_hist *src, int *shakes) {
     npad_ref ref = npad_resolve(h >> 8 & 0xff);
     int pl = ref.kind >= KIND_DUAL ? ref.pad : player_of(h >> 8 & 0xff);
     *shakes = pl == 0 && ref.kind < KIND_DUAL;
-    return ref.kind >= KIND_DUAL ? motion_joy(ref.pad, ref.kind == KIND_LEFT ? 0 : ref.kind == KIND_RIGHT ? 1 : (int)(h >> 16 & 1), ms) : motion_live(pl, ms);
+    motion_state st;
+    live_motion *m = ref.kind >= KIND_DUAL ? motion_joy_pick(ref.pad, ref.kind == KIND_LEFT ? 0 : ref.kind == KIND_RIGHT ? 1 : (int)(h >> 16 & 1), &st) : motion_pick(pl, &st);
+    src->n = 0;
+    if (m) live_ring_copy(m, src->r, &src->n);
+    return src->n;
 }
-static void six_at(SixAxisState *s, int64_t samp, int live, const motion_state *ms, int shakes) {
-    if (live) six_sample_live(s, samp, ms, shakes); else six_sample(s, samp, shakes);
+// The state at a tick: from the live history (live_at) while there is one, else the host's own (flat, shaken or swung)
+static void six_at(SixAxisState *s, int64_t samp, const live_hist *src, int shakes) {
+    if (src->n) { motion_sample ms; live_at(src->r, src->n, (uint64_t)samp * SIX_PERIOD_NS, &ms); six_sample_live(s, samp, &ms, shakes); }
+    else six_sample(s, samp, shakes);
 }
 static int six_states(SixAxisState *out, int n, uint32_t h) {
     if (n <= 0) return 0;
     if (!six_connected(h)) { memset(out, 0, sizeof *out * (size_t)n); return 0; }
-    int64_t samp = (int64_t)(guest_ns() / SIX_PERIOD_NS);
-    motion_state ms; int shakes, live = six_source(h, &ms, &shakes);
-    for (int i = 0; i < n; i++) six_at(&out[i], samp - i, live, &ms, shakes);
+    static _Thread_local live_hist src;   // 10 KB: off the guest thread's stack
+    int shakes; six_source(h, &src, &shakes);
+    int64_t samp = live_last_tick(src.r, src.n, (int64_t)(guest_ns() / SIX_PERIOD_NS));
+    for (int i = 0; i < n; i++) six_at(&out[i], samp - i, &src, shakes);
     return n;
 }
 // A style set of several styles (FullKey | JoyDual, as a game that takes either passes) gets the style the npad's controller is shown in, when it is one of them (else the first, as
@@ -1113,8 +1161,8 @@ static double imu_gauss(int64_t tick, uint32_t device, int channel) {   // a sta
     return sqrt(-2 * log(u1)) * cos(2 * M_PI * u2);
 }
 void imu_env_reread(void) { pthread_once(&g_imu_once, imu_env_read); imu_env_read(); }   // DM_CTL "env DM_IMU_…" (a race with a sample being made only mixes two settings for one tick)
-static void imu_sample(NpadImuSample *o, int64_t tick, int live, const motion_state *ms, int shakes, uint32_t device) {
-    SixAxisState s; six_at(&s, tick, live, ms, shakes);
+static void imu_sample(NpadImuSample *o, int64_t tick, const live_hist *src, int shakes, uint32_t device) {
+    SixAxisState s; six_at(&s, tick, src, shakes);
     o->sampling = tick + 1; o->delta_ns = SIX_PERIOD_NS;
     for (int i = 0; i < 3; i++) {
         double na = g_imu_noise_g > 0 ? g_imu_noise_g * imu_gauss(tick, device, i) : 0, ng = g_imu_noise_dps > 0 ? g_imu_noise_dps / 360 * imu_gauss(tick, device, 3 + i) : 0;
@@ -1128,11 +1176,13 @@ HLE_FORCE("_ZN2nn3hid17GetNpadImuSamplesEPNS0_13NpadImuSampleEiNS0_13NpadImuHand
     pthread_once(&g_imu_once, imu_env_read);
     int slot, dev;
     if (!out || n <= 0 || six_handle_slot(NULL, imu_handle, &slot, &dev) != RES_OK || !six_connected(imu_handle) || !h_hid_ImuIs()) return 0;
-    motion_state ms; int shakes, live = six_source(imu_handle, &ms, &shakes);
-    int64_t now = (int64_t)(guest_ns() / SIX_PERIOD_NS), k = n < IMU_RING ? n : IMU_RING;
+    static _Thread_local live_hist src;
+    int shakes; unsigned live = six_source(imu_handle, &src, &shakes);
+    int64_t now = live_last_tick(src.r, src.n, (int64_t)(guest_ns() / SIX_PERIOD_NS)), k = n < IMU_RING ? n : IMU_RING;   // live: up to the newest sample's tick
     if (k > now + 1) k = now + 1;   // no tick before the guest clock's start
+    if (k <= 0) return 0;
     NpadImuSample *o = out;
-    for (int64_t i = 0; i < k; i++) imu_sample(&o[i], now - k + 1 + i, live, &ms, shakes, imu_handle >> 8 & 0xffff);
+    for (int64_t i = 0; i < k; i++) imu_sample(&o[i], now - k + 1 + i, &src, shakes, imu_handle >> 8 & 0xffff);
     static _Atomic uint64_t out_count;
     if (k > 0 && imu_log_due(&out_count))
         LOG("imu out h=%#x k=%lld s=%lld..%lld acc %+.4f %+.4f %+.4f m/s2 gyro %+.4f %+.4f %+.4f rad/s %s", imu_handle, (long long)k, (long long)o[0].sampling, (long long)o[k - 1].sampling,
