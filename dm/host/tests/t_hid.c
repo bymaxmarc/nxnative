@@ -630,7 +630,7 @@ static void t_npad_imu(void) {
 
 // Npad IMU samples (Switch 2): stateless, as the console's ring in shared memory. A call returns the newest min(n, 16) 5 ms ticks on the guest clock, oldest first, numbered by absolute
 // tick + 1; the SDK's fusion skips numbers it has taken (sdk+0x6d7198), so a repeated tick is harmless and every reader gets every tick. Units are the fusion's: m/s^2 and rad/s, with the
-// signs it undoes (sdk+0x6d7334, +0x6d74a0)
+// six-axis state's signs: the SDK negates the acceleration (sdk+0x6d7334) and takes the angular velocity as it is
 typedef struct { int64_t sampling, delta_ns; float acc[3], gyro[3]; } TestImuSample;   // acceleration at +0x10, angular velocity at +0x1c (sdk+0x6d7320)
 _Static_assert(sizeof(TestImuSample) == 0x28, "NpadImuSample");
 static int imu_numbered(const TestImuSample *s, int k, int64_t first) {   // k samples numbered first, first + 1, ... each 5 ms apart
