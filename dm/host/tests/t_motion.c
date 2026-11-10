@@ -201,6 +201,22 @@ static void rest_checks(void) {
     motion_rest_reset(&r); CHECK(!r.have && !r.pending, "rest: reset forgets");
 }
 
+// The playout delay: the 90th percentile of how late the next sample arrives, capped at 40 ms
+static void lag_checks(void) {
+    motion_lag l; motion_lag_reset(&l);
+    CHECK(l.delay_ns == 0, "lag: none before a second sample");
+    motion_lag_add(&l, 30000000); CHECK(l.delay_ns == 30000000, "lag: one spacing is the delay");
+    for (int i = 0; i < 40; i++) motion_lag_add(&l, i % 10 == 9 ? 34000000 : 30000000);   // a report in ten 4 ms late
+    CHECK(l.n == MOTION_LAG_N && l.delay_ns == 34000000, "lag: the 90th percentile covers the late ones that come one in ten");
+    for (int i = 0; i < 40; i++) motion_lag_add(&l, i % 20 == 19 ? 60000000 : 30000000);   // a lost report in twenty
+    CHECK(l.delay_ns == 30000000, "lag: a rare stall does not set the delay");
+    for (int i = 0; i < 40; i++) motion_lag_add(&l, 90000000);
+    CHECK(l.delay_ns == MOTION_LAG_MAX_NS, "lag: capped at 40 ms");
+    motion_lag_add(&l, 5000000000ull); CHECK(l.need_us[(l.next + MOTION_LAG_N - 1) % MOTION_LAG_N] == 1000000, "lag: a silence counts as a second");
+    motion_lag_reset(&l); for (int i = 0; i < 40; i++) motion_lag_add(&l, 15000000 + (uint64_t)(i % 4) * 1000000);
+    CHECK(l.delay_ns == 18000000, "lag: 67 Hz with 3 ms of jitter: 18 ms");
+}
+
 int main(void) {
     motion_map m;
     CHECK(motion_map_parse(&m, NULL) && m.src[0] == 0 && m.det == 1, "default map is the identity");
@@ -289,6 +305,7 @@ int main(void) {
     invalid_samples();
     swing_checks();
     rest_checks();
+    lag_checks();
     mapping_and_precision();
 
     printf("t_motion: %d checks, %d failed\n", checks, fails);

@@ -10,6 +10,7 @@
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdint.h>
 
 typedef struct { int src[3]; float sign[3]; float acc_sign; float det; } motion_map;
 typedef struct {
@@ -180,3 +181,22 @@ static inline void motion_rest_update(motion_rest *r, const float acc[3], const 
     memcpy(r->cand, m, sizeof r->cand); r->pending = 1;   // the window right after this one must agree (a pending one is dropped by any break)
 }
 static inline void motion_rest_apply(const motion_rest *r, const float rot[3], double t, float out[3]) { float b[3]; motion_rest_now(r, t, b); for (int i = 0; i < 3; i++) out[i] = rot[i] - b[i]; }
+
+// Playout delay of a live stream (motion_lag): a source sends a sample every 15 to 30 ms while the game reads 5 ms ticks up to the present, so read at the present most ticks lie
+// past the newest sample and can only hold it. Played back a little late, every tick lies between two samples that have arrived. The delay a stream needs is how long after a
+// sample's time the next one arrives (arrival_{k+1} - t_k: the sample spacing plus the next one's transport lateness); the stream's delay is the 90th percentile of the last
+// MOTION_LAG_N of them, capped at MOTION_LAG_MAX_NS so a stream that stalls (a lost Joy-Con 2 report: 60 or 90 ms) does not add its stall to every tick
+#define MOTION_LAG_N 32
+#define MOTION_LAG_PCT 90
+#define MOTION_LAG_MAX_NS 40000000ull
+#define MOTION_LAG_CLIP_NS 1000000000ull   // a need past a second is a silence, not a spacing (the stream starts over anyway)
+typedef struct { uint32_t need_us[MOTION_LAG_N]; unsigned n, next; uint64_t delay_ns; } motion_lag;
+static inline void motion_lag_reset(motion_lag *l) { memset(l, 0, sizeof *l); }
+static inline void motion_lag_add(motion_lag *l, uint64_t need_ns) {
+    if (need_ns > MOTION_LAG_CLIP_NS) need_ns = MOTION_LAG_CLIP_NS;
+    l->need_us[l->next] = (uint32_t)(need_ns / 1000); l->next = (l->next + 1) % MOTION_LAG_N; if (l->n < MOTION_LAG_N) l->n++;
+    uint32_t s[MOTION_LAG_N]; memcpy(s, l->need_us, sizeof s);   // the window, sorted (insertion: 32 values at most, once a sample)
+    for (unsigned i = 1; i < l->n; i++) { uint32_t v = s[i]; unsigned j = i; while (j && s[j - 1] > v) { s[j] = s[j - 1]; j--; } s[j] = v; }
+    unsigned k = l->n * MOTION_LAG_PCT / 100; if (k >= l->n) k = l->n - 1;
+    uint64_t d = (uint64_t)s[k] * 1000; l->delay_ns = d < MOTION_LAG_MAX_NS ? d : MOTION_LAG_MAX_NS;
+}
