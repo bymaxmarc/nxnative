@@ -650,8 +650,9 @@ static void *imu_reader(void *arg) {   // reads the newest 16 at a fixed guest t
 }
 static void t_npad_imu_samples(void) {
     g_mode = 1; dm_pad_players(1); g_phone_mode = 0;
+    setenv("DM_IMU_NOISE", "0", 1); imu_env_read();   // exact values here; t_imu_noise checks the noise
     atomic_store(&g_shake_t0, 0); atomic_store(&g_shake_end, 0);
-    uint32_t id = 0, h; CHECK(h_hid_SixHandles(&h, 1, &id, STYLE_FULLKEY) == 1, "imu: player 1's sensor handle (the fusion's NpadImuHandle is the six-axis handle, sdk+0x6d7078)");
+    uint32_t h = 0x20003;   // the SDK's own handle (utility::GetSixAxisSensorHandle, sdk+0x6d8490): full key (style index 3) on No1, the whole controller (device 2)
     imu_handle = h;
     TestImuSample s[40], t[40]; memset(s, 0xAB, sizeof s);
     guest_now = 2000000000ull;   // tick 400
@@ -685,9 +686,9 @@ static void t_npad_imu_samples(void) {
     dm_motion_clear(0);
 
     // Another device reads the same clock; a handle whose controller is not connected has no samples
-    uint32_t right = h | 1u << 16;
+    uint32_t right = 0x10003;   // another device index of the same controller
     CHECK(h_hid_ImuSamples(s, 2, right) == 2 && imu_numbered(s, 2, 403), "imu: another device index, the same absolute numbers");
-    uint32_t no4 = 3u << 8; memset(s, 0xAB, sizeof s);
+    uint32_t no4 = 0x20003 | 3u << 8; memset(s, 0xAB, sizeof s);
     CHECK(h_hid_ImuSamples(s, 16, no4) == 0 && s[0].delta_ns == (int64_t)0xABABABABABABABABull, "imu: an npad with no controller: no samples, nothing written");
 
     // Two readers each get the same newest ticks, also at once from two threads
@@ -705,10 +706,76 @@ static void t_npad_imu_samples(void) {
     h_hid_ImuDisable(); guest_now = 1000000000ull; dm_pad_players(1); g_phone_mode = -1;
 }
 
+// The IMU handles the SDK makes itself (GetNpadImuHandles → utility::GetSixAxisSensorHandle, sdk+0x6d8490, not taken over): NpadStyleIndex in byte 0, device in byte 2. Nintendo
+// Switch Sports Resort supports Handheld | JoyDual (0x6), so the keyboard's player 1 is a Joy-Con pair on No1 and its fusion reads 0x5 and 0x10005: those must have samples
+static void t_imu_sdk_handles(void) {
+    g_mode = 1; dm_pad_players(1); g_phone_mode = 0;
+    uint32_t t;
+    CHECK(imu_host_handle(0x10005, &t) && t == (2u | 1u << 16), "imu handle: Joy-Con pair (5), right device → style bit 2, device 1");
+    CHECK(imu_host_handle(0x20004 | 0x20u << 8, &t) && t == (1u | 0x20u << 8), "imu handle: handheld (4) on 0x20, device 2 → style bit 1, device 0");
+    CHECK(imu_host_handle(0x20003, &t) && t == 0, "imu handle: full key (3), device 2 → style bit 0, device 0");
+    CHECK(imu_host_handle(0x6, &t) && t == 3 && imu_host_handle(0x10007, &t) && t == (4u | 1u << 16), "imu handle: left (6) and right (7) Joy-Cons");
+    CHECK(!imu_host_handle(0x2, &t) && !imu_host_handle(0x8, &t) && !imu_host_handle(0x30005, &t), "imu handle: no style index the host knows, or device 3: none");
+    uint8_t ring[64]; h_hid_ImuEnable(ring, sizeof ring);
+    TestImuSample s[4];
+    h_hid_SetStyles(STYLE_HANDHELD | STYLE_JOYDUAL);   // the game's lobby (main+0xa9e940): the keyboard is shown as a pair
+    CHECK(h_hid_ImuSamples(s, 4, 0x5) == 4 && h_hid_ImuSamples(s, 4, 0x10005) == 4, "imu: the pair's two SDK handles have samples");
+    CHECK(h_hid_ImuSamples(s, 4, 0x20003) == 0, "imu: no full-key controller then: none");
+    g_mode = 0;
+    CHECK(h_hid_ImuSamples(s, 4, 0x20004 | 0x20u << 8) == 4, "imu: handheld, its SDK handle on 0x20 has samples");
+    g_mode = 1; h_hid_SetStyles(0xffffffffu);
+    CHECK(h_hid_ImuSamples(s, 4, 0x20003) == 4 && h_hid_ImuSamples(s, 4, 0x5) == 0, "imu: full key supported: the full-key handle, not the pair's");
+    h_hid_ImuDisable(); g_phone_mode = -1;
+}
+
+// The IMU samples' white noise (the SDK's stillness detector tests the gyro for it, sdk+0x736fb0): on by default, the same for a tick read again, different per device, zero mean
+// with the intended spread, uncorrelated from one tick to the next; DM_IMU_NOISE=0 leaves it out
+static void t_imu_noise(void) {
+    g_mode = 1; dm_pad_players(1); g_phone_mode = 0;
+    atomic_store(&g_shake_t0, 0); atomic_store(&g_shake_end, 0);
+    unsetenv("DM_IMU_NOISE"); imu_env_read();
+    uint32_t h[2] = {0x20003, 0x10003};   // the SDK's handles of player 1's full-key controller, two device indexes
+    uint8_t ring[64]; h_hid_ImuEnable(ring, sizeof ring);
+    enum { N = 4000 }; static float gx[N], az[N];
+    double sg = 0, sg2 = 0, sa = 0, sa2 = 0, lag = 0; int differ = 0, again = 1;
+    TestImuSample s[16], t[16];
+    for (int i = 0; i < N; i++) {
+        guest_now = 5000000000ull + (uint64_t)i * SIX_PERIOD_NS;
+        if (h_hid_ImuSamples(s, 1, h[0]) != 1) { CHECK(0, "imu noise: a sample each tick"); break; }
+        gx[i] = s[0].gyro[0]; az[i] = s[0].acc[2];
+        sg += gx[i]; sg2 += (double)gx[i] * gx[i]; sa += az[i] - 9.80665; sa2 += (az[i] - 9.80665) * (az[i] - 9.80665);
+        if (i) lag += (double)gx[i] * gx[i - 1];
+        if (i < 50) { h_hid_ImuSamples(t, 1, h[1]); differ += t[0].gyro[0] != s[0].gyro[0]; }
+    }
+    double gsd = sqrt(sg2 / N), asd = sqrt(sa2 / N), want_g = 0.1 * M_PI / 180, want_a = 0.00005 * 9.80665;
+    CHECK(fabs(sg / N) < 4 * want_g / sqrt(N) && fabs(gsd - want_g) < 0.1 * want_g, "imu noise: the gyro's is zero-mean, 0.1 deg/s per axis");
+    CHECK(fabs(sa / N) < 4 * want_a / sqrt(N) && fabs(asd - want_a) < 0.1 * want_a, "imu noise: the acceleration's is zero-mean, 0.05 mG per axis");
+    CHECK(fabs(lag / (N - 1) / (gsd * gsd)) < 0.08, "imu noise: white (no correlation from one tick to the next)");
+    {   // the SDK's stillness test (sdk+0x736850): the lag-1 autocovariance of 64 accelerations (m/s^2) on x and z within 1e-6, for every window of a still controller
+        int still = 1;
+        for (int w = 0; w + 64 <= N; w += 16) {
+            double m = 0, c = 0; for (int i = w; i < w + 64; i++) m += az[i]; m /= 64;
+            for (int i = w; i < w + 63; i++) c += (az[i] - m) * (az[i + 1] - m);
+            still &= fabs(c / 63) < 1e-6;
+        }
+        CHECK(still, "imu noise: small enough that the SDK's stillness detector finds a still controller still");
+    }
+    CHECK(differ >= 48, "imu noise: each device has its own");
+    guest_now = 6000000000ull;
+    h_hid_ImuSamples(s, 16, h[0]); guest_now += 3 * SIX_PERIOD_NS; h_hid_ImuSamples(t, 16, h[0]);
+    for (int i = 3; i < 16; i++) again &= !memcmp(&s[i], &t[i - 3], sizeof s[i]);
+    CHECK(again, "imu noise: a tick read again reads the same");
+    setenv("DM_IMU_NOISE", "0", 1); imu_env_read();
+    CHECK(h_hid_ImuSamples(s, 1, h[0]) == 1 && s[0].gyro[0] == 0 && s[0].acc[2] == 9.80665f, "imu noise: DM_IMU_NOISE=0 leaves it out");
+    unsetenv("DM_IMU_NOISE"); imu_env_read();
+    h_hid_ImuDisable(); guest_now = 1000000000ull; g_phone_mode = -1;
+}
+
 // DM_KEYS / DM_CTL "Swing" (motion_swing.h): the step carries the swing, its press starts it on the guest clock, player 1's six-axis states and npad IMU samples play it (in the IMU's
 // units and signs), the sensor is not at rest meanwhile, and a pad that is not player 1's own does not swing
 static void t_swing(void) {
     g_mode = 1; dm_pad_players(1); g_phone_mode = 0;
+    setenv("DM_IMU_NOISE", "0", 1); imu_env_read();
     atomic_store(&g_shake_t0, 0); atomic_store(&g_shake_end, 0);
     keys_parse("f100:Swing-x@1800,f200:A+Swing~f2,f300:Swingq");
     CHECK(g_nsteps == 3 && g_steps[0].swing && g_steps[0].sw.axis == 0 && g_steps[0].sw.sign == -1 && g_steps[0].sw.peak_dps == 1800 && !g_steps[0].btn, "Swing-x@1800 parses into the step, with no button");
@@ -728,7 +795,7 @@ static void t_swing(void) {
     CHECK(!h_hid_SixRest(&h), "a swinging sensor is not at rest");
     uint8_t ring[64]; h_hid_ImuEnable(ring, sizeof ring);
     TestImuSample m[1];
-    CHECK(h_hid_ImuSamples(m, 1, h) == 1 && fabsf(m[0].gyro[2] + 1500.f / 360 * 2 * (float)M_PI) < 1e-3f && fabsf(m[0].acc[1] + st[0].acc[1] * 9.80665f) < 1e-3f,
+    CHECK(h_hid_ImuSamples(m, 1, 0x20003) == 1 && fabsf(m[0].gyro[2] + 1500.f / 360 * 2 * (float)M_PI) < 1e-3f && fabsf(m[0].acc[1] + st[0].acc[1] * 9.80665f) < 1e-3f,
           "the npad IMU sample of that tick: -rev/s x 2 pi rad/s, -G x 9.80665 m/s^2");
     h_hid_ImuDisable();
     dm_pad_players(3); uint32_t id2 = 1, h2; h_hid_SixHandles(&h2, 1, &id2, STYLE_FULLKEY);
@@ -738,6 +805,7 @@ static void t_swing(void) {
     CHECK(six_states(st, 1, h) == 1 && st[0].acc[2] == -1 && st[0].gyro[2] == 0 && st[0].dir[0] == 1 && h_hid_SixRest(&h), "after the swing: flat and at rest again");
     g_nsteps = 0; g_steps = NULL; guest_now = 1000000000ull; g_phone_mode = -1;
     pthread_mutex_lock(&g_swing_mu); g_swing_set = 0; pthread_mutex_unlock(&g_swing_mu);
+    unsetenv("DM_IMU_NOISE"); imu_env_read();
 }
 
 // Six-axis sensor information the fusion's initialization reads (sdk+0x6d7e28): 0xc8 bytes (sdk+0x6d7e58 copies them), gyro half then acceleration half
@@ -800,7 +868,7 @@ static void t_unsupported_style(void) {
     CHECK(h_hid_SixHandles(h, 2, &id, STYLE_JOYDUAL) == 2 && six_connected(h[0]) && six_connected(h[1]), "two six-axis sensors, connected");
     { uint64_t was = guest_now; guest_now = 2000000000ull; uint8_t ring[64]; TestImuSample s[4];
       h_hid_ImuEnable(ring, sizeof ring);
-      CHECK(h_hid_ImuSamples(s, 4, h[0]) == 4 && imu_numbered(s, 4, 398) && h_hid_ImuSamples(s, 4, h[1]) == 4 && imu_numbered(s, 4, 398), "IMU samples for device index 0 and 1");
+      CHECK(h_hid_ImuSamples(s, 4, 0x5) == 4 && imu_numbered(s, 4, 398) && h_hid_ImuSamples(s, 4, 0x10005) == 4 && imu_numbered(s, 4, 398), "IMU samples for the SDK's pair handles (style index 5), device index 0 and 1");
       h_hid_ImuDisable(); guest_now = was; }
 
     // Vibration: type 5 handles, routed to player 1's motors, as are the full-key handles it got before
@@ -849,6 +917,8 @@ int main(void) {
     t_motion_hid();
     t_npad_imu_samples();
     t_swing();
+    t_imu_noise();
+    t_imu_sdk_handles();
     t_six_ic_info();
     t_rec();
     {   // Nmouse with no device (SDK 21's forms): the pointer range is kept, the merged handle 0 takes settings, the standard mouse and the handle queries report nothing
