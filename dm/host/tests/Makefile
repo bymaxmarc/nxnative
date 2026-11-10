@@ -223,7 +223,7 @@ nfc: $(B)/t_nfc
 	$(B)/t_nfc
 $(B)/t_language: t_language.c ../hle_sdk16.c ../hle.h ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -Wno-frame-address -fsanitize=address,undefined -I.. $(GINC) -o $@ t_language.c
-$(B)/t_motion: t_motion.c ../motion_fusion.h | $(B)
+$(B)/t_motion: t_motion.c ../motion_fusion.h ../motion_swing.h | $(B)
 	$(CLANG) -O1 -Wall -Werror -Wno-unused-function -o $@ t_motion.c -lm
 run: $(B)/t_motion_apple
 $(B)/t_motion_apple: t_motion_apple.m ../motion_apple.h ../dm_input.h | $(B)
@@ -244,9 +244,9 @@ $(B)/t_motion_pro: t_motion_pro.c ../motion_pro.h | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -fsanitize=address,undefined -o $@ t_motion_pro.c
 $(B)/t_motion_pro_mac: t_motion_pro_mac.m ../motion_pro_mac.h ../motion_pro.h ../dm_input.h | $(B)
 	$(CLANG) -O1 -g -fobjc-arc -Wall -Werror -Wno-unused-function -fsanitize=address,undefined -I.. -o $@ t_motion_pro_mac.m -framework Foundation -framework GameController -framework IOKit
-$(B)/t_hid: t_hid.c ../hle_hid.c ../motion_fusion.h ../hle_haptics.c ../hle_haptics.h ../pad_slots.h ../dm_input.h ../hle.h ../dm.h $(GAME_H) | $(B)
+$(B)/t_hid: t_hid.c ../hle_hid.c ../motion_fusion.h ../motion_swing.h ../hle_haptics.c ../hle_haptics.h ../pad_slots.h ../dm_input.h ../hle.h ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_hid.c ../hle_haptics.c
-$(B)/t_hid_tsan: t_hid.c ../hle_hid.c ../motion_fusion.h ../hle_haptics.c ../hle_haptics.h ../pad_slots.h ../dm_input.h ../hle.h ../dm.h $(GAME_H) | $(B)
+$(B)/t_hid_tsan: t_hid.c ../hle_hid.c ../motion_fusion.h ../motion_swing.h ../hle_haptics.c ../hle_haptics.h ../pad_slots.h ../dm_input.h ../hle.h ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -g -fsanitize=thread -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_hid.c ../hle_haptics.c
 $(B)/t_haptics: t_haptics.c ../hle_haptics.c ../hle_haptics.h ../dm_input.h | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -I.. -o $@ t_haptics.c ../hle_haptics.c

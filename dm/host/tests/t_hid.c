@@ -705,6 +705,41 @@ static void t_npad_imu_samples(void) {
     h_hid_ImuDisable(); guest_now = 1000000000ull; dm_pad_players(1); g_phone_mode = -1;
 }
 
+// DM_KEYS / DM_CTL "Swing" (motion_swing.h): the step carries the swing, its press starts it on the guest clock, player 1's six-axis states and npad IMU samples play it (in the IMU's
+// units and signs), the sensor is not at rest meanwhile, and a pad that is not player 1's own does not swing
+static void t_swing(void) {
+    g_mode = 1; dm_pad_players(1); g_phone_mode = 0;
+    atomic_store(&g_shake_t0, 0); atomic_store(&g_shake_end, 0);
+    keys_parse("f100:Swing-x@1800,f200:A+Swing~f2,f300:Swingq");
+    CHECK(g_nsteps == 3 && g_steps[0].swing && g_steps[0].sw.axis == 0 && g_steps[0].sw.sign == -1 && g_steps[0].sw.peak_dps == 1800 && !g_steps[0].btn, "Swing-x@1800 parses into the step, with no button");
+    CHECK(g_steps[1].swing && g_steps[1].btn == DM_BTN_A && g_steps[1].sw.axis == 2 && g_steps[1].sw.sign == 1, "A+Swing: the button and the default swing");
+    CHECK(!g_steps[2].swing, "an unknown axis is no swing");
+    free(g_steps); g_steps = NULL; g_nsteps = g_cap_steps = 0;
+    uint32_t id = 0, h; h_hid_SixHandles(&h, 1, &id, STYLE_FULLKEY);
+    SixAxisState st[2];
+    guest_now = 5000000000ull;
+    CHECK(six_states(st, 1, h) == 1 && st[0].acc[2] == -1 && st[0].gyro[2] == 0 && h_hid_SixRest(&h), "before the swing: flat and at rest");
+    static key_step one[1]; g_steps = one; g_cap_steps = 0; g_nsteps = 1;
+    g_steps[0] = (key_step){.hold = 0.15, .swing = 1, .sw = {2, 1, 1500}};
+    keys_main(NULL);   // presses at guest 5 s (the test's usleep does not move the guest clock)
+    guest_now = 5000000000ull + (uint64_t)(swing_impact(1500) * 1e9);
+    CHECK(six_states(st, 2, h) == 2 && fabsf(st[0].gyro[2] - 1500.f / 360) < 1e-3f && st[0].acc[1] > 7.9f, "at the impact: the swing's peak about z and its centripetal pull");
+    CHECK(st[1].sampling == st[0].sampling - 1 && st[1].gyro[2] < st[0].gyro[2] + 1e-6f, "the history holds the swing's earlier ticks");
+    CHECK(!h_hid_SixRest(&h), "a swinging sensor is not at rest");
+    uint8_t ring[64]; h_hid_ImuEnable(ring, sizeof ring);
+    TestImuSample m[1];
+    CHECK(h_hid_ImuSamples(m, 1, h) == 1 && fabsf(m[0].gyro[2] + 1500.f / 360 * 2 * (float)M_PI) < 1e-3f && fabsf(m[0].acc[1] + st[0].acc[1] * 9.80665f) < 1e-3f,
+          "the npad IMU sample of that tick: -rev/s x 2 pi rad/s, -G x 9.80665 m/s^2");
+    h_hid_ImuDisable();
+    dm_pad_players(3); uint32_t id2 = 1, h2; h_hid_SixHandles(&h2, 1, &id2, STYLE_FULLKEY);
+    CHECK(six_states(st, 1, h2) == 1 && st[0].gyro[2] == 0 && st[0].acc[2] == -1, "player 2's sensor does not swing");
+    dm_pad_players(1);
+    guest_now = 5000000000ull + (uint64_t)(swing_duration(1500) * 1e9) + SIX_PERIOD_NS;
+    CHECK(six_states(st, 1, h) == 1 && st[0].acc[2] == -1 && st[0].gyro[2] == 0 && st[0].dir[0] == 1 && h_hid_SixRest(&h), "after the swing: flat and at rest again");
+    g_nsteps = 0; g_steps = NULL; guest_now = 1000000000ull; g_phone_mode = -1;
+    pthread_mutex_lock(&g_swing_mu); g_swing_set = 0; pthread_mutex_unlock(&g_swing_mu);
+}
+
 // Six-axis sensor information the fusion's initialization reads (sdk+0x6d7e28): 0xc8 bytes (sdk+0x6d7e58 copies them), gyro half then acceleration half
 static void t_six_ic_info(void) {
     uint8_t ic[0xd0]; memset(ic, 0xAB, sizeof ic); uint32_t h = 0;
@@ -813,6 +848,7 @@ int main(void) {
     t_motion_live();
     t_motion_hid();
     t_npad_imu_samples();
+    t_swing();
     t_six_ic_info();
     t_rec();
     {   // Nmouse with no device (SDK 21's forms): the pointer range is kept, the merged handle 0 takes settings, the standard mouse and the handle queries report nothing
