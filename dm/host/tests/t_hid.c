@@ -1067,6 +1067,27 @@ static void t_live_rest(void) {
     guest_now = motion_now = 1000000000ull; g_phone_mode = -1;
 }
 
+// A single Joy-Con the game is shown as a pair (Switch Sports Resort supports Handheld | JoyDual): both pair handles read that Joy-Con's own stream (upright, a pair's frame), not
+// the merged pad stream (a sideways Joy-Con's frame); shown as full key it reads the merged stream; a right Joy-Con split as JoyRight reads its own
+static void t_single_joy_as_pair(void) {
+    g_mode = 1; dm_pad_players(1); g_phone_mode = 0; hwm_clear(); setenv("DM_IMU_NOISE", "0", 1); imu_env_read();
+    uint64_t t = 400000000000ull; motion_now = guest_now = t;
+    uint8_t ring[64]; h_hid_ImuEnable(ring, sizeof ring);
+    dm_joy_attach(0, 2);   // the right Joy-Con alone
+    float a[3] = {0, 0, -1}, side[3] = {0.5f, 0, 0}, own[3] = {0, 0.7f, 0};
+    dm_motion_set_hid(0, a, side, t); dm_motion_set_joy(0, 1, a, own, t);
+    TestImuSample q[1];
+    h_hid_SetStyles(STYLE_HANDHELD | STYLE_JOYDUAL);
+    CHECK(h_hid_ImuSamples(q, 1, 0x5) == 1 && fabsf(q[0].gyro[1] + 0.7f) < 1e-4f && fabsf(q[0].gyro[0]) < 1e-4f, "single Joy-Con as a pair: device 0 reads the Joy-Con's own stream");
+    CHECK(h_hid_ImuSamples(q, 1, 0x10005) == 1 && fabsf(q[0].gyro[1] + 0.7f) < 1e-4f, "and device 1 too");
+    h_hid_SetStyles(STYLE_FULLKEY);
+    CHECK(h_hid_ImuSamples(q, 1, 0x20003) == 1 && fabsf(q[0].gyro[0] + 0.5f) < 1e-4f, "shown as full key: the merged stream (a sideways Joy-Con)");
+    h_hid_SetStyles(STYLE_FULLKEY | STYLE_JOYDUAL | STYLE_JOYLEFT | STYLE_JOYRIGHT);
+    CHECK(h_hid_GetStyle(&(uint32_t){0}) == STYLE_JOYRIGHT && h_hid_ImuSamples(q, 1, 0x10007) == 1 && fabsf(q[0].gyro[1] + 0.7f) < 1e-4f, "a game with JoyRight: its own stream, as before");
+    dm_motion_clear_joy(0, 1); dm_motion_clear_hid(0); dm_joy_attach(0, 0); h_hid_SetStyles(0xffffffffu);
+    unsetenv("DM_IMU_NOISE"); imu_env_read(); h_hid_ImuDisable(); guest_now = motion_now = 1000000000ull; g_phone_mode = -1;
+}
+
 // Six-axis sensor information the fusion's initialization reads (sdk+0x6d7e28): 0xc8 bytes (sdk+0x6d7e58 copies them), gyro half then acceleration half
 static void t_six_ic_info(void) {
     uint8_t ic[0xd0]; memset(ic, 0xAB, sizeof ic); uint32_t h = 0;
@@ -1187,6 +1208,7 @@ int main(void) {
     t_live_ring();
     t_live_edges();
     t_live_rest();
+    t_single_joy_as_pair();
     t_six_ic_info();
     t_rec();
     {   // Nmouse with no device (SDK 21's forms): the pointer range is kept, the merged handle 0 takes settings, the standard mouse and the handle queries report nothing

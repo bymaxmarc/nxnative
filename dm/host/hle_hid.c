@@ -786,8 +786,9 @@ static int imu_log_every(void) {
 }
 static int imu_log_due(_Atomic uint64_t *count) { int n = imu_log_every(); return n > 0 && atomic_fetch_add(count, 1) % (uint64_t)n == 0; }
 static void motion_set_to(live_motion *m, int p, const float acc[3], const float rot[3], int source, uint64_t sample_ns) {
-    static _Atomic uint64_t raw_count[4];
-    if (imu_log_due(&raw_count[source & 3]))
+    static _Atomic uint64_t raw_count[5];   // per kind of stream: gc, phone, hid, joyL, joyR (a shared count logged every n-th of the HID and Joy-Con streams together, always one of them)
+    int kind = source == 2 ? (m == &g_joy_motion[p][0] ? 3 : m == &g_joy_motion[p][1] ? 4 : 2) : source & 1;
+    if (imu_log_due(&raw_count[kind]))
         LOG("imu raw %s p%d t=%.4f acc %+.4f %+.4f %+.4f G rot %+.4f %+.4f %+.4f rad/s", source == 1 ? "phone" : source == 2 ? (m == &g_joy_motion[p][0] ? "joyL" : m == &g_joy_motion[p][1] ? "joyR" : "hid") : "gc",
             p + 1, (double)(sample_ns ? sample_ns : now_ns()) / 1e9, acc[0], acc[1], acc[2], rot[0], rot[1], rot[2]);
     pthread_once(&g_motion_once, motion_env); if (g_motion_off) return;
@@ -980,11 +981,21 @@ static uint32_t six_style_index(uint32_t style) {
 // The motion behind a handle: a Joy-Con npad's own Joy-Con, else its player's controller. Fills src with that stream's history (live_ring_copy) and returns its count: 0 when no
 // live stream is fresh (the sensor lies flat). Also whether it shakes
 typedef struct { motion_sample r[LIVE_RING]; unsigned n; } live_hist;
+// The stream behind a handle. A Joy-Con npad reads its own Joy-Con. A whole controller reads its player's merged stream, except a single Joy-Con the game is shown as a pair
+// (pad_style: a game such as Nintendo Switch Sports Resort supports JoyDual but no single Joy-Con style): both of the pair's sensors then read that Joy-Con's own stream, in
+// the frame of a Joy-Con of a pair (upright), as the game takes a JoyDual sensor to be. The merged stream holds it in the frame of a Joy-Con held sideways, a quarter turn
+// away, and the right Joy-Con 2's session showed the pair's handles reading that
+static live_motion *six_stream(uint32_t h, npad_ref ref, int pl) {
+    if (ref.kind >= KIND_DUAL) return motion_joy_pick(ref.pad, ref.kind == KIND_LEFT ? 0 : ref.kind == KIND_RIGHT ? 1 : (int)(h >> 16 & 1), NULL);
+    uint32_t sides = pl >= 0 && pl < DM_PLAYERS && joy_active(pl) ? atomic_load(&g_joy_sides[pl]) : 0;
+    if ((sides == 1 || sides == 2) && kind_style(ref, h >> 8 & 0xff) == STYLE_JOYDUAL) return motion_joy_pick(pl, sides == 2, NULL);
+    return motion_pick(pl, NULL);
+}
 static unsigned six_source(uint32_t h, uint64_t from, live_hist *src, int *shakes) {   // from: the oldest tick's guest time the answer needs
     npad_ref ref = npad_resolve(h >> 8 & 0xff);
     int pl = ref.kind >= KIND_DUAL ? ref.pad : player_of(h >> 8 & 0xff);
     *shakes = pl == 0 && ref.kind < KIND_DUAL;
-    live_motion *m = ref.kind >= KIND_DUAL ? motion_joy_pick(ref.pad, ref.kind == KIND_LEFT ? 0 : ref.kind == KIND_RIGHT ? 1 : (int)(h >> 16 & 1), NULL) : motion_pick(pl, NULL);
+    live_motion *m = six_stream(h, ref, pl);
     src->n = 0;
     if (m) live_ring_copy(m, from, src->r, &src->n);
     return src->n;
@@ -994,7 +1005,7 @@ static unsigned six_source(uint32_t h, uint64_t from, live_hist *src, int *shake
 static int six_offset_known(uint32_t h) {
     npad_ref ref = npad_resolve(h >> 8 & 0xff);
     int pl = ref.kind >= KIND_DUAL ? ref.pad : player_of(h >> 8 & 0xff);
-    live_motion *m = ref.kind >= KIND_DUAL ? motion_joy_pick(ref.pad, ref.kind == KIND_LEFT ? 0 : ref.kind == KIND_RIGHT ? 1 : (int)(h >> 16 & 1), NULL) : motion_pick(pl, NULL);
+    live_motion *m = six_stream(h, ref, pl);
     if (!m || m < g_motion || m >= g_motion + DM_PLAYERS) return 1;
     pthread_mutex_lock(&m->mu); int have = m->rest.have; pthread_mutex_unlock(&m->mu);
     return have;
