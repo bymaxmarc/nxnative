@@ -812,6 +812,17 @@ static void t_imu_noise(void) {
     setenv("DM_IMU_NOISE", "0,0.2", 1); imu_env_reread();
     CHECK(h_hid_ImuSamples(s, 1, h[0]) == 1 && s[0].gyro[0] == 0 && s[0].acc[2] != 9.80665f && fabsf(s[0].acc[2] - 9.80665f) < 0.02f, "imu noise: acceleration only");
     unsetenv("DM_IMU_NOISE"); imu_env_read();
+    {   // DM_IMU_LOG=<n>: every n-th raw sample and IMU answer is logged (read once); unset or 0: none
+        _Atomic uint64_t c = 0;
+        atomic_store(&g_imu_log, -1); unsetenv("DM_IMU_LOG");
+        CHECK(!imu_log_due(&c) && !imu_log_due(&c), "imu log: off by default");
+        atomic_store(&g_imu_log, -1); setenv("DM_IMU_LOG", "3", 1); c = 0;
+        int due[6]; for (int i = 0; i < 6; i++) due[i] = imu_log_due(&c);
+        CHECK(due[0] && !due[1] && !due[2] && due[3] && !due[4] && !due[5], "imu log: every third");
+        TestImuSample q[2]; CHECK(h_hid_ImuSamples(q, 2, h[0]) == 2, "imu log: answers unchanged while logging");
+        float a1[3] = {0, 0, -1}, r1[3] = {0}; dm_motion_set(0, a1, r1); dm_motion_clear(0);
+        atomic_store(&g_imu_log, -1); unsetenv("DM_IMU_LOG");
+    }
     h_hid_ImuDisable(); guest_now = 1000000000ull; g_phone_mode = -1;
 }
 

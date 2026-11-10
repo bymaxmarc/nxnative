@@ -779,7 +779,21 @@ static void motion_set(int p, const float acc[3], const float rot[3], int source
     if (p < 0 || p >= DM_PLAYERS || (source == 1 && p)) return;
     motion_set_to(source == 1 ? &g_phone_motion : source == 2 ? &g_hid_motion[p] : &g_motion[p], p, acc, rot, source, sample_ns);
 }
+// DM_IMU_LOG=<n> (diagnostic, for checking a real controller against the host's synthetic samples): every n-th raw motion sample as the host receives it, per stream (the source,
+// player, the sample's host time, acceleration in G and rotation in rad/s as the front end gave them, before any axis map), and every n-th GetNpadImuSamples answer (the handle,
+// how many, their sampling numbers, the newest one's values in the units the game gets: m/s^2 and rad/s, and whether live motion drove it). One line each
+static _Atomic int g_imu_log = -1;   // -1 unread, 0 off, else n
+static int imu_log_every(void) {
+    int n = atomic_load(&g_imu_log);
+    if (n < 0) { const char *e = getenv("DM_IMU_LOG"); n = e ? atoi(e) : 0; if (n < 0) n = 0; atomic_store(&g_imu_log, n); }
+    return n;
+}
+static int imu_log_due(_Atomic uint64_t *count) { int n = imu_log_every(); return n > 0 && atomic_fetch_add(count, 1) % (uint64_t)n == 0; }
 static void motion_set_to(live_motion *m, int p, const float acc[3], const float rot[3], int source, uint64_t sample_ns) {
+    static _Atomic uint64_t raw_count[4];
+    if (imu_log_due(&raw_count[source & 3]))
+        LOG("imu raw %s p%d t=%.4f acc %+.4f %+.4f %+.4f G rot %+.4f %+.4f %+.4f rad/s", source == 1 ? "phone" : source == 2 ? (m == &g_joy_motion[p][0] ? "joyL" : m == &g_joy_motion[p][1] ? "joyR" : "hid") : "gc",
+            p + 1, (double)(sample_ns ? sample_ns : now_ns()) / 1e9, acc[0], acc[1], acc[2], rot[0], rot[1], rot[2]);
     pthread_once(&g_motion_once, motion_env); if (g_motion_off) return;
     static motion_map identity = {{0, 1, 2}, {1, 1, 1}, 1, 1};
     // Each transport owns its orientation. HID batches carry three sample times; arrival time controls freshness, never their integration intervals.
@@ -1119,6 +1133,10 @@ HLE_FORCE("_ZN2nn3hid17GetNpadImuSamplesEPNS0_13NpadImuSampleEiNS0_13NpadImuHand
     if (k > now + 1) k = now + 1;   // no tick before the guest clock's start
     NpadImuSample *o = out;
     for (int64_t i = 0; i < k; i++) imu_sample(&o[i], now - k + 1 + i, live, &ms, shakes, imu_handle >> 8 & 0xffff);
+    static _Atomic uint64_t out_count;
+    if (k > 0 && imu_log_due(&out_count))
+        LOG("imu out h=%#x k=%lld s=%lld..%lld acc %+.4f %+.4f %+.4f m/s2 gyro %+.4f %+.4f %+.4f rad/s %s", imu_handle, (long long)k, (long long)o[0].sampling, (long long)o[k - 1].sampling,
+            o[k - 1].acc[0], o[k - 1].acc[1], o[k - 1].acc[2], o[k - 1].gyro[0], o[k - 1].gyro[1], o[k - 1].gyro[2], live ? "live" : "synthetic");
     return (int)k;
 }
 // The fusion's initialization (sdk+0x6d7db0) asks GetSixAxisSensorIcInformation through the hid service (IHidServer +0x178, sdk+0x6c3768), which the host does not serve: on a failure it
