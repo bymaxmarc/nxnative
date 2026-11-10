@@ -1034,11 +1034,21 @@ static void t_live_rest(void) {
     unsigned before = g_motion[0].count; dm_motion_set(0, z, z); CHECK(g_motion[0].count == before && !motion_live(0, &(motion_state){0}), "session: an all-zero sample is dropped");
     uint8_t cal[0x744]; uint32_t h = 0x3; memset(cal, 0xAB, sizeof cal);
     dm_motion_set(0, a, off);
-    CHECK(h_hid_SixCalLoad(cal, &h) == RES_SIX_CAL_NONE && cal[0] == 0xAB, "session: a GameController with its offset not learned: no stored calibration");
-    for (int i = 0; i < 80; i++) { motion_now = guest_now = (t += 15000000); dm_motion_set(0, a, off); }
-    CHECK(g_motion[0].rest.have, "session: the GameController's offset learned at rest");
+    CHECK(h_hid_SixCalLoad(cal, &h) == RES_SIX_CAL_NONE && cal[0] == 0 && cal[0x743] == 0, "session: a GameController with its offset not learned: no stored calibration (the buffer zeroed)");
+    for (int i = 0; i < 150; i++) { motion_now = guest_now = (t += 15000000); dm_motion_set(0, a, off); }
+    CHECK(g_motion[0].rest.have, "session: the GameController's offset learned at rest (two agreeing seconds)");
+    for (int i = 0; i < 60; i++) { motion_now = guest_now = (t += 15000000); dm_motion_set(0, a, off); }   // past the ramp
     SixAxisState st; CHECK(six_states(&st, 1, h) == 1 && fabsf(st.gyro[0]) < 1e-4f && fabsf(st.gyro[2]) < 1e-4f, "session: and taken off its six-axis state");
-    CHECK(h_hid_SixCalLoad(cal, &h) == 0 && cal[0] == 0, "session: then a zero bias");
+    // a gap of 150 ms breaks the rest window; a stale stream forgets the offset
+    unsigned n_before = g_motion[0].rest.n; motion_now = guest_now = (t += 150000000); dm_motion_set(0, a, off);
+    CHECK(g_motion[0].rest.n <= 1 && n_before >= 1 && g_motion[0].rest.have, "session: a gap starts the rest window again, the offset kept");
+    motion_now = guest_now = (t += MOTION_STALE_NS + 1); dm_motion_set(0, a, off);
+    CHECK(!g_motion[0].rest.have, "session: a stale stream forgets the offset");
+    for (int i = 0; i < 150; i++) { motion_now = guest_now = (t += 15000000); dm_motion_set(0, a, off); }
+    memset(cal, 0xAB, sizeof cal); CHECK(h_hid_SixCalLoad(cal, &h) == 0 && cal[0] == 0 && cal[0x743] == 0, "session: then a zero bias");
+    // a later all-zero sample on a fresh stream is a reading (a free fall), kept
+    unsigned c0 = g_motion[0].count; motion_now = guest_now = (t += 15000000); dm_motion_set(0, z, z);
+    CHECK(g_motion[0].count == c0 + 1 || g_motion[0].count == LIVE_RING, "session: zeros on a live stream are kept (free fall)");
     dm_motion_clear(0);
     CHECK(!g_motion[0].rest.have, "session: a controller leaving forgets the offset (another may take the player)");
     dm_motion_set_hid(0, a, off, t); CHECK(h_hid_SixCalLoad(cal, &h) == 0, "session: a HID stream (its front end takes the offset off): zero bias");

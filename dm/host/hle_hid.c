@@ -749,6 +749,7 @@ static int shaking(uint64_t t) { return t >= atomic_load(&g_shake_t0) && t < ato
 // sample, so the fusion saw a staircase of repeated samples. DM_MOTION=0 ignores live motion; DM_MOTION_AXES / DM_MOTION_ACC_SIGN map Apple's axes (motion_fusion.h);
 // DM_MOTION_GAIN sets the tilt correction (default 0.5); DM_MOTION_LOG=1 logs player 1's mapped sample once a second, for checking the axes
 enum { MOTION_STALE_NS = 300000000 };
+#define MOTION_REST_GAP_NS 100000000ull   // motion_set_to: samples more than 100 ms apart break the rest window
 // LIVE_RING samples cover 128 ms at 1 kHz and 1.28 s at 100 Hz, more than the 16 ticks (80 ms) an IMU answer reaches back at any source rate the host sees; 80 bytes each,
 // about 340 KB for every stream of every player
 enum { LIVE_RING = 128 };
@@ -790,19 +791,24 @@ static void motion_set_to(live_motion *m, int p, const float acc[3], const float
         LOG("imu raw %s p%d t=%.4f acc %+.4f %+.4f %+.4f G rot %+.4f %+.4f %+.4f rad/s", source == 1 ? "phone" : source == 2 ? (m == &g_joy_motion[p][0] ? "joyL" : m == &g_joy_motion[p][1] ? "joyR" : "hid") : "gc",
             p + 1, (double)(sample_ns ? sample_ns : now_ns()) / 1e9, acc[0], acc[1], acc[2], rot[0], rot[1], rot[2]);
     pthread_once(&g_motion_once, motion_env); if (g_motion_off) return;
-    // A sample of all zeros is no reading (a sensor at rest still reads 1 G): a Joy-Con 2's first report carries one, which put a 0 G sample into the history
-    if (!acc[0] && !acc[1] && !acc[2] && !rot[0] && !rot[1] && !rot[2]) return;
+    // A stream's first sample of all zeros is no reading yet (a sensor at rest reads 1 G): a Joy-Con 2's first report carries one, which put a 0 G sample into the history. Later
+    // zeros can be a real free fall (motion_apple.h), so only a stream with nothing fresh drops them
+    if (!acc[0] && !acc[1] && !acc[2] && !rot[0] && !rot[1] && !rot[2]) {
+        pthread_mutex_lock(&m->mu); int fresh = m->last_ns && now_ns() - m->received_ns <= MOTION_STALE_NS; pthread_mutex_unlock(&m->mu);
+        if (!fresh) return;
+    }
     static motion_map identity = {{0, 1, 2}, {1, 1, 1}, 1, 1};
     // Each transport owns its orientation. HID batches carry three sample times; arrival time controls freshness, never their integration intervals.
     uint64_t now = now_ns(), t = sample_ns ? sample_ns : now;
     if (!t || t > now || now - t > MOTION_STALE_NS) return;
     pthread_mutex_lock(&m->mu);
-    if (!m->last_ns || now - m->received_ns > MOTION_STALE_NS) { motion_reset(&m->st); m->last_ns = 0; m->count = 0; }
+    if (!m->last_ns || now - m->received_ns > MOTION_STALE_NS) { motion_reset(&m->st); m->last_ns = 0; m->count = 0; if (m->received_ns) motion_rest_reset(&m->rest); }   // stale: forget the offset too
+    else if (t - m->last_ns > MOTION_REST_GAP_NS) motion_rest_break(&m->rest);   // a gap: the rest window starts again
     if (m->last_ns && t <= m->last_ns) { pthread_mutex_unlock(&m->mu); return; }
     float dt = m->last_ns && t > m->last_ns ? (float)((double)(t - m->last_ns) / 1e9) : 0;
     // GameController reports the gyro with its rest offset (a DualSense: 0.34, 0.20, -0.66 deg/s): the host learns it while the controller rests and takes it off (motion_rest),
     // as the Joy-Con 2 front end does for its own (s2_rest); the HID and phone sources come corrected
-    float rc[3]; if (!source) { motion_rest_update(&m->rest, acc, rot, (double)t / 1e9); motion_rest_apply(&m->rest, rot, rc); rot = rc; }
+    float rc[3]; if (!source) { motion_rest_update(&m->rest, acc, rot, (double)t / 1e9); motion_rest_apply(&m->rest, rot, (double)t / 1e9, rc); rot = rc; }
     motion_update(&m->st, source ? &identity : &g_motion_map, acc, rot, dt, g_motion_gain);
     if (g_motion_log && !p && t - m->logged > 1000000000ull) {
         m->logged = t;
@@ -828,7 +834,7 @@ void dm_motion_clear_joy(int p, int side) {
 }
 void dm_motion_clear(int p) {
     if (p < 0 || p >= DM_PLAYERS) return;
-    pthread_mutex_lock(&g_motion[p].mu); g_motion[p].last_ns = 0; g_motion[p].rest.have = 0; g_motion[p].rest.n = 0; pthread_mutex_unlock(&g_motion[p].mu);   // another controller may take the player
+    pthread_mutex_lock(&g_motion[p].mu); g_motion[p].last_ns = 0; motion_rest_reset(&g_motion[p].rest); pthread_mutex_unlock(&g_motion[p].mu);   // another controller may take the player
 }
 void dm_motion_clear_hid(int p) {
     if (p < 0 || p >= DM_PLAYERS) return;
@@ -1278,11 +1284,13 @@ HLE_FORCE("_ZN2nn3hid37LoadSixAxisSensorCalibrationParameterEPNS0_33SixAxisSenso
     int slot, dev; Result r = six_handle_slot("LoadSixAxisSensorCalibrationParameter", *h, &slot, &dev);
     if (r != RES_OK) return r;
     int known = six_offset_known(*h);
+    memset(out, 0, SIX_CAL_SIZE);   // written whatever the answer; the SDK's only caller (fusion init, sdk+0x6d7f64) tests the Result for 0 and reads nothing on a failure
     pthread_mutex_lock(&g_six_cal_mu);
     dev = six_cal_dev(dev);
     if (g_six_cal_have[slot][dev]) memcpy(out, g_six_cal[slot][dev], SIX_CAL_SIZE);
-    else if (known) memset(out, 0, SIX_CAL_SIZE);   // nothing stored: a sensor whose offset is taken off reads with zero bias
-    else r = RES_SIX_CAL_NONE;   // a GameController whose rest offset is not known yet: the fusion has to learn it (Switch Sports Resort then asks to calibrate)
+    else if (known) {}   // nothing stored: a sensor whose offset is taken off reads with zero bias (the zeros above)
+    else r = RES_SIX_CAL_NONE;   // a GameController whose rest offset is not known yet: the fusion has to learn it (Switch Sports Resort then asks to calibrate). The host
+    // answered this Result for every device before (Switch Sports Resort ran with it); the fusion's init only takes the bias on 0 (sdk+0x6d7f68: cset eq, cbnz skips it)
     pthread_mutex_unlock(&g_six_cal_mu);
     return r;
 }
