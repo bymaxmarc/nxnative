@@ -1024,6 +1024,39 @@ static void t_live_edges(void) {
     guest_now = 1000000000ull; motion_now = 1000000000ull; g_phone_mode = -1;
 }
 
+// What the real-controller session showed (Joy-Con 2 pair, DualSense): a first all-zero sample is no reading; a GameController's gyro offset is learned at rest and taken off;
+// LoadSixAxisSensorCalibrationParameter claims a zero bias only for a sensor whose offset is taken off
+static void t_live_rest(void) {
+    g_mode = 1; dm_pad_players(1); g_phone_mode = 0; hwm_clear();
+    uint64_t t = 300000000000ull; motion_now = guest_now = t;
+    dm_motion_clear(0); dm_motion_clear_hid(0);
+    float z[3] = {0, 0, 0}, a[3] = {0, 0, -1}, off[3] = {0.006f, 0.0035f, -0.0115f};
+    unsigned before = g_motion[0].count; dm_motion_set(0, z, z); CHECK(g_motion[0].count == before && !motion_live(0, &(motion_state){0}), "session: an all-zero sample is dropped");
+    uint8_t cal[0x744]; uint32_t h = 0x3; memset(cal, 0xAB, sizeof cal);
+    dm_motion_set(0, a, off);
+    CHECK(h_hid_SixCalLoad(cal, &h) == RES_SIX_CAL_NONE && cal[0] == 0xAB, "session: a GameController with its offset not learned: no stored calibration");
+    for (int i = 0; i < 80; i++) { motion_now = guest_now = (t += 15000000); dm_motion_set(0, a, off); }
+    CHECK(g_motion[0].rest.have, "session: the GameController's offset learned at rest");
+    SixAxisState st; CHECK(six_states(&st, 1, h) == 1 && fabsf(st.gyro[0]) < 1e-4f && fabsf(st.gyro[2]) < 1e-4f, "session: and taken off its six-axis state");
+    CHECK(h_hid_SixCalLoad(cal, &h) == 0 && cal[0] == 0, "session: then a zero bias");
+    dm_motion_clear(0);
+    CHECK(!g_motion[0].rest.have, "session: a controller leaving forgets the offset (another may take the player)");
+    dm_motion_set_hid(0, a, off, t); CHECK(h_hid_SixCalLoad(cal, &h) == 0, "session: a HID stream (its front end takes the offset off): zero bias");
+    dm_motion_clear_hid(0); CHECK(h_hid_SixCalLoad(cal, &h) == 0, "session: no live source: zero bias");
+    {   // DM_IMU_AXES: the IMU samples' axes permuted, rotation times the map's determinant
+        setenv("DM_IMU_NOISE", "0", 1); setenv("DM_IMU_AXES", "y,-x,z", 1); imu_env_read();
+        float tilt[3] = {0.5f, 0, -0.8660254f}, turn[3] = {0, 0, 3.14159265f}; uint8_t ring[64]; h_hid_ImuEnable(ring, sizeof ring);
+        motion_now = guest_now = (t += 5000000); dm_motion_set_hid(0, tilt, turn, t);
+        TestImuSample q[1];
+        CHECK(h_hid_ImuSamples(q, 1, 0x20003) == 1 && fabsf(q[0].acc[1] - 0.5f * 9.80665f) < 1e-3f && fabsf(q[0].acc[0]) < 1e-3f && fabsf(q[0].gyro[2] + 3.14159265f) < 1e-3f,
+              "imu axes: y,-x,z puts -x on y (+4.9 m/s2 there) and keeps the turn about z");
+        setenv("DM_IMU_AXES", "y,x,z", 1); imu_env_read();
+        CHECK(h_hid_ImuSamples(q, 1, 0x20003) == 1 && fabsf(q[0].gyro[2] - 3.14159265f) < 1e-3f, "imu axes: a mirror (y,x,z) turns the rotation's sign, so it stays a proper rotation");
+        unsetenv("DM_IMU_AXES"); unsetenv("DM_IMU_NOISE"); imu_env_read(); h_hid_ImuDisable(); dm_motion_clear_hid(0);
+    }
+    guest_now = motion_now = 1000000000ull; g_phone_mode = -1;
+}
+
 // Six-axis sensor information the fusion's initialization reads (sdk+0x6d7e28): 0xc8 bytes (sdk+0x6d7e58 copies them), gyro half then acceleration half
 static void t_six_ic_info(void) {
     uint8_t ic[0xd0]; memset(ic, 0xAB, sizeof ic); uint32_t h = 0;
@@ -1143,6 +1176,7 @@ int main(void) {
     t_imu_sdk_handles();
     t_live_ring();
     t_live_edges();
+    t_live_rest();
     t_six_ic_info();
     t_rec();
     {   // Nmouse with no device (SDK 21's forms): the pointer range is kept, the merged handle 0 takes settings, the standard mouse and the handle queries report nothing

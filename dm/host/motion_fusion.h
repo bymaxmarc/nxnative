@@ -134,3 +134,30 @@ static inline void motion_phone_to_switch(int orient, const float in[3], float o
     default: out[0] = in[0]; out[1] = in[1]; out[2] = in[2]; break;
     }
 }
+// Gyro rest offset of a controller the host receives raw rotation from (GameController: a DualSense at rest read 0.34, 0.20, -0.66 deg/s in Nintendo Switch Sports Resort's
+// session): about MOTION_REST_S of samples in which the gyro varies by under MOTION_REST_GYRO_SPAN rad/s and the acceleration by under MOTION_REST_ACC_SPAN G per axis is a
+// controller lying or held still; their mean rotation is its offset (kept when under MOTION_REST_MAX rad/s, averaged with the last one), which motion_rest_apply subtracts.
+// As the Joy-Con 2 front end's s2_rest (switch2_proto.h), in the units dm_motion_set takes (G, rad/s), timed by the samples' own clock
+#define MOTION_REST_S 1.0
+#define MOTION_REST_GYRO_SPAN 0.03f   // rad/s (1.7 deg/s)
+#define MOTION_REST_ACC_SPAN 0.02f    // G
+#define MOTION_REST_MAX 0.0873f       // rad/s (5 deg/s)
+typedef struct { int have; double t0, sum[3]; unsigned n; float bias[3], gmin[3], gmax[3], amin[3], amax[3]; } motion_rest;
+static inline void motion_rest_update(motion_rest *r, const float acc[3], const float rot[3], double t) {
+    for (int i = 0; i < 3; i++) if (!isfinite(acc[i]) || !isfinite(rot[i])) { r->n = 0; return; }
+    if (!r->n) { r->t0 = t; for (int i = 0; i < 3; i++) { r->sum[i] = 0; r->gmin[i] = r->gmax[i] = rot[i]; r->amin[i] = r->amax[i] = acc[i]; } }
+    for (int i = 0; i < 3; i++) {
+        r->sum[i] += rot[i];
+        if (rot[i] < r->gmin[i]) r->gmin[i] = rot[i]; if (rot[i] > r->gmax[i]) r->gmax[i] = rot[i];
+        if (acc[i] < r->amin[i]) r->amin[i] = acc[i]; if (acc[i] > r->amax[i]) r->amax[i] = acc[i];
+        if (r->gmax[i] - r->gmin[i] > MOTION_REST_GYRO_SPAN || r->amax[i] - r->amin[i] > MOTION_REST_ACC_SPAN) { r->n = 0; return; }   // moving: start again
+    }
+    r->n++;
+    if (t - r->t0 < MOTION_REST_S || r->n < 10) return;
+    float m[3]; for (int i = 0; i < 3; i++) m[i] = (float)(r->sum[i] / r->n);
+    r->n = 0;
+    for (int i = 0; i < 3; i++) if (fabsf(m[i]) > MOTION_REST_MAX) return;
+    for (int i = 0; i < 3; i++) r->bias[i] = r->have ? 0.5f * r->bias[i] + 0.5f * m[i] : m[i];
+    r->have = 1;
+}
+static inline void motion_rest_apply(const motion_rest *r, const float rot[3], float out[3]) { for (int i = 0; i < 3; i++) out[i] = rot[i] - (r->have ? r->bias[i] : 0); }
