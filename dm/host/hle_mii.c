@@ -96,7 +96,7 @@ HLE_FORCE("_ZN2nn3mii8Database6ImportEPKvm", "mii:u service; importing needs the
 HLE_FORCE("_ZNK2nn3mii8Database6ExportEPvm", "mii:u service; nothing to export", Result, h_mii_Export, const void *self, void *p, size_t n) {
     (void)self; (void)p; (void)n; LOG("[RED] mii: Database::Export refused"); return MII_RES_TEST_MODE;
 }
-// MiiModel system data (0100000000000802) stand-in. The Mii rendering code an application links (Mario Kart 8 Deluxe 4.0.0: main+0x8f1400..+0x8fc000) reads one texture file
+// MiiModel system data (0100000000000802) stand-in, also the Switch 2's MiiResource (0400000000000849, below). The Mii rendering code an application links (Mario Kart 8 Deluxe 4.0.0: main+0x8f1400..+0x8fc000) reads one texture file
 // (NXTexture{Low,Mid}{Linear,SRGB}.dat) and one shape file (Shape{Mid,High}.dat) whole and builds each part of a head from them; the firmware's files are not the host's to ship, so it writes
 // files of the same layout in which every part is absent:
 //   texture file: +0x0c u32 largest decompressed size of each of the 11 part kinds, +0x38 their alignments, then from +0x64 one 0x1c-byte entry per part (u32 offset, u32 size, u32 stored size,
@@ -134,19 +134,26 @@ static int mii_write(const char *dir, const char *name, int parts, size_t size) 
     if (!ok) LOG("[RED] mii: cannot write the MiiModel stand-in %s", p);
     return ok;
 }
-int dm_mii_standin(const char *dir) {   // written once per process (the query and the mount both ask), so a host with another layout never leaves old files behind
-    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; static int done;
+// Written once per directory and process (the query and the mount both ask), so a host with another layout never leaves old files behind. One stand-in serves both archives:
+// the Switch's MiiModel (0100000000000802) and the Switch 2's MiiResource (0400000000000849), whose files have the same layout (Nintendo Switch Sports Resort's accessors,
+// main+0x1cdcd80..+0x1cdd0c4: 11 texture part kinds from +0x64 in 0x1c-byte entries, 12 shape kinds from +0x6c in 0x58-byte entries, hair transforms at +0x12704, faceline at
+// +0x14c24) and which adds the Switch 2's texture sets, OunceTexture{Low,Mid,High}{Linear,SRGB}.dat; the NX files are written into both, and a game reads only those it names
+enum { MII_DIRS = 4 };
+int dm_mii_standin(const char *dir) {
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; static char done_dir[MII_DIRS][1024]; static int done[MII_DIRS], ndone;
     pthread_mutex_lock(&mu);
-    if (done) { pthread_mutex_unlock(&mu); return done > 0; }
+    for (int i = 0; i < ndone; i++) if (!strcmp(done_dir[i], dir)) { int r = done[i] > 0; pthread_mutex_unlock(&mu); return r; }
     char p[1024]; strlcpy(p, dir, sizeof p);
     for (char *s = p + 1; *s; s++) if (*s == '/') { *s = 0; mkdir(p, 0755); *s = '/'; }
     mkdir(p, 0755);
-    static const char *tex[] = {"NXTextureLowLinear.dat", "NXTextureLowSRGB.dat", "NXTextureMidLinear.dat", "NXTextureMidSRGB.dat"}, *shape[] = {"ShapeMid.dat", "ShapeHigh.dat"};
+    static const char *tex[] = {"NXTextureLowLinear.dat", "NXTextureLowSRGB.dat", "NXTextureMidLinear.dat", "NXTextureMidSRGB.dat",
+                                "OunceTextureLowLinear.dat", "OunceTextureLowSRGB.dat", "OunceTextureMidLinear.dat", "OunceTextureMidSRGB.dat", "OunceTextureHighLinear.dat", "OunceTextureHighSRGB.dat"},
+                      *shape[] = {"ShapeMid.dat", "ShapeHigh.dat"};
     int ok = 1;
-    for (int i = 0; i < 4; i++) ok &= mii_write(dir, tex[i], 11, MII_TEX_SIZE);
-    for (int i = 0; i < 2; i++) ok &= mii_write(dir, shape[i], 12, MII_SHAPE_SIZE);
-    LOG("mii: MiiModel system data is the host's stand-in (no textures, every shape one degenerate triangle: Mii heads draw nothing) in %s", dir);
-    done = ok ? 1 : -1;
+    for (size_t i = 0; i < sizeof tex / sizeof *tex; i++) ok &= mii_write(dir, tex[i], 11, MII_TEX_SIZE);
+    for (size_t i = 0; i < sizeof shape / sizeof *shape; i++) ok &= mii_write(dir, shape[i], 12, MII_SHAPE_SIZE);
+    LOG("mii: Mii model system data is the host's stand-in (no textures, every shape one degenerate triangle: Mii heads draw nothing) in %s", dir);
+    if (ndone < MII_DIRS) { strlcpy(done_dir[ndone], dir, sizeof done_dir[ndone]); done[ndone++] = ok ? 1 : -1; }
     pthread_mutex_unlock(&mu);
     return ok;
 }
