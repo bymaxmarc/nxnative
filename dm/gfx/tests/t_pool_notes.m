@@ -217,6 +217,15 @@ int main(void) { @autoreleasepool {
           "no table is built and no ID went down the slow path: the takeover's note names no ID");
     same_as_whole(b18, "the patched table holds what a table built whole does (a finalized twin's base taken over)");
 
+    // More registrations than the ring of notes holds since the table was made: the table is built whole, and the log line's split of "too many" names the registrations
+    table();
+    builds = g_stat_pool_builds; uint64_t many_reg = g_stat_pool_many[0], many_ser = g_stat_pool_many[1], many_ids = g_stat_pool_many[3];
+    for (int i = 0; i <= REG_LOG; i++) mtl_reg_tex(5, (const tex_t *)(i & 1 ? &t5 : &t9), NULL);   // a registration that repeats the ID's texture changes nothing, so alternate two
+    id<MTLBuffer> b19 = table();
+    CHECK(g_stat_pool_builds == builds + 1 && g_stat_pool_many[0] == many_reg + 1, "registrations past the log build the table whole, counted as such");
+    CHECK(g_stat_pool_many[1] == many_ser && g_stat_pool_many[3] == many_ids, "and not as storage changes past their log or IDs past the patch's limit");
+    CHECK(entry(b19, 5) != dummy_of(b19), "ID 5 still holds its texture");
+
     mtl_reg_tex(1, NULL, NULL); mtl_reg_tex(2, NULL, NULL); mtl_reg_tex(5, NULL, NULL); mtl_reg_tex(6, NULL, NULL); mtl_reg_tex(7, NULL, NULL); mtl_reg_tex(9, NULL, NULL);
     mtl_tex_release(&t2); h_nvnTextureFinalize(&t1); h_nvnTextureFinalize(&t5); h_nvnTextureFinalize(&t9); h_nvnTextureFinalize(&t10);
     h_nvnMemoryPoolFinalize((NVNmemoryPool *)&dpool); h_nvnMemoryPoolFinalize((NVNmemoryPool *)&epool);
