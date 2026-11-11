@@ -14,15 +14,16 @@ ROOT = Path(__file__).resolve().parents[3]
 TOOLS = ROOT / 'dm/gfx/tools'
 sys.path.insert(0, str(TOOLS))
 sys.path.insert(0, str(ROOT / 'dm/ios/tools'))
+import dmsh_chain  # noqa: E402
 import dmsh_rewrite  # noqa: E402
 import ios_metal  # noqa: E402
 
 WORD = '(*spvDescriptorSet0.fp_c5)._m0[16]'
 
 
-def mac_metal():   # dmsh_build.py's MAC_METAL, read without running the script
+def mac_metal():   # dmsh_build.py's MAC_METAL, read without running the script (dmsh_build.py runs a build when imported)
     for n in ast.parse((TOOLS / 'dmsh_build.py').read_text()).body:
-        if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'MAC_METAL' for t in n.targets): return ast.literal_eval(n.value)
+        if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'MAC_METAL' for t in n.targets): return eval(compile(ast.Expression(n.value), 'dmsh_build.py', 'eval'), {'dmsh_chain': dmsh_chain})   # its flags name dmsh_chain.MAC_MIN_FLAG
     raise AssertionError('no MAC_METAL in dmsh_build.py')
 
 

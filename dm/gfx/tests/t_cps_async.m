@@ -46,7 +46,7 @@ static prog_t *program(uint64_t serial, id<MTLLibrary> lib, NSString *name) {
     return pg;
 }
 static NvShader *shader_of(prog_t *pg) { NvProg *p = serial_get(pg->serial); return p->sh[5]; }
-static int job_done(prog_t *pg) { CpsJob *job = shader_of(pg)->cps_job; return !job || !dispatch_group_wait(job->done, DISPATCH_TIME_NOW); }
+static int job_done(prog_t *pg) { CpsJob *job = shader_of(pg)->cps_job[1]; return !job || !dispatch_group_wait(job->done, DISPATCH_TIME_NOW); }
 static uint32_t *g_mem;
 enum { OUT_WORDS = 64, THREADS = 4, WAIT_MS = 400 };
 // One submission: each program dispatched in turn, program i writing out[i * OUT_WORDS ...]; returns how long the replay took, without the GPU's time (ms)
@@ -142,7 +142,7 @@ int main(void) { @autoreleasepool {
     prog_t *bad = program(970006, lib, @"bad_k");
     submit((prog_t *[]){bad, fre}, 2);
     CHECK(wrote(0, 0) && wrote(1, 9), "failed: skipped, the next dispatch runs");
-    CHECK(shader_of(bad)->cps_failed == 1 && !shader_of(bad)->cps_job, "failed: marked, no build left");
+    CHECK(shader_of(bad)->cps_failed == 1 && !shader_of(bad)->cps_job[0] && !shader_of(bad)->cps_job[1], "failed: marked, no build left");
     submit((prog_t *[]){bad}, 1);
     CHECK(g_builds_bad == 1, "failed: not asked again");
 
