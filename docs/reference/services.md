@@ -590,6 +590,7 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Fix:** the host now recognizes gestures from the same touch points, by yuzu's rules plus an 8 px slop before a touch counts as moving (`hle_touch.c` `gesture_sample`, unit test `t_gesture`; only in handheld mode, as touches): Touch, Press after 0.5 s, Pan, Pinch / Rotate with two fingers, Cancel on a change in the finger count, then Tap (IsDoubleTap within 0.35 s), Swipe above 400 px/s or Complete, and Idle. For every game.
 - **Check:** every menu, the cards, the map's drag and flick worked by touch with it. `DM_TOUCH_LOG=1` logs each gesture entry, and a `DM_CTL` line `drag <x0> <y0> <x1> <y1> [seconds]` moves a finger for testing pans and swipes on the Mac.
 - **Found on:** [Taiko Risshiden V DX](../../dm/games/0100346017304000/README.md) (SDK 12.3.3, Koei Tecmo's KTGL).
+- **Two-argument `InitializeGesture`:** SDK 20.5.15 has an overload `nn::hid::InitializeGesture(int, int)`, whose SDK body opens the hid service and aborts in `sm::Initialize` (Result 0xe15) on the host; it is taken over as the other one is ([PRAGMATA](../../dm/games/0400C76024710000/README.md)).
 
 ### Touch sampling numbers across docked and handheld
 
@@ -1044,6 +1045,14 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Fix:** `hle_jit.c` takes over the API (`Initialize`, `CreateJitEnvironment`, `GenerateCode`, `Control`, `GetJitEnvironmentInfo`, `DestroyJitEnvironment`, `Finalize`). `CreateJitEnvironment` finds the plugin among the game's buffers by SHA-256 among the rewritten NROs (`nro_collect.py` collects it through the game's NRR), loads it alone (`loader.c` `nro_load_alone`: relocated against itself and left out of the game's symbol lookups), runs it as the service does (`_init`, `GetVersion`, `ResolveBasicSymbols` with the host's `memcpy` / `memmove` / `memset` and panic handlers, `SetupDiagnostics` off, `Configure`, `OnPrepared`) and gives it its configuration: the code memory (a `MAP_JIT` mapping on the Mac, one address for the plugin's writes and the game's calls), the data memory, and the work buffer's last part as its transfer memory, where it keeps its state. `GenerateCode` and `Control` run on the calling thread under one lock, with the data zero-padded to 32 bytes as the SDK sends it; `GenerateCode` opens the thread's JIT write window (`pthread_jit_write_protect_np`) and invalidates the instruction cache over the range returned. Layouts from SDK 9.5.1's `nn::jit` (`sdk+0x2e6610` ff.): code ranges are offsets in the code / data memory, the handle is the environment, `GetJitEnvironmentInfo` returns {code address, size, data address, size}. `DM_JIT_LOG=1` logs every request (
 - **Found on:** [Super Mario 3D All-Stars: Super Mario 64](../../dm/games/010049900F546001/README.md) : command 3 at boot turns 4,235 precompiled MIPS blocks into 14.2 MB of code in 27 ms; command 4 compiles a handful of blocks in play. Its code needs nothing from the rewriter (no x18, SVC, system register or PC-relative literal in 3.55 million instructions).
 
+
+### A JIT plugin loaded a second time crashed
+
+- **Symptom:** a second `nn::jit::CreateJitEnvironment` for the same plugin, after `DestroyJitEnvironment`, crashes with SIGSEGV in `nro_load_alone` (a `memcpy` from address 0) right after `NRO <name> loaded alone (load 2, …)`.
+- **Cause:** NRO data snapshots are lazy: `preload_nros` records only the length of an NRO's initialized data, and the first load copies it. `nro_load` did that copy, but `nro_load_alone` (the JIT plugin's load) did not, so its reload restored the data from a null pointer. Its reload also left the bss as the previous environment had left it, while the jit service loads the plugin fresh for each environment.
+- **Fix:** both loads start with `nro_reset_data` (`loader.c`): the first load snapshots the initialized data, and a reload restores it and zeroes the bss. Each load keeps its own symbol binding (linked into the game's lookups, or alone).
+- **Found on:** no game: a synthetic test found it, and no game has been seen to create a second environment. [Super Mario 3D All-Stars: Super Mario 64](../../dm/games/010049900F546001/README.md) is the one game that takes this path.
+- **Check:** `t_nro` loads a module alone, dirties its data, bss and relocation slots, and loads it alone again: the data and bss are as rewritten and the slots relocated against the module itself. Without the fix it fails at the first load (no snapshot).
 
 ### `nn::jit` served from an image on iOS
 
