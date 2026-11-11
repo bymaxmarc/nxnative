@@ -31,6 +31,8 @@ A Switch 2 game: update v65536, which holds the whole game (packed from a NUP wi
 - `render_cond on`: about 10 clears a frame are conditional on render-enable state the game sets; with the key they are skipped as on the console. No visible change in the menus and the match.
 - Resolved (chain 592225da745b): the main menu's island sea drew black with NaN noise, and the avatar's hair and clothes drew flat black in Personalizar, user selection and the HUD icons. Both were the [fragment size register read as 0](../../../docs/reference/shaders.md#the-fragment-size-register-special-register-0x84-reads-1-x-1): the sea shaders `01a6b85e2f6ea3d4`, `b3203175c76cda20` and `2271b2e0293b3c55` divided by it, and the avatar material `c30f0edd6c669a61` took it into a shading factor. On the rebuilt app the sea is blue and two random default avatars show their colours in Personalizar (`DM_CTL` route, runs of 2026-11-10 15:11 and 15:15).
 - Open: six mesh shaders are refused (task payloads over Metal's 16 KB), never loaded in the runs so far.
+- **Picture size.** Docked (the host's default, graphics scale tier 0) the game's output is 2560x1440. Its dynamic resolution steps between 2560x1440 (no upscale) and 854x480, through 2134x1200, 2048x1152, 1862x1048, 1707x960, 1536x864, 1494x840, 1397x786, 1280x720 and 1164x655, and agl's NDSR network upscales to 2560x1440 (`DM_UPSCALER=metalfx`: MetalFX's spatial scaler instead). At full size its frame has stair-stepped edges of its own (the pointer calibration screen's swapchain texture; its pass dump has no multisampled target).
+- A picture shown smaller than 2560x1440 (fullscreen on a 1080p screen, a window) went through one bilinear tap a pixel, which made the steps uneven; resolved, [A picture shown smaller than it is drawn](../../../docs/reference/rendering.md#a-picture-shown-smaller-than-it-is-drawn-stair-stepped-edges-from-the-presents-single-tap).
 
 ## Memory
 
@@ -65,3 +67,4 @@ A Switch 2 game: update v65536, which holds the whole game (packed from a NUP wi
 - [Model heaps sized by the host's command record sizes](../../../docs/reference/memory.md#model-heaps-sized-by-the-hosts-command-record-sizes)
 - [Two source buffers for each staged upload from a large pool](../../../docs/reference/memory.md#two-source-buffers-for-each-staged-upload-from-a-large-pool)
 - [The fragment size register (special register 0x84) reads 1 x 1](../../../docs/reference/shaders.md#the-fragment-size-register-special-register-0x84-reads-1-x-1)
+- [A picture shown smaller than it is drawn: stair-stepped edges from the present's single tap](../../../docs/reference/rendering.md#a-picture-shown-smaller-than-it-is-drawn-stair-stepped-edges-from-the-presents-single-tap)
