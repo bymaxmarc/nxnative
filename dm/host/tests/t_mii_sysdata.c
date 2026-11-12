@@ -4,6 +4,7 @@
 #include "../hle_fs.c"
 #include "../hle_mii.c"
 #include <sys/stat.h>
+#include <zlib.h>
 struct dm_flags g_flag; uint64_t g_t0_ns;
 uint64_t now_ns(void) { return 0; }
 void dm_guest_write_prepare(void *a, size_t n) { (void)a; (void)n; }
@@ -27,13 +28,22 @@ static uint8_t *read_all(const char *path, int64_t *size) {
     *size = n; return b;
 }
 static uint32_t u32(const uint8_t *b, size_t at) { uint32_t v; memcpy(&v, b + at, 4); return v; }
-// A texture file: 11 part kinds with sizes and alignments that are not 0 (they size the model's memory pool), and every part's entry of size 0, which the reader skips
-// (Switch Sports Resort main+0x1cdead0: entry +4 != 0); the entries end at 0x2428 (noselines, the last kind, at +0x2230, 18 of 0x1c bytes)
+// A texture file: 11 part kinds with sizes and alignments that are not 0 (they size the model's memory pool), and every part a texture, as in the firmware's files: the Mii code
+// skips a part of size 0 (Switch Sports Resort main+0x1cdead0: entry +4 != 0) but answers for it by the model's create flags (CharModel's texture getter, main+0x1cd5490), so a
+// game that asks a skipped part's texture gets an empty holder and calls nvnTextureGetFlags with a null texture (main+0x49c54). An entry: data offset, inflated size, stored size;
+// the texture from +0x10: u16 width and height at +0x14, the format index (0-6, main+0x42d2688) at +0x18, the mip count at +0x19, the tile mode index (0-1) at +0x1a (main+0x1cdcf00).
+// Each part's data inflates (nn::util::DecompressZlib, main+0x1cdcbe8) to its size, which is no more than its texture's bytes: the reader inflates into the texture's storage
+// without a bound of its own. The entries end at 0x2428 (noselines, the last kind, at +0x2230, 18 of 0x1c bytes)
 static int texture_ok(const char *path) {
     int64_t n = 0; uint8_t *b = read_all(path, &n); if (!b) return 0;
     int ok = n >= 0x2428;
     for (int i = 0; ok && i < 11; i++) ok = u32(b, 0xc + 4 * i) && u32(b, 0x38 + 4 * i);
-    for (int i = 0; ok && i < 327; i++) ok = u32(b, 0x64 + 0x1c * i + 4) == 0;
+    for (int i = 0; ok && i < 327; i++) {
+        const uint8_t *e = b + 0x64 + 0x1c * i; uint32_t off = u32(e, 0), size = u32(e, 4), stored = u32(e, 8); uint16_t w, h; memcpy(&w, e + 0x14, 2); memcpy(&h, e + 0x16, 2);
+        ok = size && stored && (uint64_t)off + stored <= (uint64_t)n && w && h && e[0x18] == 0 && e[0x19] == 1 && e[0x1a] <= 1 && size <= (uint32_t)w * h;   // format 0: R8, a byte a texel
+        uint8_t out[4096]; uLongf got = sizeof out;
+        ok = ok && size <= sizeof out && uncompress(out, &got, b + off, stored) == Z_OK && got == size;
+    }
     free(b); return ok;
 }
 // A shape file: 12 kinds from +0x6c in 0x58-byte entries (857 of them), each pointing at one mesh inside the file, then the hair and faceline transforms (+0x12704, +0x14c24)
@@ -55,7 +65,7 @@ int main(void) {
     static const char *tex[] = {"NXTextureLowLinear", "NXTextureLowSRGB", "NXTextureMidLinear", "NXTextureMidSRGB",
                                 "OunceTextureLowLinear", "OunceTextureLowSRGB", "OunceTextureMidLinear", "OunceTextureMidSRGB", "OunceTextureHighLinear", "OunceTextureHighSRGB"};
     int all = 1; for (size_t i = 0; i < sizeof tex / sizeof *tex; i++) { snprintf(p, sizeof p, "MiiResource:/%s.dat", tex[i]); all &= texture_ok(p); }
-    CHECK(all, "every texture file Switch Sports Resort names (NX and Ounce sets) reads in the texture layout, with no part");
+    CHECK(all, "every texture file Switch Sports Resort names (NX and Ounce sets) reads in the texture layout, every part a texture that inflates");
     CHECK(shape_ok("MiiResource:/ShapeMid.dat") && shape_ok("MiiResource:/ShapeHigh.dat"), "both shape files read in the shape layout, every part one mesh in the file");
     g_nmnt = 0;
     CHECK(h_fs_QuerySysDataCache(&cache, 0x0100000000000802ull) == RES_OK && h_fs_MountSysData("MiiResource", 0x0100000000000802ull, NULL, cache) == RES_OK,

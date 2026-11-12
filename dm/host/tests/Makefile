@@ -152,7 +152,7 @@ fs-tsan: $(B)/t_fs_commit_list_tsan
 	TMPDIR="$(abspath $(B))" $(B)/t_fs_commit_list_tsan
 run: $(B)/t_mii_sysdata
 $(B)/t_mii_sysdata: t_mii_sysdata.c ../hle_fs.c ../hle_mii.c ../save_sync.c ../save_sync.h ../hle_bigstack.c ../hle.h ../dm.h $(GAME_H) | $(B)
-	$(CLANG) -O1 -Wall -Wno-unused-function -I.. $(GINC) -o $@ t_mii_sysdata.c ../hle_bigstack.c ../save_sync.c
+	$(CLANG) -O1 -Wall -Wno-unused-function -I.. $(GINC) -o $@ t_mii_sysdata.c ../hle_bigstack.c ../save_sync.c -lz
 $(B)/t_fs_case: t_fs_case.c ../hle_fs.c ../save_sync.c ../save_sync.h ../hle_bigstack.c ../hle.h ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -Wno-unused-function -I.. $(GINC) -o $@ t_fs_case.c ../hle_bigstack.c ../save_sync.c
 run: $(B)/t_save_sync $(B)/t_save_sync_metadata
