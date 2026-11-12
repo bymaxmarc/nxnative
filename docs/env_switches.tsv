@@ -135,7 +135,7 @@ DM_NVN_CBDUMP	diagnostic	`=<dir>`: saves each draw's whole uniform blocks as `F<
 DM_NVN_CBDUMP_KEY	diagnostic	`=<shader key>`: limits `DM_NVN_CBDUMP` to draws using that shader; for a vertex shader key also saves the draw's vertex streams and index buffer
 DM_NVN_CBLOG	diagnostic	`=1` logs the command memory the game adds to command buffers (`AddCommandMemory`: the first 60, then every 500th) and the out-of-memory callbacks
 DM_NVN_CLEARLOG	diagnostic	`=1` logs the first 40 colour clears drawn as a triangle (inside a pass, with a partial channel mask or a partial scissor)
-DM_NVN_CMDSTAT	diagnostic	`=1` logs every 300 frames the command recording usage: bytes and records per frame, command memory segment sizes, out-of-memory callbacks, host segments, count and bytes per command type; small recordings by op and by guest thread, with the control memory their lists take; per command buffer, the control memory the game gives, reads back and whether it enables the control-memory callback
+DM_NVN_CMDSTAT	diagnostic	`=1` logs every 300 frames the command recording usage: bytes and records per frame, command memory segment sizes, out-of-memory callbacks, host segments, count and bytes per command type; small recordings by op and by guest thread, with the control memory their lists take; per command buffer, the control memory the game gives, reads back and whether it enables the control-memory callback; once more at the first buffer with a null pool
 DM_NVN_COUNT	diagnostic	`1` counts every NVN call (the counting trampolines) and writes the per-frame call lines; off by default (on with a `DM_NVN_TSV` table that has call rows), the count is an atomic add all recording threads share
 DM_NVN_CPS_WAIT_MS	switch	`=<ms>`: how long a compute dispatch waits for its pipeline, built off the replay thread, before it is skipped (default 5000; `0` skips the first dispatch of a new pipeline at once)
 DM_NVN_CPUPROF	diagnostic	1 records CPU wall/time/instruction totals by renderer operation; off by default.
@@ -148,6 +148,7 @@ DM_NVN_DEFER_AB	diagnostic	`=1` keeps the deferred pass merging (with `DM_NVN_TB
 DM_NVN_DEPTHOVR	diagnostic	`=<fragment shader key prefix>,…`: those draws compare depth with `ALWAYS`; with `DM_NVN_HILITE`, tells "the depth test rejects every fragment" from "nothing rasterizes"
 DM_NVN_DIRECT_UPLOAD	switch	0 disables bounded direct RGBA16F array uploads and keeps staged copies; on by default for supported non-sparse textures.
 DM_NVN_DIRTYCHECK	diagnostic	`=1` fully hashes pool content on every use to find changes the dirty-page tracking missed
+DM_NVN_DISPATCH_BARRIER	diagnostic	`full`: every compute dispatch is ordered after everything before it in its encoder, as before; by default dispatches are ordered by the game's own barriers and by the copies around them (`nvn_mtl.m` `dbar_game`); `ab` alternates the two with the `DM_AB` phases, for measurement
 DM_NVN_DISPATCH_OWN	switch	`=1` gives every compute dispatch a compute encoder of its own with full barriers, as before (by default dispatches share the copy encoder); `DM_NVN_PASSGPU` does the same
 DM_NVN_DLSS_BILINEAR	diagnostic	`=1` draws every DLSS evaluation with the bilinear stand-in, to tell MetalFX's part in a GPU fault or stall
 DM_NVN_DUAL_WANT	path	`=<file>`: appends the key of each pixel shader a pipeline blends with its output 1 as the second source, while it has no dual-source entry point, to that file, once per key (the profile's `dual_want.tsv`)
@@ -208,7 +209,7 @@ DM_NVN_RT_RANGE_CHECK	diagnostic	With `DM_NVN_RT_RANGE=1` and `DM_NVN_PASSDUMP`,
 DM_NVN_RT_RECYCLE	switch	`0` makes each render target in a GPU-only pool, each feedback snapshot and each resolution family heap its own exact Metal allocation, freed with its texture, as before; by default they are placed in heaps from one free list, and a freed one's heap waits, resident, for the next texture it fits (`ab` alternates it with the `DM_AB` phases)
 DM_NVN_SHDUMP	diagnostic	`=<dir>` saves programs missing from the shader map as `<key>.ctl` (control section) and `<key>.code`, to find the files that hold them
 DM_NVN_SHMAP	path	The shader map (`shader_map.tsv`); `c1_full.tsv` and `pso_manifest.tsv` are taken from the same folder. Default: the game profile's folder on the Mac; the iOS app sets it
-DM_NVN_SHOT	diagnostic	`=<frame>[,<frame>…]:<path>` saves the swapchain texture as an image at those frames (`%d` in the path = frame number): the whole texture, without the game's window or layer crop (`DM_NVN_SHOT_OUT` for the picture as presented)
+DM_NVN_SHOT	diagnostic	`=<frame>[,<frame>…]:<path>` saves the swapchain texture as an image at those frames (`%d` in the path = frame number); a window the game crops is saved as presented (the crop drawn at the texture's own size)
 DM_NVN_SHOT_OUT	diagnostic	`=<W>x<H>` makes `DM_NVN_SHOT` capture the picture as the present pass upscales it to that size, the crop included, instead of the raw swapchain texture
 DM_NVN_SKIP_FS	diagnostic	`=<fragment key>[,…]` (up to 16) drops all draws of those fragment shaders, to measure their GPU cost or bisect a wrong draw; the picture is wrong
 DM_NVN_SKIP_MESH	diagnostic	`=1` drops every task and mesh draw, to measure what they cost in all; the picture is wrong
@@ -243,7 +244,7 @@ DM_NVN_UPLOAD_REUSE	switch	0 keeps the original one-block upload-slot policy; de
 DM_NVN_VBUF_CACHE	switch	`0` turns off the cache of resolved vertex stream addresses and vertex argument table writes across draws (on by default), for A/B runs
 DM_NVN_VCONV_CHECK	diagnostic	`=1` scans the indices again at every reuse of a cached vertex conversion range (`vconv_range`) and reports differences
 DM_NVN_VCONV_CPU	switch	`=1` converts integer vertex inputs fed formats of another class on the CPU, as before, instead of through the shader's shadow inputs (`<key>_bv`)
-DM_NVN_VCONV_KEEP	switch	`=0` turns off the kept vertex conversions (`vk_get`); `=<n>` sets the smallest range kept, in vertices (default 4096)
+DM_NVN_VCONV_KEEP	switch	`=0` turns off the kept vertex conversions (`vk_get`); `=<n>` sets the smallest range kept, in vertices (default 4096, which `=1` also gives)
 DM_NVN_VCONV_RANGE	switch	`0` / `1` overrides the profile's `vconv_range`: CPU vertex conversion only over the vertices each draw reads instead of the whole bound range
 DM_NVN_VLOG	diagnostic	Set: logs each NVN memory pool as it is created (address, memory, size, flags) with a backtrace
 DM_NVN_VSDUMP	path	Output file for post-vertex captures; used with DM_NVN_VSDUMP_KEY and the frame/count bounds
@@ -298,12 +299,14 @@ DM_PSO_BUNDLE	path	The pipeline archive made offline (`<GPU architecture>.mtl4a`
 DM_PSO_GPUS	switch	`build_ipa.sh`: the GPU architectures, comma-separated, to build the offline pipeline archive for (`none` builds none); unset, a profile with `pso_mtl4 on` gets its `pso_gpu` list or `g18p` when absent; profiles with `pso_mtl4 off` get none
 DM_PSO_HYBRID	switch	`0`: a draw whose pipeline is not built yet waits for it instead of drawing with its shader pair's pulling pipeline meanwhile (on by default with the Metal 4 path)
 DM_PSO_IOS_MIN	switch	`build_ipa.sh`: the minimum iOS version of the offline pipeline archives (default the SDK's major version); a device of another major version cannot open them and builds the bases itself
-DM_PSO_MANIFEST	path	The prewarm manifest to use instead of the profile's `pso_manifest.tsv`; `off` turns the prewarm off
+DM_PSO_MANIFEST	path	The prewarm manifest to use instead of the profile's `pso_manifest.tsv` and the device's `pso_user.tsv` (also the list the prebuild tool, `DM_PSO_PREBUILD=tool`, builds); `off` turns the prewarm off
 DM_PSO_MTL4	player	`0` builds render pipelines through the `MTLDevice` with no bases and no archive; `1` uses MTL4Compiler with the archive, hybrid pipelines and prebuild (default on on the Mac, the profile's `pso_mtl4` on iOS)
 DM_PSO_PAIRS	path	The prebuild's second shader pair table (default: `pso_pairs.tsv` beside the shader map)
-DM_PSO_PREBUILD	player	`0` turns off the prebuild of every known shader pair's pulling base into the pipeline archive (on by default); `tool` runs the prebuild alone on the Mac and exits
+DM_PSO_PREBUILD	player	`0` turns off the prebuild of every known shader pair's pulling base into the pipeline archive (on by default); `tool` runs on the Mac what a first start would build and exits: the pairs' bases, then the prewarm lists' pipelines
 DM_PSO_PREBUILD_DEPTH	switch	`zero`: the prebuild tool (`DM_PSO_PREBUILD=tool`) builds bases for the near = 0 depth mode; the NSP script sets it from the profile's `depth_mode`
+DM_PSO_PREBUILD_OUT	switch	`=<folder>`: the prebuild tool's bundle form (the NSP script's `--prebake`): the captures go to the `DM_PSO_ARCHIVE` work folder, then into the folder as `<GPU>-prewarm-<NN>.mtl4a` with their indexes, `prewarm-<NN>.mtl4-json` (each period as a pipelines script, which the NSP script compiles with `metal-tt` for the other GPUs `--gpu` names) and `prewarm.tsv`, for the app to bundle
 DM_PSO_PREBUILD_THREADS	switch	`=<n>`: the workers of the prebuild tool (`DM_PSO_PREBUILD=tool`; default: Metal's concurrent compiles, `maximumConcurrentCompilationTaskCount`)
+DM_PSO_PREBUILD_WARM	switch	`0`: the prebuild tool (`DM_PSO_PREBUILD=tool`) builds the pairs' bases alone and leaves the prewarm lists' pipelines to the first start
 DM_PSO_PREPARE	switch	`0` runs the prewarm in the background while the game starts, as without a window; `1` makes the first submission wait for the prewarm lists also without a window
 DM_PSO_PREPARE_THREADS	switch	`=<n>`: the workers of the prepare step that builds the prewarm lists before the first frame (default: the device's active cores)
 DM_PSO_PULL_ALL	diagnostic	`=1`: every draw that has a pulling pipeline draws with it, never with the pipeline for its vertex layout

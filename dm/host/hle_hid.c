@@ -704,8 +704,8 @@ static void joy_assign(uint32_t id, int single, int keep) {
 HLE_FORCE("_ZN2nn3hid20GetNpadJoyAssignmentERKj", "Joy-Con assignment: what the game set (dual by default)", int, h_hid_GetJoyAssign, const uint32_t *id) { return *id < DM_PLAYERS && (atomic_load(&g_single_mask) >> *id & 1); }
 HLE_FORCE("_ZN2nn3hid30SetNpadJoyAssignmentModeSingleERKj", "Joy-Con single assignment: the pair splits, the left Joy-Con stays", void, h_hid_JoySingle, const uint32_t *id) { joy_assign(*id, 1, 0); }
 HLE_FORCE("_ZN2nn3hid18SwapNpadAssignmentERKjS2_", "swap controller ids; ignored by the host", void, h_hid_Swap, const uint32_t *a, const uint32_t *b) { (void)a; (void)b; }
-// The npad ids the SDK's own checks accept (No1..No8, Other, Handheld), as an index 0..9; -1 otherwise. Home button protection is upstream's, below (g_home_protect)
-static int npad_id_slot(uint32_t id) { return id < 8 ? (int)id : id == 0x10 ? 8 : id == 0x20 ? 9 : -1; }   // the npad ids the SDK's own checks accept, as an index; -1 otherwise
+// The npad ids the SDK's own checks accept (No1..No8, Other, Handheld), as an index 0..9; -1 otherwise
+static int npad_id_slot(uint32_t id) { return id < 8 ? (int)id : id == 0x10 ? 8 : id == 0x20 ? 9 : -1; }
 // Joy-Con icon decoration colour (Switch 2 SDKs; a 12-byte NpadJoyIconDecorationColor). Unhooked, the SDK read the npad's internal state from hid shared memory the host does not fill,
 // found none and answered 0x58cca, which its wrapper aborts on (Nintendo Switch Sports Resort, sdk+0x6cab6c, once it draws). For an npad whose controller is no decorated Joy-Con the SDK
 // answers 0x4b6ca without writing the colour (sdk+0x6be204), and its wrapper hands that to the game; no controller of the host is one. An id that is no npad aborts in the SDK (0x58aca)
@@ -969,7 +969,7 @@ static int live_at(const motion_sample *r, unsigned n, uint64_t t, motion_sample
     // so the direction is always a rotation
     const motion_sample *near = f < 0.5f ? a : b;
     memcpy(o->dir, near->dir, sizeof o->dir);
-    int same = !memcmp(a->acc, b->acc, sizeof a->acc) && !memcmp(a->gyro, b->gyro, sizeof a->gyro);
+    int same = !memcmp(a->acc, b->acc, sizeof a->acc) && !memcmp(a->gyro, b->gyro, sizeof a->gyro);   // NOLINT(bugprone-suspicious-memory-comparison): a held sample is the same floats bit for bit, which is what "same" means here
     if (b->t - a->t > LIVE_BLEND_MAX_NS) return same;
     float R[3][3]; for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) R[i][j] = a->dir[3 * i + j] + (b->dir[3 * i + j] - a->dir[3 * i + j]) * f;
     for (int j = 0; j < 3; j++) if (R[0][j] * R[0][j] + R[1][j] * R[1][j] + R[2][j] * R[2][j] < 0.25f) return same;

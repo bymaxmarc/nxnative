@@ -62,6 +62,9 @@ void dm_ctl_cvar_i32(uint64_t off, int32_t v) { (void)off; (void)v; }
 void dm_ctl_cvar_f32(uint64_t off, float v) { (void)off; (void)v; }
 void dm_gfx_texdump_next(const char *path) { (void)path; }
 void dm_gfx_passdump_next(long n) { (void)n; }
+void dm_gfx_addr_note(uint64_t a, char *note, size_t n) { (void)a; if (n) note[0] = 0; }   // DM_CTL "addr" (nvn_mtl.m)
+void dm_gfx_bufsnap(const char *key, uint64_t a, size_t n, const char *path) { (void)key; (void)a; (void)n; (void)path; }   // DM_CTL "bufsnap" (nvn_mtl.m)
+void probe_atrace(uint64_t lo, uint64_t n) { (void)lo; (void)n; }   // DM_CTL "atrace" (probe.c)
 static int applet_depth, applet_opens, applet_closes_at_depth0;   // hle_oe.c: the applet stand-ins open and close their applet around the answer
 void dm_applet_enter(const char *name) { (void)name; applet_depth++; applet_opens++; }
 void dm_applet_leave(void) { applet_closes_at_depth0 += --applet_depth == 0; }
@@ -741,7 +744,7 @@ static void t_npad_imu_samples(void) {
     }
     CHECK(s[0].gyro[0] == 0 && s[0].gyro[1] == 0 && s[0].gyro[2] == 0, "imu: at rest no rotation");
     CHECK(h_hid_ImuSamples(s, 16, h) == 16 && imu_numbered(s, 16, 386), "imu: the newest 16 ending at the current tick, oldest first");
-    CHECK(h_hid_ImuSamples(t, 16, h) == 16 && !memcmp(s, t, 16 * sizeof *s), "imu: the same tick again gives the same numbers (the fusion skips them)");
+    CHECK(h_hid_ImuSamples(t, 16, h) == 16 && !memcmp(s, t, 16 * sizeof *s), "imu: the same tick again gives the same numbers (the fusion skips them)");   // NOLINT(bugprone-suspicious-memory-comparison): the same tick read again is the same bytes, padding included (both buffers zeroed by the host)
     CHECK(h_hid_ImuSamples(s, 4, h) == 4 && imu_numbered(s, 4, 398), "imu: at most n: the newest 4");
     CHECK(h_hid_ImuSamples(s, 40, h) == 16 && imu_numbered(s, 16, 386), "imu: never more than the 16 the SDK's ring holds");
     guest_now += 4000000; CHECK(h_hid_ImuSamples(s, 1, h) == 1 && imu_numbered(s, 1, 401), "imu: less than a tick later: the same newest tick");
@@ -772,7 +775,7 @@ static void t_npad_imu_samples(void) {
 
     // Two readers each get the same newest ticks, also at once from two threads
     hwm_clear(), guest_now = 3000000000ull;   // tick 600
-    CHECK(h_hid_ImuSamples(s, 16, h) == 16 && h_hid_ImuSamples(t, 16, h) == 16 && !memcmp(s, t, 16 * sizeof *s) && imu_numbered(s, 16, 586), "imu: two readers, the same ticks");
+    CHECK(h_hid_ImuSamples(s, 16, h) == 16 && h_hid_ImuSamples(t, 16, h) == 16 && !memcmp(s, t, 16 * sizeof *s) && imu_numbered(s, 16, 586), "imu: two readers, the same ticks");   // NOLINT(bugprone-suspicious-memory-comparison): two reads of one tick are the same bytes
     atomic_store(&imu_reader_ok, 0);
     pthread_t th[2]; for (int i = 0; i < 2; i++) pthread_create(&th[i], NULL, imu_reader, NULL);
     for (int i = 0; i < 2; i++) pthread_join(th[i], NULL);
@@ -876,7 +879,7 @@ static void t_imu_noise(void) {
     CHECK(differ >= 48, "imu noise: each device has its own");
     hwm_clear(), guest_now = 6000000000ull;
     h_hid_ImuSamples(s, 16, h[0]); guest_now += 3 * SIX_PERIOD_NS; h_hid_ImuSamples(t, 16, h[0]);
-    for (int i = 3; i < 16; i++) again &= !memcmp(&s[i], &t[i - 3], sizeof s[i]);
+    for (int i = 3; i < 16; i++) again &= !memcmp(&s[i], &t[i - 3], sizeof s[i]);   // NOLINT(bugprone-suspicious-memory-comparison): a tick read again is the same bytes
     CHECK(again, "imu noise: a tick read again reads the same");
     setenv("DM_IMU_NOISE", "0", 1); imu_env_read();
     CHECK(h_hid_ImuSamples(s, 1, h[0]) == 1 && s[0].gyro[0] == 0 && s[0].acc[2] == 9.80665f, "imu noise: DM_IMU_NOISE=0 leaves it out");
@@ -1176,7 +1179,7 @@ static void t_single_joy_as_pair(void) {
         TestImuSample r[4]; CHECK(h_hid_ImuSamples(r, 4, 0x10007) == 4, "dither: four ticks");
         // ticks at t-15, -10 (the newest sample), -5, 0 ms: the first is interpolated exactly, the newest-sample tick and those after it are held and dithered
         CHECK(fabsf(r[0].gyro[1] + 0.75f) < 1e-6f, "dither: an interpolated tick is the controller's own value, untouched");
-        int alike = 0; for (int i = 1; i < 4; i++) alike |= !memcmp(&r[i].gyro, &r[i - 1].gyro, sizeof r[i].gyro) || !memcmp(&r[i].acc, &r[i - 1].acc, sizeof r[i].acc);
+        int alike = 0; for (int i = 1; i < 4; i++) alike |= !memcmp(&r[i].gyro, &r[i - 1].gyro, sizeof r[i].gyro) || !memcmp(&r[i].acc, &r[i - 1].acc, sizeof r[i].acc);   // NOLINT(bugprone-suspicious-memory-comparison): held ticks must differ in their bits (the dither)
         CHECK(!alike && fabsf(r[3].gyro[1] + 0.8f) < 1e-3f && fabsf(r[3].acc[2] - 9.80665f) < 1e-3f, "dither: held ticks differ from each other, and stay at the held value");
     }
     dm_motion_clear_joy(0, 1); dm_motion_clear_hid(0); dm_joy_attach(0, 0); h_hid_SetStyles(0xffffffffu); h_hid_ImuDisable(); guest_now = motion_now = 1000000000ull; g_phone_mode = -1;
@@ -1229,6 +1232,7 @@ static delay_stats live_delay_run(double hz, int joy_clock, const char *const *d
     int64_t last = 0; int seg = -1; double prev_data = -1; int prev_interp = 0;
     for (uint64_t t = t0; t < t0 + (uint64_t)nd * seg_ns; t += 500000) {
         int now_seg = (int)((t - t0) / seg_ns);
+        if (now_seg >= nd) break;   // the loop's bound already ends at the last segment; said here so that delays[] is never read past it
         if (now_seg != seg) { seg = now_seg; if (*delays[seg]) setenv("DM_IMU_DELAY", delays[seg], 1); else unsetenv("DM_IMU_DELAY"); imu_env_read(); }
         motion_now = guest_now = t;
         while (arr <= t) {
@@ -1489,7 +1493,7 @@ static void t_live_still_dither(void) {
                 nf += 16666667; TestImuSample q[16]; int k = h_hid_ImuSamples(q, 16, 0x20003);
                 for (int i = 0; i < k; i++) {
                     if (q[i].sampling <= last_num) continue;   // a tick the fusion took already
-                    if (have && !memcmp(q[i].acc, prev.acc, sizeof prev.acc) && !memcmp(q[i].gyro, prev.gyro, sizeof prev.gyro)) run_ok = 0;
+                    if (have && !memcmp(q[i].acc, prev.acc, sizeof prev.acc) && !memcmp(q[i].gyro, prev.gyro, sizeof prev.gyro)) run_ok = 0;   // NOLINT(bugprone-suspicious-memory-comparison): two ticks with the same bits are what the fusion counts as a held sample
                     // the rest learner may take the gyro offset away (an HID source), so check each tick against the one before: the dither is all that moves
                     if (have && (fabsf(q[i].acc[2] - prev.acc[2]) > 1e-3f || fabsf(q[i].gyro[0] - prev.gyro[0]) > 1e-3f)) val_ok = 0;
                     prev = q[i]; have = 1; last_num = q[i].sampling;

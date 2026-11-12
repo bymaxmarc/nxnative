@@ -10,7 +10,8 @@ uint64_t now_ns(void) { return bp_now(); }
 static int read_texel(id<MTLTexture> t, float out[4]) {
     NSString *src = @"#include <metal_stdlib>\nusing namespace metal;\nkernel void rd(texture2d<float> t [[texture(0)]], device float4 *o [[buffer(0)]]) { o[0] = t.read(uint2(0, 0)); }\n";
     NSError *err = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:src options:nil error:&err];
-    id<MTLComputePipelineState> ps = lib ? [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rd"] error:&err] : nil;
+    id<MTLFunction> fn = [lib newFunctionWithName:@"rd"];
+    id<MTLComputePipelineState> ps = fn ? [g_dev newComputePipelineStateWithFunction:fn error:&err] : nil;
     if (!ps || !t) return 0;
     id<MTLBuffer> o = [g_dev newBufferWithLength:16 options:MTLResourceStorageModeShared];
     id<MTLCommandQueue> q = [g_dev newCommandQueue]; id<MTLCommandBuffer> cb = [q commandBuffer]; id<MTLComputeCommandEncoder> en = [cb computeCommandEncoder];

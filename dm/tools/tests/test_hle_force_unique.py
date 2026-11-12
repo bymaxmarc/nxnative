@@ -1,13 +1,14 @@
 """Every symbol the host takes over with HLE_FORCE appears once.
 
-The loader dies at startup on a duplicate ("duplicate entry in the forced takeover list"), but the host's unit
-tests link the handlers under their own C names and never build that list, so two handlers for one symbol (as
-when an upstream merge brought nn::hid's Home button protection next to the host's own) pass every test and only
-abort the game at boot. This test reads the sources instead.
+The loader dies at startup on a duplicate ("duplicate entry in the forced takeover list", loader.c), but the
+host's unit tests link the handlers under their own C names and never build that list, so two handlers for one
+symbol (as when a merge brings a handler next to one another branch added for the same function) pass every test
+and only abort the game at boot. This test reads the sources instead.
 """
 import collections
 import pathlib
 import re
+import tempfile
 import unittest
 
 HOST = pathlib.Path(__file__).resolve().parents[2] / "host"
@@ -30,6 +31,15 @@ def forced_symbols(root):
 class ForcedTakeoverUnique(unittest.TestCase):
     def test_sources_found(self):
         self.assertGreater(sum(1 for _ in forced_symbols(HOST)), 100, "no HLE_FORCE uses found: the pattern or the path is wrong")
+
+    def test_a_duplicate_is_found(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / "a.c").write_text('HLE_FORCE("_ZN2nn3hid3FooEv", "x", void, a_foo, void) {}\n')
+            (root / "b.c").write_text('HLE_FORCE_BIG( "_ZN2nn3hid3FooEv", "x", void, b_foo, void) {}\n')
+            (root / "tests").mkdir()
+            (root / "tests" / "t.c").write_text('HLE_FORCE("_ZN2nn3hid3FooEv", "x", void, t_foo, void) {}\n')
+            self.assertEqual(sorted(forced_symbols(root)), [("_ZN2nn3hid3FooEv", "a.c:1"), ("_ZN2nn3hid3FooEv", "b.c:1")])
 
     def test_each_symbol_forced_once(self):
         places = collections.defaultdict(list)

@@ -626,7 +626,7 @@ static int host_mounted(const char *name) {
 }
 // ---------- Mounts in the SDK's own table ----------
 // A mount call the host does not take over (nn::fs::MountRamDisk) runs in the SDK and registers in the SDK's own table, which the host's file calls did not consult: every path on such a
-// mount was "path not found". Nintendo Switch Sports Resort (provisional profile) mounts its VoiceText speech data as the RAM disk "vtapi" and aborted at boot on GetEntryType("vtapi:/VoiceText")
+// mount was "path not found". Nintendo Switch Sports Resort (04008E001F098000) mounts its VoiceText speech data as the RAM disk "vtapi" and aborted at boot on GetEntryType("vtapi:/VoiceText")
 // (Result 0x202, main+0x414dbc). A path whose mount name the host does not hold but the SDK's IsMounted does goes to the SDK's own call (guest_sym: the module's definition, not the host's
 // take-over), and the handles it opens are listed, so the calls that take them go to the SDK too. The host's own handles (an fd or an image entry shifted by FH_OUT, a dirh_t pointer) never
 // enter the list, and a path on a host mount never asks the SDK. No host lock is held across an SDK call: the SDK takes its own locks
@@ -763,11 +763,17 @@ HLE_FORCE("_ZN2nn2fs18IsSaveDataExistingENS_13ApplicationIdERKNS_7account3UidE",
 // its own save as SaveReadOnly at boot; refused, the game aborted at the first boot that found an account save (main+0x349d880 checks that the mount it reads from is named
 // SaveReadOnly, and calls the abort at main+0x3917260 otherwise), so every run after its first save stopped about 48 s in
 // Without a save folder it answers TargetNotFound, as before, and the game's own MountSaveData stops the run with the reason
+// The save sync of the first mount (save_sync.h). A save that a pull of the cloud's left half replaced and could not put back is not mounted: the game would play on, and
+// commit and send, a save that is neither this device's nor the cloud's. What this device's save is made of stays where the log's [save-sync] lines say, and the next
+// start tries again
+static void save_sync_or_stop(const char *dd) {
+    if (save_sync_mount(dd, DM_GAME_ID)) die("this game's save %s is not whole after a pull of the cloud's save that could not be undone: not mounted (the [save-sync] lines above say where this device's save is kept; the next start tries again)", dd);
+}
 static Result mount_own_save_ro(const char *name) {
     const char *d = getenv("DM_SAVE");
     if (!d || !*d) { LOG("[RED] fs read-only mount of this game's save data %s: DM_SAVE is not set, answered as no save data", name); return 0x7d402u; }   // fs ResultTargetNotFound
     char dd[1024]; strlcpy(dd, d, sizeof dd); size_t L = strlen(dd); while (L > 1 && dd[L - 1] == '/') dd[--L] = 0;
-    save_sync_mount(dd, DM_GAME_ID);   // the cloud's save comes in before anything reads the committed one (the first mount does it, as for MountSaveData)
+    save_sync_or_stop(dd);   // the cloud's save comes in before anything reads the committed one (the first mount does it, as for MountSaveData)
     // A first launch has no committed save yet: an empty one, as the console's new save data. The folder is checked here, since mount_ex would stop on a missing one as on missing game files
     struct stat st;
     if (mkdir(dd, 0755) && errno != EEXIST) { LOG("[RED] fs read-only mount of this game's save data %s: cannot create the save folder %s (errno=%d), answered as no save data", name, dd, errno); return 0x7d402u; }
@@ -786,7 +792,7 @@ HLE_FORCE("_ZN2nn2fs13MountSaveDataEPKcRKNS_7account3UidE", "fsp-srv; save data 
     const char *d = getenv("DM_SAVE");
     if (!d) die("DM_SAVE is not set: point it at a writable copy of a save directory");
     char dd[1024]; strlcpy(dd, d, sizeof dd); size_t L = strlen(dd); while (L > 1 && dd[L - 1] == '/') dd[--L] = 0;   // strip trailing slashes (.work / .new are appended at the same level)
-    save_sync_mount(dd, DM_GAME_ID);   // DM_SAVE_SYNC: the cloud's save comes in before the work directory is cloned from the committed one (save_sync.h)
+    save_sync_or_stop(dd);   // DM_SAVE_SYNC: the cloud's save comes in before the work directory is cloned from the committed one (save_sync.h)
     return mount_ex(name, dd, 0, 1);
 }
 // Device save data: one save for the console instead of one per user. Animal Crossing: New Horizons keeps its island there (3.0.3's main mounts no account save data at all); the host
@@ -799,7 +805,7 @@ HLE_FORCE("_ZN2nn2fs19MountDeviceSaveDataEPKc", "fsp-srv; device save data → t
     const char *d = getenv("DM_SAVE");
     if (!d) die("DM_SAVE is not set: point it at a writable copy of a save directory");
     char dd[1024]; strlcpy(dd, d, sizeof dd); size_t L = strlen(dd); while (L > 1 && dd[L - 1] == '/') dd[--L] = 0;
-    save_sync_mount(dd, DM_GAME_ID);   // the cloud's save holds both, so it comes in at whichever of the two mounts first
+    save_sync_or_stop(dd);   // the cloud's save holds both, so it comes in at whichever of the two mounts first
     strlcat(dd, "_device", sizeof dd);
     return mount_ex(name, dd, 0, 1);
 }
@@ -826,6 +832,12 @@ static Result commit_mount_locked(int i, int *notify_error) {
     pthread_rwlock_t *txn_guard __attribute__((cleanup(txn_unlock))) = &g_txn_lock[txn];
     uint64_t tc1 = clock_gettime_nsec_np(CLOCK_MONOTONIC), tw0 = atomic_exchange(&g_mnt[txn].first_write_ns, 0);
     int perr = atomic_exchange(&g_mnt[txn].poison, 0);
+    // Probe: files of this transaction still open at the commit. Horizon's fs client is believed to refuse a commit while a file is open for writing (WriteModeFileNotClosed;
+    // not checked against the SDK); the host commits anyway. A refused commit below reclones the work directory, and a handle opened before it then points into the
+    // discarded tree: what is written through it is lost at the next commit. Named so a game that does this shows itself before the host follows Horizon's rule (open)
+    int nopen = 0, nwrite = 0; uint16_t token = (uint16_t)(txn + 1);
+    for (int k = 0; k < 65536; k++) if (atomic_load(&g_ftxn[k]) == token) { nopen++; nwrite += (g_fmode[k] & (MODE_WRITE | MODE_APPEND)) != 0; }
+    if (nwrite) { static int red; if (red++ < 8) LOG("[RED] save commit with %d file(s) open for writing in this transaction (%d open in all); Horizon refuses such a commit, the host goes on", nwrite, nopen); }
     if (perr) {                                                         // a write failed in this transaction: refuse the commit, discard the working directory
         char torn[512] = ""; size_t tl = 0; DIR *d0 = opendir(g_mnt[i].dir); struct dirent *e0;   // record files truncated to 0 bytes (the damage that would enter the save if committed as usual)
         while (d0 && (e0 = readdir(d0))) {
@@ -837,8 +849,6 @@ static Result commit_mount_locked(int i, int *notify_error) {
             if (d1) closedir(d1);
         }
         if (d0) closedir(d0);
-        int nopen = 0; uint16_t token = (uint16_t)(txn + 1);
-        for (int k = 0; k < 65536; k++) nopen += atomic_load(&g_ftxn[k]) == token;   // these handles point into the deleted old working directory after re-cloning
         // First clone the committed version into a sibling temporary directory; once that succeeds, atomically swap it with the tainted work directory and delete the swapped-out one. If any step fails, do not exit: the work directory stays and the "tainted" mark is put back
         // (the next commit is refused again and recloning is retried); the committed version is unchanged (before, the work directory was deleted first and then recloned, and a failed clone called die, so with a full disk the process exited and the work directory was gone)
         char re[1100]; snprintf(re, sizeof re, "%s.re", g_mnt[i].dir); int rerr = 0;
@@ -847,7 +857,8 @@ static Result commit_mount_locked(int i, int *notify_error) {
         else if (renamex_np(re, g_mnt[i].dir, RENAME_SWAP)) { rerr = errno ? errno : EIO; rm_tree(re); }
         else rm_tree(re);                                               // the swapped-out tainted work directory
         if (rerr) { save_poison_txn(txn, perr); LOG("[RED] save transaction: recloning the work directory failed errno=%d -- the work directory is left as it is and stays tainted (the next commit is refused again and retries), the committed version is unchanged", rerr); }
-        LOG("[RED] save commit refused: a save write failed in this transaction errno=%d (0-byte files in the work directory: %s); the committed version is unchanged, the work directory %s%s", perr, tl ? torn + 1 : "none", rerr ? "could not be recloned (see the previous line)" : "was recloned from the committed version", nopen ? "; [RED] save files are still open" : "");
+        LOG("[RED] save commit refused: a save write failed in this transaction errno=%d (0-byte files in the work directory: %s); the committed version is unchanged, the work directory %s%s", perr, tl ? torn + 1 : "none", rerr ? "could not be recloned (see the previous line)" : "was recloned from the committed version",
+            nopen && !rerr ? "; [RED] save files are still open: they point into the discarded work directory, and what is written through them is lost" : nopen ? "; [RED] save files are still open" : "");
         *notify_error = perr;
         return RES_FAIL;
     }

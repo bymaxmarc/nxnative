@@ -33,7 +33,7 @@ int main(void) {
         FAIL("properties: size %zu, name %.16s, shortest %lld ns, +0x108 %u", sizeof p, p.name, (long long)p.min_ns, p.word_108);
     if (!h_os_Props(&p, "AudioExternalOutput")) FAIL("properties of a device the host does not have");
     char nf[0x350] = {0};   // the overload without flags (Nintendo Switch Sports Resort, main+0x5edb34)
-    if (h_os_OpenNoFlags(nf, ev, NULL, 0, name, fmt, CAP, CAP - FRAMES) || h_os_State(nf) != OS_STOPPED || h_os_Free(nf) != CAP) FAIL("open without flags");
+    if (h_os_OpenNoFlags(nf, ev, NULL, 0, name, fmt, CAP, CAP - FRAMES) || h_os_State(nf) != OS_STOPPED || h_os_Free(nf) != CAP) FAIL("open without flags");   // NOLINT(clang-analyzer-core.StackAddressEscape): the host keeps the stream only while it is open, and it is closed below before this returns
     h_os_Close(nf);
     if (h_os_State(nf) != OS_NONE) FAIL("state after closing the stream opened without flags");
     int32_t bad[3] = {OS_FLOAT, 2, 44100};

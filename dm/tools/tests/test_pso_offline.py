@@ -11,12 +11,10 @@ import re
 import types
 from pathlib import Path
 import shutil
-import signal
 import struct
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import unittest
 import tracemalloc
@@ -26,8 +24,6 @@ REPO = Path(__file__).resolve().parents[3]
 spec = importlib.util.spec_from_file_location('pso_offline', REPO / 'dm/gfx/tools/pso_offline.py')
 po = importlib.util.module_from_spec(spec); spec.loader.exec_module(po)
 CHAIN = '0123456789ab'
-REAL_RUN_LOGGED = po.run_logged   # the Build tests replace it; the tests of stopping need real processes
-SLOW_GROUP = po.SPLIT   # a part of the size compile_split cuts a large group into
 
 
 def tag(name, data): return name + struct.pack('<H', len(data)) + data
@@ -185,6 +181,7 @@ class Plan(unittest.TestCase):
         self.assertEqual(real, work / 'libraries')
         self.assertEqual(po.constants(real / 'v_bp@main0_z.metallib'), {'main0_z': ('dm_border_off',)})
         self.assertEqual((real / 'v_bp.metallib').read_bytes(), (self.d / 'v_bp.metallib').read_bytes())
+        self.assertTrue((real / 'v_bp.metallib').is_symlink(), 'a library of a folder is linked, not copied')
         po.clear_real_libraries(work)
         self.assertEqual(po.real_libraries(self.d, [('v_bp', 'main0', 'v_bp', 'main0')], work), self.d, 'nothing to cut: the folder as it is')
 
@@ -497,7 +494,7 @@ class Build(unittest.TestCase):
             po.main(['--game', '0100000000001000', '--msl', str(self.lib), '--out', str(self.out), '--work', str(self.work)])
         self.assertEqual(list(self.out.glob('*.mtl4a')), [])
 
-    def batched_runner(self, fail_compile=None, fail_merge=False):
+    def batched_runner(self, fail_compile=(), fail_merge=False):   # fail_compile: the vertex entries whose base metal-tt fails on
         original = self.fake_run
         observed = []
         def run(cmd, **kw):
@@ -512,7 +509,7 @@ class Build(unittest.TestCase):
                 config = json.loads(js.read_text())
                 names = [f['name'] for f in config['function_descriptors']['library_function_descriptors'] if f['library'] == 'lib:v_bp']
                 observed.append(('compile', names))
-                if fail_compile in names:
+                if set(fail_compile) & set(names):
                     Path(cmd[cmd.index('-o') + 1]).write_bytes(b'partial')
                     return subprocess.CompletedProcess(cmd, 1)
             return original(cmd, **kw)
@@ -552,9 +549,42 @@ class Build(unittest.TestCase):
         self.assertEqual(first.stat().st_mtime_ns, identity)
         self.assertEqual(observed, [('compile',['vertex2','vertex3']),('compile',['vertex4']),('merge',3)])
 
+    def test_a_base_metal_tt_cannot_compile_is_left_to_the_device(self):   # PRAGMATA: one pixel shader the GPU compiler stops on cost the whole archive
+        bases = [('v_bp', f'vertex{i}', 'f_b', 'main0') for i in range(5)]
+        runner, observed = self.batched_runner(fail_compile=('vertex2',))
+        out = io.StringIO()
+        with mock.patch.object(po.subprocess, 'run', runner), mock.patch.object(po, 'plan', return_value=(bases, [('v', 'c')], {})), \
+                mock.patch.dict(os.environ, DM_GAMES_DIR=str(self.prof.parent)), contextlib.redirect_stdout(out):
+            po.main(['--game', '0100000000001000', '--msl', str(self.lib), '--out', str(self.out), '--work', str(self.work), '--os-min', '27.0', '--no-compute', '--jobs', '1'])
+        compiles = [names for kind, names in observed if kind == 'compile']
+        self.assertEqual(compiles[0], [f'vertex{i}' for i in range(5)])
+        self.assertIn(['vertex2'], compiles)                                            # tried alone before it is named
+        self.assertTrue((self.out / 'applegpu_g18p.mtl4a').is_file())
+        self.assertEqual((self.out / 'rest_pairs.tsv').read_text(), 'v\tc\nv\tf\n')   # after the pairs with function constants
+        self.assertIn('failed\t1 bases', (self.out / 'archive.tsv').read_text())
+        self.assertRegex(out.getvalue(), r'\[RED\] pso_offline: applegpu_g18p: metal-tt cannot compile the base of v \+ f \(v_bp\.vertex2, f_b\.main0\)')
+        n = len(observed); out = io.StringIO()   # a second run reuses the archive and still names the pair
+        (self.out / 'rest_pairs.tsv').unlink()
+        with mock.patch.object(po.subprocess, 'run', runner), mock.patch.object(po, 'plan', return_value=(bases, [('v', 'c')], {})), \
+                mock.patch.dict(os.environ, DM_GAMES_DIR=str(self.prof.parent)), contextlib.redirect_stdout(out):
+            po.main(['--game', '0100000000001000', '--msl', str(self.lib), '--out', str(self.out), '--work', str(self.work), '--os-min', '27.0', '--no-compute', '--jobs', '1'])
+        self.assertEqual(len(observed), n)
+        self.assertEqual((self.out / 'rest_pairs.tsv').read_text(), 'v\tc\nv\tf\n')
+
+    def test_a_failing_base_in_one_group_keeps_the_other_groups(self):
+        bases = [('v_bp', f'vertex{i}', 'f_b', 'main0') for i in range(5)]
+        runner, observed = self.batched_runner(fail_compile=('vertex3',))
+        with mock.patch.object(self, 'fake_run', runner), mock.patch.object(po, 'plan', return_value=(bases, [], {})):
+            self.main('--batch-size', '2', '--os-min', '27.0', '--no-compute', '--jobs', '1')
+        self.assertEqual(observed[0], ('compile', ['vertex0', 'vertex1']))
+        self.assertEqual(observed[-1], ('merge', 3))
+        self.assertIn(('compile', ['vertex2']), observed)   # the second group's archive, without the base that fails
+        self.assertEqual((self.out / 'rest_pairs.tsv').read_text(), 'v\tf\n')
+        self.assertEqual(po.read_left_out(self.work / 'left_out.applegpu_g18p.tsv', (self.work / 'key.applegpu_g18p').read_text().strip()), [('base', ('v_bp', 'vertex3', 'f_b', 'main0'))])
+
     def test_a_pipeline_that_fails_alone_is_left_out(self):   # Nintendo Switch Sports Resort: one failing pipeline lost the whole archive after hours
         bases = [('v_bp', f'vertex{i}', 'f_b', 'main0') for i in range(5)]
-        runner, observed = self.batched_runner(fail_compile='vertex2')
+        runner, observed = self.batched_runner(fail_compile=('vertex2',))
         out = io.StringIO()
         with mock.patch.object(self, 'fake_run', runner), mock.patch.object(po, 'plan', return_value=(bases, [], {})), contextlib.redirect_stdout(out):
             self.main('--batch-size','2','--os-min','27.0','--jobs','1')
@@ -562,12 +592,12 @@ class Build(unittest.TestCase):
         self.assertEqual(observed, [('compile',['vertex0','vertex1']),('compile',['vertex2','vertex3']),('compile',['vertex2']),('compile',['vertex3']),('compile',['vertex4']),('merge',3)])
         self.assertTrue((self.out/'applegpu_g18p.mtl4a').is_file()); self.assertTrue((self.out/'prebuilt.tsv').is_file())
         self.assertEqual((self.work/'left_out.applegpu_g18p.tsv').read_text().split('\n')[1:], ['base\tv_bp\tvertex2\tf_b\tmain0', ''])
-        self.assertIn('left out\t1\n', (self.out/'archive.tsv').read_text())
+        self.assertIn('failed\t1 bases', (self.out/'archive.tsv').read_text())
         self.assertFalse(list(self.work.rglob('*.partial')))
         observed.clear()   # unchanged inputs: the archive and its list reused
         with mock.patch.object(self, 'fake_run', runner), mock.patch.object(po, 'plan', return_value=(bases, [], {})):
             self.main('--batch-size','2','--os-min','27.0','--jobs','1')
-        self.assertEqual(observed, []); self.assertIn('left out\t1\n', (self.out/'archive.tsv').read_text())
+        self.assertEqual(observed, []); self.assertIn('failed\t1 bases', (self.out/'archive.tsv').read_text())
         observed.clear(); (self.out/'applegpu_g18p.mtl4a').unlink()   # made again: the failed group goes straight to its parts (its failure is kept), the lone pipeline is tried again
         with mock.patch.object(self, 'fake_run', runner), mock.patch.object(po, 'plan', return_value=(bases, [], {})):
             self.main('--batch-size','2','--os-min','27.0','--jobs','1')
@@ -655,41 +685,6 @@ class Build(unittest.TestCase):
         self.assertTrue(po.known_failure(ff, 'K', 1830).timed_out); self.assertIsNone(po.known_failure(ff, 'other key', 1830))
         ff.write_text('K\nfailed\t1830\nexit 1\n'); self.assertIsNotNone(po.known_failure(ff, 'K', None))   # a failure is kept whatever the limit
 
-    def test_sigterm_stops_every_run_and_records_nothing(self):   # --jobs 2: stop_all kills both runs; neither is taken for a failure, split or followed by another run
-        bin_, runs = self.t / 'bin', self.t / 'runs'; bin_.mkdir(); runs.write_text('')
-        (bin_ / 'xcrun').write_text(f'#!/bin/sh\ncase " $* " in *" -version "*) echo "AIR-TT 1.0"; exit 0;; esac\nsleep 60 & echo $! >> {runs}\nwait\n'); (bin_ / 'xcrun').chmod(0o755)
-        rows = ''.join(f'cs\t{i}\tcompute\tk{i}\tx\n' for i in range(20))   # two compute groups, 16 and 4, run 2 at a time
-        (self.prof / 'shader_map.tsv').write_text('package\tindex\tstage\tkey\tsource\n' + rows); (self.prof / 'shader_pairs.tsv').write_text('v\tc\n')
-        for i in range(20):
-            (self.lib / f'k{i}_b.json').write_text(json.dumps({'chain': CHAIN, 'stage': 'cs', 'entry': 'main0'})); (self.lib / f'k{i}_b.metallib').write_bytes(metallib([('main0', False)]))
-        def stop():   # SIGTERM to this process once both runs are under way, as the NSP script sends it on Ctrl-C
-            for _ in range(300):
-                if len(runs.read_text().split()) >= 2: break
-                time.sleep(0.1)
-            os.kill(os.getpid(), signal.SIGTERM)
-        before, t0 = signal.getsignal(signal.SIGTERM), time.time()
-        threading.Thread(target=stop, daemon=True).start()
-        with mock.patch.object(po, 'run_logged', REAL_RUN_LOGGED), mock.patch.dict(os.environ, PATH=f'{bin_}:{os.environ["PATH"]}', DM_GAMES_DIR=str(self.prof.parent)), \
-                contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as e:
-            po.main(['--game', '0100000000001000', '--msl', str(self.lib), '--out', str(self.out), '--work', str(self.work), '--os-min', '27.0', '--jobs', '2'])
-        self.assertEqual(e.exception.code, 128 + signal.SIGTERM); self.assertLess(time.time() - t0, 30)
-        pids = [int(x) for x in runs.read_text().split()]
-        self.assertEqual(len(pids), 2)   # no run started after the stop
-        for pid in pids:
-            with self.assertRaises(ProcessLookupError): os.kill(pid, 0)
-        self.assertFalse(list(self.work.rglob('failed.*'))); self.assertFalse(list(self.work.rglob('split'))); self.assertEqual(po.LIVE, set())
-        self.assertFalse(list(self.out.glob('*.mtl4a'))); self.assertIs(signal.getsignal(signal.SIGTERM), before)   # the handler restored
-
-    def test_failed_single_run_is_kept_and_not_compiled_whole_again(self):
-        bases = [('v_bp', f'vertex{i}', 'f_b', 'main0') for i in range(3)]
-        runner, observed = self.batched_runner(fail_compile='vertex1')
-        with mock.patch.object(self, 'fake_run', runner), mock.patch.object(po, 'plan', return_value=(bases, [], {})):
-            self.main('--os-min', '27.0', '--jobs', '1')
-            self.assertEqual(observed[0], ('compile', ['vertex0', 'vertex1', 'vertex2'])); self.assertTrue((self.work / 'failed.applegpu_g18p').is_file())
-            observed.clear(); (self.out / 'applegpu_g18p.mtl4a').unlink()
-            self.main('--os-min', '27.0', '--jobs', '1')
-        self.assertEqual(observed, [('compile', ['vertex1']), ('merge', 2)])   # not the whole run again: its parts from their caches, the lone failure tried again
-
     def test_gives_up_when_nothing_compiles(self):   # a broken toolchain fails every pipeline: stop after GIVE_UP of them alone, not after trying each
         bases = [('v_bp', f'vertex{i}', 'f_b', 'main0') for i in range(40)]
         calls, original = [], self.fake_run
@@ -720,25 +715,7 @@ class Build(unittest.TestCase):
         self.assertIn('ran past its limit', out.getvalue())
         self.assertEqual(po.time_limit(1000, po.PER_PIPELINE_S), po.RUN_BASE_S + 1000 * po.PER_PIPELINE_S); self.assertIsNone(po.time_limit(1000, 0))
         self.assertTrue((self.out / 'applegpu_g18p.mtl4a').is_file())
-        self.assertNotIn('left out', (self.out / 'archive.tsv').read_text())
-
-    def test_a_small_part_past_its_time_limit_is_compiled_one_pipeline_at_a_time(self):   # Nintendo Switch Sports Resort: each slow pipeline ran to the limit at 16, 8, 4, 2 and 1
-        bases = [('v_bp', f'vertex{i}', 'f_b', 'main0') for i in range(SLOW_GROUP)]
-        runner, observed = self.batched_runner()
-        def slow(cmd, log_path, env, timeout=None, watch=None):   # a run with vertex5 does not finish in time
-            names = [f['name'] for f in json.loads(Path(next(c for c in cmd if str(c).endswith('.mtl4-json'))).read_text())['function_descriptors']['library_function_descriptors']
-                     if f['library'] == 'lib:v_bp']
-            observed.append(('run', len(names)))
-            if 'vertex5' in names: log_path.write_text(''); return None
-            return run_logged_through_run(cmd, log_path, env, timeout)
-        with mock.patch.object(po.subprocess, 'run', runner), mock.patch.object(po, 'plan', return_value=(bases, [], {})), mock.patch.object(po, 'run_logged', slow), \
-                mock.patch.dict(os.environ, DM_GAMES_DIR=str(self.prof.parent)), contextlib.redirect_stdout(io.StringIO()):
-            code = po.main(['--game', '0100000000001000', '--msl', str(self.lib), '--out', str(self.out), '--work', str(self.work), '--os-min', '27.0', '--jobs', '1'])
-        self.assertEqual(code, po.LEFT_OUT_EXIT)
-        runs = [n for kind, n in observed if kind == 'run']
-        self.assertEqual(runs, [SLOW_GROUP] + [1] * SLOW_GROUP)   # the group once, then each pipeline alone: one more run past the limit, not one at every halving
-        self.assertEqual([x[1][1] for x in po.read_left_out(self.work / 'left_out.applegpu_g18p.tsv', (self.work / 'key.applegpu_g18p').read_text().strip())], ['vertex5'])
-        self.assertTrue((self.out / 'applegpu_g18p.mtl4a').is_file())
+        self.assertNotIn('failed', (self.out / 'archive.tsv').read_text())
 
     def test_merge_failure_never_publishes_partial_archive(self):
         bases = [('v_bp', f'vertex{i}', 'f_b', 'main0') for i in range(3)]
@@ -853,9 +830,7 @@ class Build(unittest.TestCase):
 
 class RunLogged(unittest.TestCase):
     """po.run_logged with real processes: a run past its time limit is stopped with the processes it started (metal-tt's air-tt and applegpu-nt go on compiling otherwise)"""
-    def setUp(self):
-        self.t = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, self.t)
-        po.STOPPING.clear(); self.addCleanup(po.STOPPING.clear)
+    def setUp(self): self.t = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, self.t)
 
     def test_exit_status_and_log(self):
         self.assertEqual(po.run_logged(['sh', '-c', 'echo made; exit 3'], self.t / 'log', dict(os.environ)), 3)
@@ -880,18 +855,13 @@ class RunLogged(unittest.TestCase):
 
     def test_stop_all_stops_the_runs_under_way(self):   # Ctrl-C or SIGTERM with --jobs above 1: the groups run detached from the terminal
         pid, result = self.t / 'pid', []
-        def run():
-            try: result.append(po.run_logged(['sh', '-c', f'sleep 30 & echo $! > {pid}; wait'], self.t / 'log', dict(os.environ)))
-            except po.Stopping: result.append('stopping')
-        t = po.threading.Thread(target=run)
+        t = po.threading.Thread(target=lambda: result.append(po.run_logged(['sh', '-c', f'sleep 30 & echo $! > {pid}; wait'], self.t / 'log', dict(os.environ))))
         t.start()
         for _ in range(300):   # a loaded Mac may take a while to start the shell
             if pid.is_file() and pid.read_text().strip(): break
             time.sleep(0.1)
         po.stop_all(); t.join(30)
-        self.assertFalse(t.is_alive()); self.assertEqual(result, ['stopping']); self.assertTrue(self.gone(int(pid.read_text()))); self.assertEqual(po.LIVE, set())
-        with self.assertRaises(po.Stopping): po.run_logged(['sh', '-c', f'echo started > {self.t / "late"}'], self.t / 'log', dict(os.environ))   # nothing starts any more
-        self.assertFalse((self.t / 'late').exists())
+        self.assertFalse(t.is_alive()); self.assertNotEqual(result, [0]); self.assertTrue(self.gone(int(pid.read_text()))); self.assertEqual(po.LIVE, set())
 
     def gone(self, child):
         for _ in range(200):

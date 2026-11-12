@@ -2,7 +2,6 @@
 front end folds no chain of tests into a switch, which Apple's GPU compiler took hours and tens of gigabytes over (Nintendo Switch Sports Resort's pixel shader 692008b305ce264f in
 the offline pipeline archive). The shader below is the translator's form of a GLSL switch on one word; with dmsh_build.py's and ios_metal.py's compile commands its plain form
 becomes a switch in the front end's IR and its rewritten form none."""
-import ast
 from pathlib import Path
 import shutil
 import subprocess
@@ -19,12 +18,6 @@ import dmsh_rewrite  # noqa: E402
 import ios_metal  # noqa: E402
 
 WORD = '(*spvDescriptorSet0.fp_c5)._m0[16]'
-
-
-def mac_metal():   # dmsh_build.py's MAC_METAL, read without running the script (dmsh_build.py runs a build when imported)
-    for n in ast.parse((TOOLS / 'dmsh_build.py').read_text()).body:
-        if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'MAC_METAL' for t in n.targets): return eval(compile(ast.Expression(n.value), 'dmsh_build.py', 'eval'), {'dmsh_chain': dmsh_chain})   # its flags name dmsh_chain.MAC_MIN_FLAG
-    raise AssertionError('no MAC_METAL in dmsh_build.py')
 
 
 # As spirv-cross writes Ryujinx's structured switch on c5[16].w (the cases 100 to 103 of a material's mode), cut down; the last test with the constant first
@@ -100,6 +93,9 @@ class UniformTests(unittest.TestCase):
         other = 'using namespace metal;\nbool _1 = as_type<int>(%s.w) != _5;\nbool _2 = as_type<int>(%s.w) >= 3;\nbool _3 = _6 == as_type<int>(%s.w);\n' % (WORD, WORD, WORD)
         self.assertEqual(dmsh_rewrite.uniform_tests(other), other, 'tests against no constant, or not of equality')
         self.assertEqual(dmsh_rewrite.uniform_tests('bool _1 = _2 != 3;'), 'bool _1 = _2 != 3;', 'no descriptor set')
+        for bank in (0, 1, 2):   # the driver's banks: the host fills them, and dmsh_entry.vs_base_instance looks for the read of c0 row 100 as written
+            drv = 'using namespace metal;\nbool _1 = as_type<int>((*spvDescriptorSet0.vp_c%d)._m0[100].y) != 0;\nbool _2 = as_type<int>((*spvDescriptorSet0.vp_c%d)._m0[100].y) != 1;\n' % (bank, bank)
+            self.assertEqual(dmsh_rewrite.uniform_tests(drv), drv, 'a driver bank, c%d' % bank)
 
     def test_unsigned_and_negative(self):
         src = 'using namespace metal;\nbool _1 = as_type<uint>(%s.y) == 4u;\nbool _2 = as_type<uint>(%s.y) != 5u;\nbool _3 = -1 != as_type<int>(%s.x);\nbool _4 = as_type<int>(%s.x) == -2;\n' % ((WORD,) * 4)
@@ -120,7 +116,7 @@ class UniformTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which('xcrun'), 'needs Xcode and Metal')
     def test_no_switch_for_the_gpu_compiler(self):
-        for name, command in (('Mac', mac_metal()), ('iPhone', ios_metal.METAL)):
+        for name, command in (('Mac', dmsh_chain.MAC_METAL), ('iPhone', ios_metal.METAL)):
             with self.subTest(platform=name):
                 self.assertGreater(self.switches(command, SHADER), 0, 'the plain tests fold into a switch: the test no longer shows the problem')
                 self.assertEqual(self.switches(command, dmsh_rewrite.uniform_tests(SHADER)), 0)
