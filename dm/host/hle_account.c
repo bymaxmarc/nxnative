@@ -73,6 +73,12 @@ HLE_FORCE("_ZN2nn7account29LoadCachedNintendoAccountInfoEPNS0_25CachedNintendoAc
 // and that call jumped through them (docs/reference/services.md, "An account AsyncContext needs its SDK constructor").
 // NintendoAccountAuthorizationRequestContext has no vtable: its constructor writes no memory, and its contents are read and written only by the interfaces below.
 HLE_FORCE("_ZN2nn7account44EnsureNetworkServiceAccountIdTokenCacheAsyncEPNS0_12AsyncContextERKNS0_10UserHandleE", "network service account token, out of scope; cut", Result, h_acc_EnsureTokAsync, void *ctx, const UserHandle *h) { (void)ctx; (void)h; return RES_FAIL; }
+// The Nintendo Switch Online license of a user (Switch Sports Resort asks entering its online room, main+0x31d9994). The SDK's own sends the request through the user handle's
+// session (a read through the host's handle at sdk+0x1b1f9c); the host has no network service, so the request completes at once (the context's event fires, as for every
+// AsyncContext here) and the license is "none" (NetworkServiceLicenseKind 0; the SDK's getter, sdk+0x1b1f10, takes 0 and 1): the game then offers what needs no license
+HLE_FORCE("_ZN2nn7account34LoadNetworkServiceLicenseInfoAsyncEPNS0_37AsyncNetworkServiceLicenseInfoContextERKNS0_10UserHandleE", "online license request: completes at once, no license (no network service)",
+          Result, h_acc_LoadLicAsync, void *ctx, const UserHandle *h) { (void)ctx; (void)h; return RES_OK; }
+HLE_FORCE("_ZN2nn7account37AsyncNetworkServiceLicenseInfoContext28GetNetworkServiceLicenseKindEv", "online license: none", int, h_acc_LicKind, void *self) { (void)self; return 0; }
 HLE_FORCE("_ZN2nn7account12AsyncContext14GetSystemEventEPNS_2os11SystemEventE", "async completion event; fires immediately", Result, h_acc_AcGetEv, void *self, void *ev) { (void)self; hle_signal_system_event(ev); return RES_OK; }
 HLE_FORCE("_ZN2nn7account12AsyncContext9GetResultEv", "async result; networking is cut, always fails", Result, h_acc_AcGetRes, void *self) { (void)self; return RES_FAIL; }
 HLE_FORCE("_ZN2nn7account42NintendoAccountAuthorizationRequestContextC1Ev", "Nintendo Account authorization, out of scope; the constructor writes no memory", void, h_acc_NaCtor, void *self) { (void)self; }

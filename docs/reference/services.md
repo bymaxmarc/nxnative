@@ -901,6 +901,13 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Fix:** the constructor is no longer taken over (`hle_account.c`): the SDK's own runs. No host interface sets the IPC pointer, so the SDK's destructor, reached through the vtable, finds no session to close and frees the object. `friends::AsyncContext` and `account::NintendoAccountAuthorizationRequestContext` have no vtable (their SDK constructors write none), so their takeovers stay.
 - **Found on:** Pokémon Friends (`010008C01E742000`, update 1.1.5, SDK 19.3.11; no profile in the repository yet). The managed names come from Il2CppDumper's table ([IL2CPP method lookup](../development.md#il2cpp-method-lookup)).
 
+### The online license request
+
+- **Symptom:** `CRASH sig=11` at `sdk+0x1b1f9c` in `nn::account::LoadNetworkServiceLicenseInfoAsync`, the faulting address the text `USERHNDL` (the host's user handle), entering Switch Sports Resort's online room ("Sala en línea") after Select User (called from `main+0x31d9994`).
+- **Cause:** the SDK's own function sends the request through the user handle's session; the host's handle has none.
+- **Fix:** taken over (`hle_account.c`): the request completes at once (the context's event fires, as for every account `AsyncContext` here) and `AsyncNetworkServiceLicenseInfoContext::GetNetworkServiceLicenseKind` answers 0, no Nintendo Switch Online license (the SDK's getter, `sdk+0x1b1f10`, takes 0 and 1). The host has no network service.
+- **Found on:** [Nintendo Switch Sports Resort](../../dm/games/04008E001F098000/README.md).
+
 ### Creating an ssl context needs no network
 
 - **Symptom:** the game ends right after `nnMain`, with a crash in its own cleanup on an object it had not created yet (DRAGON QUEST BUILDERS 2: `CRASH sig=11 addr=0x60db0` at `main+0x2676c8`, x0 = 0, the callers `main+0x85210` and `main+0x7fabf8`). No red line.
