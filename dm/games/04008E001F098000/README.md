@@ -50,6 +50,17 @@ There is no game-specific patch and no rewriter cut. Everything else it needed i
 
 The work folder `04008E001F098000-work` beside the dump has `run/boot.sh <log> <secs> [VAR=value…]` (`DMHOST=` for another host), `run/go.sh <shot> <wait> <presses…>` for a run with `DM_CTL`, `run/to_select.sh` and `run/play.sh <prefix> <host> <secs>`: from the save in `run/save`, A presses through the title, Select User, Tennis's match settings and the court into a doubles match at its serve prompt (about 2 minutes), then `Shake` every 2 s with a shot every 30 s.
 
+## Local play between consoles
+
+The game's local play between consoles goes through Pia's `pia::local` over `nn::ldn`; the host serves it over IP with `DM_NETWORK=ldn` ([Local wireless (LDN) over IP](../../../docs/reference/services.md#local-wireless-ldn-over-ip)). What the game does there (static analysis of `main`, 2026-11-13):
+
+- Pia's LDN code is `main+0x13b9180`-`0x13be480`; its `LocalService` initializes LDN and sets the protocol right after (`main+0x13c1c20`, [LDN protocol (Switch 2 SDK)](../../../docs/reference/services.md#ldn-protocol-switch-2-sdk)), as does the game's network manager for its mode 2 (`main+0x3902b50`, which drops local play on a nonzero result). `MakeBroadcastAddress` is the SDK's own computation.
+- Its one UDP socket: `Socket(2, 2, 17)`, `SO_REUSEPORT`, bound to `0.0.0.0:12345` (`main+0x13b9f5c`, `main+0x13ba010`), then `SO_BROADCAST`; non-blocking receives (flag 0x80). It sends to the LDN broadcast address on port 12345 (`main+0x13c2e78`) and to each connected `NodeInfo` address on 12345, and drops datagrams from its own address. Error numbers are Linux's ([Socket error numbers are Linux's](../../../docs/reference/services.md#socket-error-numbers-are-linuxs)).
+- A station looks for its own `GetIpv4Address` among the `NodeInfo` addresses (`main+0x13baea0`) and takes the host's and its own MAC from there; nifm is not used in LDN mode.
+- Two instances on one Mac: one on `lo0`, one on `en0`, each with its own `DM_LDN_PORT` and the other in `DM_NET_DISCOVERY_PEER` ([Two LDN instances on one Mac](../../../docs/reference/services.md#two-ldn-instances-on-one-mac)).
+
+**Open: no menu reached here starts it.** The game makes its LDN session at boot (`main+0x38ef770`: a session of type 2 with Pia's `LocalService`; the network manager's mode 2, `main+0x3902910`), but in two runs on the M2 Max (2026-11-13, `DM_PROBE` on the session's update `main+0x38ef8c0`, the mode-2 start `main+0x38ef904`, the network manager and `LocalService`'s start) neither the sports' menus (Play, 1 or 2 players), "Sala en línea" (1 player, Select User, Ready) nor "Amistoso en línea" (Search for a friend) made it active: both online menus start mode 1 (internet). "Sala en línea" (its rules: up to two consoles, 2-8 players) first checks the network (`main+0x31d98b8`), the network service login and the online license (`main+0x31d9994`); with nifm reporting a network it stops at the login, which the host cuts (error `0x2a2`), and without one it returns to the menu. The `Local` button (layout `LBtnLocalM`, in `LMenuSubList` and `Cmn_MenuSub`) was not seen. Which screen offers local play between consoles, and whether it needs the online room first, is not known.
+
 ## Open
 
 - A point played on the Mac in this tree (needs a motion controller, or scripted moves that serve).
@@ -57,6 +68,7 @@ The work folder `04008E001F098000-work` beside the dump has `run/boot.sh <log> <
 - Mii heads need the player's own console files: without the system data the game mounts as `MiiResource` (`0400000000000849`) it logs `[RED] fs mount system data MiiResource: the host has no 0400000000000849` and draws no heads. With that archive and the console's Mii database under `DM_SYSTEM_DIR` ([A console's own Mii database and system data](../../../docs/reference/services.md#a-consoles-own-mii-database-and-system-data)) it lists the player's Miis and draws their heads (FifteenPen, PR #2274, M4 Pro); not run in this tree, which has no console files.
 - The 6 refused mesh shaders, above.
 - iPhone and iPad: no IPA built.
+- Local play between consoles: the menu that starts it ([Local play between consoles](#local-play-between-consoles)).
 
 ## Found on this game
 
@@ -72,3 +84,5 @@ The work folder `04008E001F098000-work` beside the dump has `run/boot.sh <log> <
 - [Conditional rendering evaluated at replay](../../../docs/reference/rendering.md#conditional-rendering-evaluated-at-replay)
 - [Tests of one uniform word folded into switches](../../../docs/reference/shaders.md#tests-of-one-uniform-word-folded-into-switches) and [Specialized second functions in the offline pipeline archive](../../../docs/reference/shaders.md#specialized-second-functions-in-the-offline-pipeline-archive)
 - [A console's own Mii database and system data](../../../docs/reference/services.md#a-consoles-own-mii-database-and-system-data): its Mii heads come from the Switch 2's own archive, `0400000000000849`.
+- [Local wireless (LDN) over IP](../../../docs/reference/services.md#local-wireless-ldn-over-ip), [LDN protocol (Switch 2 SDK)](../../../docs/reference/services.md#ldn-protocol-switch-2-sdk), [Two LDN instances on one Mac](../../../docs/reference/services.md#two-ldn-instances-on-one-mac), [Host IPv4 sockets for play on the local network](../../../docs/reference/services.md#host-ipv4-sockets-for-play-on-the-local-network) and [Socket error numbers are Linux's](../../../docs/reference/services.md#socket-error-numbers-are-linuxs): its local play through Pia
+- [The online license request](../../../docs/reference/services.md#the-online-license-request): a crash entering its online room
