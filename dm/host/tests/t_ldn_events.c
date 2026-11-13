@@ -32,6 +32,8 @@ long dm_net_discovery_send_native(int fd,const void *bytes,size_t size,int flags
     struct sockaddr_in to={.sin_len=sizeof to,.sin_family=AF_INET,.sin_addr={address},.sin_port=port};return sendto(fd,bytes,size,flags,(struct sockaddr *)&to,sizeof to);
 }
 int dm_net_errno(void) { return 13; }
+int dm_net_discovery_peer(uint32_t *address, uint16_t *port) { (void)address; if (port) *port = 0; return 0; }
+int dm_net_interface_pinned(void) { return 0; }
 int dm_net_multicast_allowed(void) { return 0; }
 static void *read_during_finalize(void *argument) {
     int which=(int)(uintptr_t)argument; Result r;
@@ -71,6 +73,21 @@ int main(void) {
     assert(h_ldn_Protocol(0) == 0 && atomic_load(&g_ldn_protocol) == 4);
     assert(h_ldn_Protocol(3) == 0 && atomic_load(&g_ldn_protocol) == 3);
     assert(h_ldn_Protocol(5) == LDN_INVALID && h_ldn_Protocol(-1) == LDN_INVALID && atomic_load(&g_ldn_protocol) == 3 && waits == 0);
+    // Two instances on one Mac: the LDN port, and a game broadcast in the network going to the other members
+    unsetenv("DM_LDN_PORT"); assert(ldn_port() == 11452);
+    setenv("DM_LDN_PORT", "11460", 1); assert(ldn_port() == 11460);
+    setenv("DM_LDN_PORT", "0", 1); assert(ldn_port() == 11452);
+    setenv("DM_LDN_PORT", "70000", 1); assert(ldn_port() == 11452);
+    setenv("DM_LDN_PORT", "12a", 1); assert(ldn_port() == 11452); unsetenv("DM_LDN_PORT");
+    uint32_t members[8];
+    c->transport.address = htonl(0x7f000001); c->transport.mask = htonl(0xff000000); c->state = LDN_AP;
+    assert(dm_ldn_broadcast_members(htonl(0x7fffffff), members, 8) == -1);   // no network yet
+    c->state = LDN_CREATED; c->network.nodes[0] = (dm_ldn_node){.ip = 0x7f000001, .connected = 1}; c->network.nodes[2] = (dm_ldn_node){.ip = 0xc0a80186, .id = 2, .connected = 1};
+    assert(dm_ldn_broadcast_members(htonl(0x7fffffff), members, 8) == 1 && members[0] == htonl(0xc0a80186));   // the network's broadcast: the other member, not this one
+    assert(dm_ldn_broadcast_members(UINT32_MAX, members, 8) == 1);
+    assert(dm_ldn_broadcast_members(htonl(0xc0a801ff), members, 8) == -1);   // another subnet's broadcast is not this network's
+    assert(dm_ldn_broadcast_members(htonl(0x7fffffff), members, 0) == 0);
+    pthread_rwlock_wrlock(&g_ldn_lock); assert(dm_ldn_broadcast_members(htonl(0x7fffffff), members, 8) == -1); pthread_rwlock_unlock(&g_ldn_lock);   // never waits behind Finalize
     g_ldn = NULL; pthread_mutex_destroy(&c->lock); free(c);
-    puts("LDN event close/reuse, observers, concurrent getter/Finalize, offline state and SetProtocol passed."); return 0;
+    puts("LDN event close/reuse, observers, concurrent getter/Finalize, offline state, SetProtocol, the LDN port and broadcasts to members passed."); return 0;
 }

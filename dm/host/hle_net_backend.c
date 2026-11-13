@@ -87,17 +87,27 @@ static int net_discovery_unicast_plan(dm_net_discovery_plan *p) {
     if (dm_net_discovery_subnet(p, adapter.address, adapter.mask)) { dm_net_set_errno(95); return -1; }
     return 0;
 }
+// DM_NET_DISCOVERY_PEER: "a.b.c.d" or "a.b.c.d:port". The port is where LDN scans go (hle_ldn.c; another instance's DM_LDN_PORT); a game's own discovery
+// datagrams keep their port. 0 when unset, 1 when valid (*port 0 without one, network order), -1 when malformed
+int dm_net_discovery_peer(uint32_t *address, uint16_t *port) {
+    const char *peer = getenv("DM_NET_DISCOVERY_PEER");
+    if (!peer || !*peer) return 0;
+    char text[64]; const char *colon = strchr(peer, ':'); size_t n = colon ? (size_t)(colon - peer) : strlen(peer);
+    if (n >= sizeof text) return -1;
+    memcpy(text, peer, n); text[n] = 0;
+    struct in_addr a; unsigned long value = 0; char *end = NULL;
+    if (inet_pton(AF_INET, text, &a) != 1 || !a.s_addr || ntohl(a.s_addr) >= 0xe0000000u) return -1;
+    if (colon) { value = strtoul(colon + 1, &end, 10); if (!colon[1] || *end || !value || value > 65535) return -1; }
+    if (address) *address = a.s_addr;
+    if (port) *port = htons((uint16_t)value);
+    return 1;
+}
 int dm_net_discovery_prepare(uint32_t destination, dm_net_discovery_plan *p) {
     if (!p) { dm_net_set_errno(14); return -1; }
     memset(p, 0, sizeof *p);
-    const char *peer = getenv("DM_NET_DISCOVERY_PEER");
-    if (peer && *peer) {
-        struct in_addr address;
-        if (inet_pton(AF_INET, peer, &address) != 1 || !address.s_addr ||
-            (ntohl(address.s_addr) & 0xf0000000u) == 0xe0000000u ||
-            ntohl(address.s_addr) >= 0xf0000000u) { dm_net_set_errno(22); return -1; }
-        p->target = address.s_addr; p->count = 1; return 0;
-    }
+    uint32_t peer_address; int peer = dm_net_discovery_peer(&peer_address, NULL);
+    if (peer < 0) { dm_net_set_errno(22); return -1; }
+    if (peer) { p->target = peer_address; p->count = 1; return 0; }
     if (dm_net_multicast_allowed()) { p->target = destination; p->count = 1; return 0; }
     return net_discovery_unicast_plan(p);
 }
@@ -128,8 +138,8 @@ static int net_is_discovery(uint32_t address, int type) {
 }
 int dm_net_discovery_supplement(uint32_t destination,dm_net_discovery_plan *plan) {
     if(!plan)return 0;memset(plan,0,sizeof *plan);
-    const char *peer=getenv("DM_NET_DISCOVERY_PEER");dm_net_mode_t mode=dm_net_mode();
-    if(!dm_net_multicast_allowed()||(peer&&*peer)||(mode!=DM_NET_LAN&&mode!=DM_NET_LDN&&mode!=DM_NET_AUTO)||!net_is_discovery(destination,2))return 0;
+    int peer=dm_net_discovery_peer(NULL,NULL);dm_net_mode_t mode=dm_net_mode();
+    if(!dm_net_multicast_allowed()||peer||(mode!=DM_NET_LAN&&mode!=DM_NET_LDN&&mode!=DM_NET_AUTO)||!net_is_discovery(destination,2))return 0;
     int saved=t_net_errno,result=!net_discovery_unicast_plan(plan);t_net_errno=saved;return result;
 }
 int dm_net_errno(void) { return t_net_errno; }
@@ -205,6 +215,8 @@ int dm_net_is_socket(int fd) {
 }
 // hle_net.c answers for its event descriptors (-1: not one); programs without it (the transport's own tests) have none
 __attribute__((weak)) int dm_net_efd_revents(int fd, int events) { (void)fd; (void)events; return -1; }
+// hle_ldn.c lists the other members of the LDN network whose broadcast address this is (-1: not an LDN network's broadcast); programs without it have no LDN network
+__attribute__((weak)) int dm_ldn_broadcast_members(uint32_t destination, uint32_t *members, int max) { (void)destination; (void)members; (void)max; return -1; }
 static int net_register(int fd, int type, int nonblock) {
     if (fcntl(fd, F_SETFL, O_NONBLOCK) < 0 || fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) { int e = errno; close(fd); return net_error(net_errno(e)); }
     int one = 1;
@@ -270,9 +282,20 @@ static int net_close_owned(int guest, int check_generation, uint64_t generation)
 int dm_net_close(int guest) { return net_gate() ? net_close_owned(guest, 0, 0) : -1; }
 int dm_net_close_generation(int guest, uint64_t generation) { return net_close_owned(guest, 1, generation); }
 void dm_net_finalize(void) { for (int i = 0; i < NET_MAX; i++) { pthread_mutex_lock(&g_net_lock); int used = g_sockets[i].used; pthread_mutex_unlock(&g_net_lock); if (used) net_close_owned(i, 0, 0); } }
+// DM_NETWORK=ldn with DM_NETWORK_INTERFACE: the game's sockets bound to any address are bound to that interface's address, so two instances on one Mac (one on lo0, one on
+// en0) each receive the datagrams sent to their own LDN address, though both games bind the same port (Pia: 0.0.0.0:12345 with SO_REUSEPORT, which on Darwin hands a unicast
+// datagram to one of the two sockets). They then receive no broadcast, which an LDN network does not need: its broadcasts reach the members as unicast (dm_net_send)
+int dm_net_interface_pinned(void) {
+    const char *name = getenv("DM_NETWORK_INTERFACE");
+    return name && *name && dm_net_mode() == DM_NET_LDN;
+}
 int dm_net_bind(int guest, const void *addr, unsigned len) {
     if (!net_gate()) return -1;
     struct sockaddr_in a; if (net_addr_in(addr, len, &a)) return -1;
+    if (!a.sin_addr.s_addr && dm_net_interface_pinned()) {
+        uint32_t own; if (dm_net_ipconfig(&own, NULL, NULL, NULL, NULL)) return net_error(99);
+        a.sin_addr.s_addr = own;
+    }
     net_ref r; if (net_borrow(guest, &r)) return -1;
     int result = bind(r.fd, (struct sockaddr *)&a, sizeof a), err = errno; close(r.fd);
     result = net_host_result(result, err); net_trace("bind", guest, result); return result;
@@ -369,6 +392,18 @@ long dm_net_recv(int guest, void *buf, unsigned long len, int flags, void *addr,
     }
     close(r.fd); net_trace("recv", guest, result); return result;
 }
+// A datagram to the broadcast address of the LDN network the game is in goes to each other member as unicast, to the same port. On a console the network is its own
+// radio cell and its broadcast reaches exactly its members; here the members can be on different subnets (two instances on one Mac, lo0 and en0) or behind a LAN that
+// drops broadcasts, and their addresses are known (NodeInfo). A broadcast with no other member is sent to nobody and succeeds, as it would on the radio
+static long net_ldn_fanout(const net_ref *r, const void *buf, size_t len, int flags, struct sockaddr_in a, const uint32_t *members, int count) {
+    int sent = 0, error = 0;
+    for (int i = 0; i < count; i++) {
+        a.sin_addr.s_addr = members[i];
+        if (sendto(r->fd, buf, len, flags, (struct sockaddr *)&a, sizeof a) >= 0) sent++; else error = errno;
+    }
+    if (count && !sent) return net_error(net_errno(error));
+    return (long)len;
+}
 long dm_net_send(int guest, const void *buf, unsigned long len, int flags, const void *addr, unsigned addrlen) {
     if (!net_gate()) return -1;
     if (!buf && len) return net_error(14);
@@ -376,6 +411,10 @@ long dm_net_send(int guest, const void *buf, unsigned long len, int flags, const
     struct sockaddr_in a; if (addr && net_addr_in(addr, addrlen, &a)) return -1;
     int hostflags = net_message_flags(flags, 1); if (hostflags < 0) return -1;
     net_ref r; if (net_borrow(guest, &r)) return -1;
+    if (addr && r.type == 2) {
+        uint32_t members[8]; int count = dm_ldn_broadcast_members(a.sin_addr.s_addr, members, 8);
+        if (count >= 0) { long result = net_ldn_fanout(&r, buf, len, hostflags, a, members, count); close(r.fd); net_trace("send-ldn-broadcast", guest, result); return result; }
+    }
     int discovery=addr&&net_is_discovery(a.sin_addr.s_addr,r.type);
     if (discovery) {
         dm_net_discovery_plan plan;

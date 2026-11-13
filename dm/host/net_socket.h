@@ -33,13 +33,19 @@ int dm_net_discovery_supplement(uint32_t destination,dm_net_discovery_plan *plan
 long dm_net_discovery_send_native(int fd,const void *bytes,size_t size,int flags,
                                   uint32_t address,uint16_t port);
 int dm_net_discovery_target(uint32_t broadcast, uint32_t *target);
+// DM_NET_DISCOVERY_PEER, "a.b.c.d[:port]": 0 unset, 1 valid (network order; *port 0 without one), -1 malformed
+int dm_net_discovery_peer(uint32_t *address, uint16_t *port);
+// DM_NETWORK=ldn with DM_NETWORK_INTERFACE: the game's wildcard binds take that interface's address
+int dm_net_interface_pinned(void);
 // One descriptor number space for sockets and hle_net.c's event descriptors (the lowest free number, from 0)
 int dm_net_fd_reserve(void);
 void dm_net_fd_unreserve(int fd);
 int dm_net_is_socket(int fd);
 // hle_net.c: Horizon revents of an event descriptor for these events, -1 when fd is not one (a socket wait asks it for the event descriptors it names)
 int dm_net_efd_revents(int fd, int events);
-
+// hle_ldn.c: when destination is the broadcast address of the LDN network the game is in (or 255.255.255.255 while in one), the other members' addresses
+// (network order, at most max) and their count; -1 otherwise. A game's datagram there goes to each of them (dm_net_send)
+int dm_ldn_broadcast_members(uint32_t destination, uint32_t *members, int max);
 void dm_net_set_multicast_allowed(int allowed);
 int dm_net_multicast_allowed(void);
 #ifdef DM_NET_TEST

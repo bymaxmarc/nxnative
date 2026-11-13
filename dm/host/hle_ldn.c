@@ -326,7 +326,7 @@ uint32_t dm_ldn_connect(dm_ldn_context *c, const dm_ldn_network *network, const 
     // Node count can change between Scan and Connect. Admission uses the
     // listener's current roster, rather than rejecting a stale full snapshot.
     pthread_mutex_lock(&c->lock); if (c->state != LDN_STATION || c->peers[0].fd >= 0) { pthread_mutex_unlock(&c->lock); return LDN_INVALID_STATE; }
-    struct sockaddr_in dest = ldn_endpoint(htonl(network->nodes[0].ip), 11452);
+    struct sockaddr_in dest = ldn_endpoint(htonl(network->nodes[0].ip), c->transport.discovery_port);   // a room this context did not scan: the host's port as a scan's
     for (int i = 0; i < c->room_count; ++i) if (!memcmp(&network->id, &c->rooms[i].network.id, sizeof network->id)) dest = c->rooms[i].endpoint;
     int fd = socket(AF_INET, SOCK_STREAM, 0); if (fd < 0) { pthread_mutex_unlock(&c->lock); return LDN_CONNECT_FAILED; }
     ldn_nonblock(fd); struct sockaddr_in local = ldn_endpoint(c->transport.address, 0);
@@ -415,11 +415,41 @@ static Result ldn_hook_info(dm_ldn_network *out, dm_ldn_update *updates, int cou
     }
     return ldn_hook_result("Info", result);
 }
+// The UDP discovery and TCP session port (ldn_mitm's 11452 by default). Two instances on one Mac each take their own, and DM_NET_DISCOVERY_PEER=a.b.c.d:port names
+// the other's: a scan goes there, and the session follows the port the answer came from
+static unsigned ldn_port(void) {
+    const char *s = getenv("DM_LDN_PORT"); char *end = NULL;
+    if (!s || !*s) return 11452;
+    unsigned long port = strtoul(s, &end, 10);
+    if (*end || !port || port > 65535) { LOG("[RED] DM_LDN_PORT=%s is not a port: 11452", s); return 11452; }
+    return (unsigned)port;
+}
+// A game datagram to this network's broadcast address goes to the other members (hle_net_backend.c). Never waits: a Finalize in progress means no network
+int dm_ldn_broadcast_members(uint32_t destination, uint32_t *members, int max) {
+    if (pthread_rwlock_tryrdlock(&g_ldn_lock)) return -1;
+    int count = -1; dm_ldn_context *c = g_ldn;
+    if (c) {
+        pthread_mutex_lock(&c->lock);
+        uint32_t own = c->transport.address, broadcast = own | ~c->transport.mask;
+        if ((c->state == LDN_CREATED || c->state == LDN_CONNECTED) && (destination == broadcast || destination == UINT32_MAX)) {
+            count = 0;
+            for (int i = 0; i < 8 && count < max; i++)
+                if (c->network.nodes[i].connected && htonl(c->network.nodes[i].ip) != own) members[count++] = htonl(c->network.nodes[i].ip);
+        }
+        pthread_mutex_unlock(&c->lock);
+    }
+    pthread_rwlock_unlock(&g_ldn_lock);
+    return count;
+}
 static int ldn_enabled(void) { const char *m = getenv("DM_NETWORK"); return m && (!strcmp(m, "ldn") || !strcmp(m, "auto")); }
 HLE_FORCE_WAIT("_ZN2nn3ldn10InitializeEv", "native ldn_mitm control transport", Result, h_ldn_Init, void) { LDN_WRITE();
     if (!ldn_enabled()) return ldn_hook_result("InitDisabled", LDN_ERROR(22)); if (g_ldn) return ldn_hook_result("InitExisting",0);
-    dm_ldn_transport t = {.port=11452, .discovery_port=11452, .scan_ms=1000, .connect_ms=4000};
+    dm_ldn_transport t = {.port=ldn_port(), .scan_ms=1000, .connect_ms=4000};
+    uint16_t peer_port = 0;
+    if (dm_net_discovery_peer(NULL, &peer_port) < 0) { LOG("[RED] DM_NET_DISCOVERY_PEER is not a.b.c.d or a.b.c.d:port"); return LDN_ERROR(22); }
+    t.discovery_port = peer_port ? ntohs(peer_port) : t.port;
     if (dm_net_ipconfig(&t.address, &t.mask, NULL, NULL, NULL)) return LDN_ERROR(16);
+    if (dm_net_interface_pinned()) t.bind_address = t.address;   // one instance per interface: its discovery socket answers from its own address
     t.discovery = t.address | ~t.mask; dm_net_discovery_plan plan;
     if (dm_net_discovery_prepare(t.discovery, &plan)) {
         LOG("[RED] LDN discovery unavailable (errno %d): no eligible bounded IPv4 LAN or valid explicit peer", dm_net_errno());

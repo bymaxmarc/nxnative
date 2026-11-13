@@ -100,6 +100,7 @@ DM_KEYS	switch	Scripted input: `<seconds or f<frame>>:<key>[+key][~hold or ~f<fr
 DM_LANG	player	Game language as a language code (default `en-US`; the iOS app sets the one the IPA was packed with)
 DM_LAUNCHER	switch	`0` skips the iOS settings screen or the Mac settings window and starts the game at once, with the saved choices (on the Mac also `--no-launcher`)
 DM_LAUNCH_PARAM	path	File whose bytes `oe::TryPopLaunchParameter` returns once; `oe::ExecuteProgram` sets it for the program it starts; a relaunch removes it
+DM_LDN_PORT	player	With `DM_NETWORK=ldn` or `auto`, the UDP discovery and TCP session port of local wireless over IP (default ldn_mitm's 11452); two instances on one Mac take one each and name the other's in `DM_NET_DISCOVERY_PEER`
 DM_LDN_TRACE	diagnostic	`=1` logs each `nn::ldn` call over IP (result, state, disconnect reason), its scans and session frames to stderr; no addresses, names or payloads
 DM_LINK_VTICK	switch	`0` keeps the system's display-link rate on 144 or 165 Hz Mac screens; by default the link counts only the refreshes nearest a steady 1/60 s clock
 DM_LOADHASH	diagnostic	`=1` logs an address-independent SHA-256 per module after loading
@@ -120,8 +121,8 @@ DM_MOVIE_TRACE	diagnostic	When set, the movie decoder logs every call with its t
 DM_MSL_DIR	path	Parent folder of the shader libraries: NVN loads from `b-<chain version>/` or the one file `b-<chain version>.img` beneath it, Vulkan from `vk/`, GL from `gl/`; the app and the Mac launcher set it
 DM_NDVE_ENGINE	switch	`0` runs nn::ndve's movie network (Ocarina of Time's title and opening movies) as the game's 12 translated dispatches after its colour conversion instead of the host's kernels (dm/gfx/msl/ndve_engine.metal, on by default: the same output, about half the frame's GPU time on an M4 Pro); `ab` alternates with DM_AB; `check` runs the game's dispatches and the host's network beside them and logs every 300 frames how many texels of the two differ. The host's kernels take only the model they were written for, bound by its shaders' keys and its weights' layout (docs/reference/shaders.md, The NDVE movie network by the host)
 DM_NETWORK	player	`lan`, `ldn` or `auto` turns on the host's IPv4 sockets and nifm reports the host's adapter, for play on the local network (`ldn` and `auto` also local wireless over IP); unset or anything else: offline, every socket call fails
-DM_NETWORK_INTERFACE	player	With `DM_NETWORK`, the IPv4 interface the sockets and nifm use (`en0`, `lo0`, …) instead of the default route's
-DM_NET_DISCOVERY_PEER	player	With `DM_NETWORK`, `a.b.c.d`: a game's datagrams to a broadcast address (its discovery) go to that address instead, for a peer the broadcast does not reach
+DM_NETWORK_INTERFACE	player	With `DM_NETWORK`, the IPv4 interface the sockets and nifm use (`en0`, `lo0`, …) instead of the default route's; with `DM_NETWORK=ldn` the game's sockets bound to any address and the LDN discovery socket take that interface's address (two instances on one Mac, one on `lo0` and one on `en0`)
+DM_NET_DISCOVERY_PEER	player	With `DM_NETWORK`, `a.b.c.d[:port]`: a game's datagrams to a broadcast address (its discovery) go to that address instead, on their own port; LDN scans go there too, to `port` when given (another instance's `DM_LDN_PORT`), else to this instance's LDN port
 DM_NET_TRACE	diagnostic	`=1` logs each host socket call (descriptor, result, Linux error number) to stderr
 DM_NICK	switch	The account nickname the game sees (default `Player`)
 DM_NRO	switch	`0` turns off loading of the NRO modules the game's NRR files register (on by default): every `nn::ro::LoadModule` then fails

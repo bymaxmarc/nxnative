@@ -1037,6 +1037,14 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Check:** `t_ldn_events` (before `Initialize`, values 0, 3, 5 and -1).
 - **Found on:** [Nintendo Switch Sports Resort](../../dm/games/04008E001F098000/README.md).
 
+### Two LDN instances on one Mac
+
+- **Symptom:** two hosts on one Mac cannot play local wireless with each other: the second one's LDN discovery socket cannot bind UDP 11452, and once both games run, the datagrams one sends to the other's address reach either game. Pia binds `0.0.0.0:12345` with `SO_REUSEPORT` (Switch Sports Resort `main+0x13b9f5c`, `main+0x13ba010`), which on Darwin lets both bind and hands a unicast datagram to one of the two sockets.
+- **Cause:** ldn_mitm fixes the port (11452), and two instances on one address cannot be told apart by the games' fixed ports. The station also needs its own address in the host's `NodeInfo` list (`main+0x13baea0`), so the two need different addresses.
+- **Fix:** each instance takes its own interface and its own LDN port: `DM_LDN_PORT` sets the discovery and session port (default 11452), `DM_NET_DISCOVERY_PEER=a.b.c.d:port` names the other's, and a scan goes there; a station then connects to the port the answer came from. With `DM_NETWORK=ldn` and `DM_NETWORK_INTERFACE`, the game's sockets bound to any address and the LDN discovery socket take that interface's address, so one instance on `lo0` (127.0.0.1) and one on `en0` each receive their own datagrams. Such a socket receives no broadcast, and the two are on different subnets, so a game datagram to the LDN network's broadcast address (`GetIpv4Address` and `MakeBroadcastAddress`; Pia sends to it on port 12345, `main+0x13c2e78`) goes to each other member of the network as unicast, on the same port (`dm_ldn_broadcast_members`). That holds without the pinned interface too: an LDN network's broadcast reaches exactly its members, as on the radio. For example, A: `DM_NETWORK=ldn DM_NETWORK_INTERFACE=lo0 DM_LDN_PORT=11452 DM_NET_DISCOVERY_PEER=<en0 address>:11453`, B: `DM_NETWORK=ldn DM_NETWORK_INTERFACE=en0 DM_LDN_PORT=11453 DM_NET_DISCOVERY_PEER=127.0.0.1:11452`. Unset, everything stays as ldn_mitm's.
+- **Check:** `t_net` (a peer with a port, the pinned bind, a broadcast to the members), `t_ldn_events` (the port, the members of a network).
+- **Found on:** [Nintendo Switch Sports Resort](../../dm/games/04008E001F098000/README.md).
+
 ### Socket error numbers are Linux's
 
 - **Symptom:** a game that retries a non-blocking receive on "no data yet" treats it as a broken socket instead.

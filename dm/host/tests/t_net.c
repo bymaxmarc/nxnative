@@ -72,6 +72,12 @@ void *guest_sym(const char *name) {
     return NULL;
 }
 
+// The LDN network's members as hle_ldn.c lists them: 10.255.255.255 stands for the network's broadcast, with the members set by the test
+static int ldn_members = -1; static uint32_t ldn_member[2];
+int dm_ldn_broadcast_members(uint32_t destination, uint32_t *members, int max) {
+    if (ldn_members < 0 || destination != htonl(0x0affffff)) return -1;
+    int n = ldn_members < max ? ldn_members : max; for (int i = 0; i < n; i++) members[i] = ldn_member[i]; return n;
+}
 static void *hook(const char *name) {
     unsigned long bytes; const hle_force_ent *p = (const hle_force_ent *)getsectiondata(&_mh_execute_header, "__DATA", "swforce", &bytes);
     for (unsigned long i = 0; p && i < bytes / sizeof *p; i++) if (!strcmp(p[i].name, name)) return p[i].fn;
@@ -294,9 +300,40 @@ static void discovery_peer(void) {
           "capable host retains native discovery destination");
     CLOSE(guest); close(native);
 }
+static void two_instances(void) {
+    // DM_NET_DISCOVERY_PEER takes a port for LDN scans; a game's own discovery keeps its port
+    uint32_t a; uint16_t port;
+    setenv("DM_NET_DISCOVERY_PEER", "127.0.0.1:11460", 1); CHECK(dm_net_discovery_peer(&a, &port) == 1 && a == htonl(0x7f000001) && port == htons(11460), "peer with a port");
+    setenv("DM_NET_DISCOVERY_PEER", "127.0.0.1", 1); CHECK(dm_net_discovery_peer(&a, &port) == 1 && port == 0, "peer without a port");
+    setenv("DM_NET_DISCOVERY_PEER", "127.0.0.1:0", 1); CHECK(dm_net_discovery_peer(&a, &port) == -1, "port 0 refused");
+    setenv("DM_NET_DISCOVERY_PEER", "127.0.0.1:70000", 1); CHECK(dm_net_discovery_peer(&a, &port) == -1, "port past 65535 refused");
+    setenv("DM_NET_DISCOVERY_PEER", "127.0.0.1:", 1); CHECK(dm_net_discovery_peer(&a, &port) == -1, "empty port refused");
+    address peer = addr(htonl(0x7f000001), 0); int native = native_udp(&peer), guest = SOCKET(2, 2, 17); char bytes[16];
+    address discovery = peer; discovery.ip = htonl(UINT32_MAX);
+    setenv("DM_NET_DISCOVERY_PEER", "127.0.0.1:9", 1); dm_net_set_multicast_allowed(0);
+    CHECK(SEND(guest, "pia", 3, 0, &discovery, 16) == 3, "a game's discovery goes to the peer's address");
+    struct pollfd ready = {native, POLLIN, 0};
+    CHECK(poll(&ready, 1, 1000) == 1 && recv(native, bytes, sizeof bytes, 0) == 3, "on the game's own port, not the LDN port");
+    unsetenv("DM_NET_DISCOVERY_PEER"); dm_net_set_multicast_allowed(1);
+    // A datagram to the LDN network's broadcast goes to each other member as unicast, on the same port
+    address broadcast = addr(htonl(0x0affffff), 0); broadcast.port = peer.port;
+    ldn_members = 1; ldn_member[0] = htonl(0x7f000001);
+    CHECK(SEND(guest, "fanout", 6, 0, &broadcast, 16) == 6, "LDN broadcast sent");
+    CHECK(poll(&ready, 1, 1000) == 1 && recv(native, bytes, sizeof bytes, 0) == 6 && !memcmp(bytes, "fanout", 6), "the member receives it as unicast");
+    ldn_members = 0; CHECK(SEND(guest, "alone", 5, 0, &broadcast, 16) == 5 && poll(&ready, 1, 50) == 0, "with no other member nothing is sent, and the send succeeds");
+    ldn_members = -1; CLOSE(guest);
+    // DM_NETWORK=ldn with DM_NETWORK_INTERFACE: a wildcard bind takes the interface's address
+    setenv("DM_NETWORK", "ldn", 1); setenv("DM_NETWORK_INTERFACE", "lo0", 1);
+    guest = SOCKET(2, 2, 17); address any = addr(0, 0), bound; unsigned n = 16;
+    CHECK(BIND(guest, &any, 16) == 0 && NAME(guest, &bound, &n) == 0 && bound.ip == htonl(0x7f000001), "pinned interface: bound to its address");
+    CLOSE(guest);
+    setenv("DM_NETWORK", "auto", 1); guest = SOCKET(2, 2, 17); n = 16;
+    CHECK(BIND(guest, &any, 16) == 0 && NAME(guest, &bound, &n) == 0 && bound.ip == 0, "auto mode keeps the wildcard");
+    CLOSE(guest); close(native);
+}
 int main(int argc, char **argv) {
     struct sigaction sa = {.sa_handler = sigpipe}; sigemptyset(&sa.sa_mask); sigaction(SIGPIPE, &sa, NULL);
-    offline(); nifm(); udp(); eventfd_mixed(); concurrency(); tcp(); errors_and_resolver(); discovery_peer();
+    offline(); nifm(); udp(); eventfd_mixed(); concurrency(); tcp(); errors_and_resolver(); discovery_peer(); two_instances();
     if (argc == 2 && !strcmp(argv[1], "--no-broadcast")) puts("broadcast test skipped explicitly (requires local-network permission for this test executable)"); else broadcast();
     GET(fn_vvoid, "_ZN2nn6socket8FinalizeEv")();
     CHECK(atomic_load(&waits) > 0 && atomic_load(&wait_balance) == 0, "all host waits yield and restore guest execution");
