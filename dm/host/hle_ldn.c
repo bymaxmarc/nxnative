@@ -16,6 +16,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <time.h>
+#include <stdatomic.h>
 #include <unistd.h>
 #ifndef DM_LDN_TEST
 #include "hle.h"
@@ -467,5 +468,19 @@ HLE_FORCE_WAIT("_ZN2nn3ldn20AddAcceptFilterEntryERKNS0_8NodeInfoE", "native LDN 
 HLE_FORCE_WAIT("_ZN2nn3ldn17ClearAcceptFilterEv", "clear native LDN accept filter", Result, h_ldn_Clear, void) { LDN_USE(); return ldn_hook_result("Clear", dm_ldn_filter_clear(g_ldn)); }
 HLE_FORCE_WAIT("_ZN2nn3ldn22SetStationAcceptPolicyENS0_12AcceptPolicyE", "enforce native LDN accept policy", Result, h_ldn_Policy, int policy) { LDN_USE(); return ldn_hook_result("Policy", dm_ldn_policy(g_ldn, policy)); }
 HLE_FORCE_WAIT("_ZN2nn3ldn6RejectENS0_11Ipv4AddressE", "disconnect actual native LDN member", Result, h_ldn_Reject, uint32_t ip) { LDN_USE(); return ldn_hook_result("Reject", dm_ldn_reject(g_ldn, ip)); }
+// Switch 2 SDK: Pia sets the protocol right after Initialize (Switch Sports Resort: LocalService at main+0x13c1c20, the game's own network setup at main+0x3902b50, which drops
+// local play on a nonzero result). The SDK's SetProtocol (sdk+0x75fca0) takes values below 5, aborts on others, maps 0..4 to 4, 1, 2, 3, 4 and sends that to the ldn service,
+// which then lists and joins networks of that protocol only. Over IP every instance of a game sets the same value, and the ldn_mitm wire has no field for it: the host keeps it
+// for the log and answers success, as the service does for a valid value
+static _Atomic int g_ldn_protocol = -1;
+HLE_FORCE_WAIT("_ZN2nn3ldn11SetProtocolENS0_8ProtocolE", "the LDN protocol of the networks to host and join (Switch 2 SDK); kept, every instance of a game sets the same", Result, h_ldn_Protocol, int protocol) {
+    LDN_USE();
+    if (protocol < 0 || protocol >= 5) { LOG("[RED] ldn::SetProtocol(%d): the SDK takes 0 to 4", protocol); return ldn_hook_result("Protocol", LDN_INVALID); }
+    if (!g_ldn) return ldn_hook_result("Protocol", LDN_INVALID_STATE);
+    static const int service_value[5] = {4, 1, 2, 3, 4};
+    atomic_store(&g_ldn_protocol, service_value[protocol]);
+    ldn_trace("protocol game=%d service=%d", protocol, service_value[protocol]);
+    return ldn_hook_result("Protocol", 0);
+}
 HLE_FORCE_WAIT("_ZN2nn3ldn16GetNetworkConfigEPNS0_13NetworkConfigE", "read native LDN network configuration", Result, h_ldn_Config, dm_ldn_network_config *o) { LDN_USE(); if (!o) return LDN_INVALID; dm_ldn_network n; Result r = dm_ldn_get_network(g_ldn, &n, NULL, 0); if (!r) { memset(o, 0, sizeof *o); o->intent = n.id.intent; o->channel = n.common.channel; o->max_nodes = n.max_nodes; o->version = n.nodes[0].version; } return ldn_hook_result("Config", r); }
 #endif

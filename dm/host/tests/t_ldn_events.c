@@ -65,5 +65,12 @@ int main(void) {
     getter_lifetime(0);getter_lifetime(1);
     setenv("DM_NETWORK", "offline", 1); assert(h_ldn_Init() == LDN_ERROR(22)); assert(h_ldn_State() == 0 && waits == 0);
     setenv("DM_NETWORK", "auto", 1); assert(ldn_enabled());
-    puts("LDN event close/reuse, observers, concurrent getter/Finalize and offline state passed."); return 0;
+    // SetProtocol (Switch 2 SDK): needs an initialized service, takes 0 to 4 (the SDK maps them to 4, 1, 2, 3, 4) and refuses anything else
+    assert(h_ldn_Protocol(1) == LDN_INVALID_STATE && atomic_load(&g_ldn_protocol) == -1);
+    dm_ldn_context *c = calloc(1, sizeof *c); assert(c); pthread_mutex_init(&c->lock, NULL); g_ldn = c;
+    assert(h_ldn_Protocol(0) == 0 && atomic_load(&g_ldn_protocol) == 4);
+    assert(h_ldn_Protocol(3) == 0 && atomic_load(&g_ldn_protocol) == 3);
+    assert(h_ldn_Protocol(5) == LDN_INVALID && h_ldn_Protocol(-1) == LDN_INVALID && atomic_load(&g_ldn_protocol) == 3 && waits == 0);
+    g_ldn = NULL; pthread_mutex_destroy(&c->lock); free(c);
+    puts("LDN event close/reuse, observers, concurrent getter/Finalize, offline state and SetProtocol passed."); return 0;
 }

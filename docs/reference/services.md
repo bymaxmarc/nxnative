@@ -1029,6 +1029,14 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Check:** `make -C dm/host/tests GAME=010015100B514000 local-network`: `t_ldn` runs the packet coder on malformed and fuzzed input and a host and a station on loopback, in one process and in two (scan, join, rejoin, disconnect, accept policy); `t_ldn_events` the state events' lifetimes across `Finalize` and a getter racing it.
 - **Found on:** [Nintendo Switch Sports Resort](../../dm/games/04008E001F098000/README.md); PR #846's author joined Mario Kart 8 Deluxe rooms between the Mac, an iPhone and a Switch with ldn_mitm.
 
+### LDN protocol (Switch 2 SDK)
+
+- **Symptom:** a Switch 2 game's local play reaches `nn::ldn::Initialize`, then a null read at `sdk+0x75fcbc` in `nn::ldn::SetProtocol`: the SDK's own reads the service session that its `Initialize` (taken over by the host) never opened.
+- **Cause:** the Switch 2 SDK adds `SetProtocol(Protocol)`. The SDK's (`sdk+0x75fca0`) takes values below 5, aborts on others, maps 0..4 to 4, 1, 2, 3, 4 and sends that to the service, which then lists and joins networks of that protocol only. Pia calls it right after `Initialize` (`main+0x13c1c20`) with its setting's value (0 unless the game sets another).
+- **Fix:** taken over (`hle_ldn.c`): with the service initialized it keeps the mapped value (logged with `DM_LDN_TRACE`) and answers success, which the game's network setup needs (`main+0x3902b58` drops local play on any other result); a value of 5 or more is refused with a `[RED]` line. The ldn_mitm protocol has no field for it, and every instance of one game sets the same value, so rooms are not told apart by it. `MakeBroadcastAddress`, imported beside it, is the SDK's own and only computes (`orn`, `sdk+0x75f9c0`): no take-over.
+- **Check:** `t_ldn_events` (before `Initialize`, values 0, 3, 5 and -1).
+- **Found on:** [Nintendo Switch Sports Resort](../../dm/games/04008E001F098000/README.md).
+
 ### Socket error numbers are Linux's
 
 - **Symptom:** a game that retries a non-blocking receive on "no data yet" treats it as a broken socket instead.
