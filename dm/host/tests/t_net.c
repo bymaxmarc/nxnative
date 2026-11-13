@@ -144,6 +144,9 @@ static void nifm(void) {
     setenv("DM_NETWORK_INTERFACE", "no-such-interface", 1);
     CHECK(dm_net_ipconfig(&ip, NULL, NULL, NULL, NULL) < 0 && ip == 0 && !dm_nifm_available(), "missing interface does not claim connectivity");
     setenv("DM_NETWORK_INTERFACE", "lo0", 1);
+    setenv("DM_NETWORK", "ldn", 1); GET(fn_vvoid, "_ZN2nn4nifm27SubmitNetworkRequestAndWaitEv")();
+    CHECK(!dm_nifm_available() && dm_net_ipconfig(&ip, NULL, NULL, NULL, NULL) == 0, "local wireless alone: the adapter is there, no internet connection is reported");
+    setenv("DM_NETWORK", "auto", 1);
     GET(fn_vvoid, "_ZN2nn4nifm20CancelNetworkRequestEv")(); CHECK(!dm_nifm_available(), "cancel clears the request state");
 }
 static void udp(void) {

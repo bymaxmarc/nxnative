@@ -29,7 +29,9 @@ HLE_FORCE("_ZN2nn4nifm22IsNetworkRequestOnHoldEv", "offline: on hold for the fir
     while (h > 0 && !atomic_compare_exchange_weak(&g_nifm_hold, &h, h - 1)) {}
     return h > 0;
 }
-int dm_nifm_available(void) { return dm_net_enabled() && atomic_load(&g_nifm_pending) && !atomic_load(&g_nifm_hold) && !dm_net_ipconfig(NULL, NULL, NULL, NULL, NULL); }
+// DM_NETWORK=ldn is local wireless alone, as a console with no access point has it: a request settles as unavailable, so a game does not start its online flows (Switch Sports
+// Resort's online room, main+0x31d98b8, goes on to the network service login, which the host cuts, and shows an error). lan and auto have the adapter
+int dm_nifm_available(void) { return dm_net_enabled() && dm_net_mode() != DM_NET_LDN && atomic_load(&g_nifm_pending) && !atomic_load(&g_nifm_hold) && !dm_net_ipconfig(NULL, NULL, NULL, NULL, NULL); }
 void dm_nifm_submit_wait(void) { if (dm_net_enabled()) { h_nifm_Submit(); while (h_nifm_OnHold()) dm_guest_sleep_ns(0); } }
 HLE_FORCE("_ZN2nn4nifm18IsNetworkAvailableEv", "unavailable offline; with DM_NETWORK, whether the settled request found a host IPv4 adapter", int, h_nifm_Available, void) { return dm_nifm_available(); }
 // Returns bool (`and w0, w0, #1`, Metroid Dread's sdk+0x336210): whether the system's network screen resolved the error
