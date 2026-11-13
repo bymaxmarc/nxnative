@@ -59,6 +59,9 @@ void *mtl_device(void);
 void nvn_gpu_busy_start(void *dev);   // nvn_gpu_busy.m: DM_NVN_GPU_BUSY read once at mtl_init, the keep-busy thread started when it is on
 void *mtl_device_classic(void);   // the same for a layer that draws only on classic queues: a device without Metal 4 (a virtual Mac) starts too, and its presents are dropped
 uint64_t mtl_ext_tex(void *tex);
+// The producer is done with one (a swap chain destroyed, a window surface replaced) and has waited for its presents' tickets (mtl_present_wait): the serial goes now, and the
+// texture leaves the residency set and the present path's references once every present committed so far has completed on the GPU. Each mtl_ext_tex takes one of these
+void mtl_ext_tex_release(uint64_t serial);
 uint64_t mtl_present_ext(uint64_t serial, double period, void *ev, uint64_t ev_val, const int crop[4]);   // crop: x, y, w, h of the texture to show (NULL = all of it)
 void mtl_present_layer(uint32_t w, uint32_t h);   // a sized vi layer (hle_vi.c): the picture's shape instead of the display's 16:9
 void mtl_present_screen(uint32_t w, uint32_t h);   // a screen taller than 16:9 (loader.c, DM_SCREEN_ASPECT): the picture's shape for a texture of that shape
