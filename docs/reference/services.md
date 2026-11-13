@@ -1013,6 +1013,21 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Check:** 12 of 12 boots with four hosts at once reached the title, with both fixes; a host that answers at once hung 1 of 4 in the same test.
 - **Note:** how it was found: the hung boots' logs diverged from good ones at the save probe (`DM_FS=1`), the thread dumps showed nothing but idle waits, and `DM_PROBE` on the state machine, then `peek` lines in a hung run's `DM_CTL` file, followed the pointers to the status word (a probe on the hot path slowed the boot enough to hide the race: 8 of 8 good).
 
+### Host IPv4 sockets for play on the local network
+
+- **Symptom:** a game's LAN mode (or a local-wireless mode built on sockets) finds nobody and cannot host: every socket call fails with ENETDOWN and nifm reports no network, by design ([Network interface, LDN, socket and play report calls](#network-interface-ldn-socket-and-play-report-calls)).
+- **Cause:** the host had no socket service of its own; offline is still the default.
+- **Fix:** `DM_NETWORK=lan`, `ldn` or `auto` turns on the host's IPv4 TCP and UDP sockets (`hle_net_backend.c`, adapted from RobiiAragon's [PR #846](https://github.com/seedds/nxnative/pull/846)). The guest's descriptors are numbers of the bsd service, the lowest free from 0, one space shared with the [event descriptors](#eventfd-needs-no-network); each call borrows a duplicate of the native descriptor, so a close on another thread cannot hand a waiter a reused socket. Addresses are Horizon's BSD `sockaddr` (length byte, family 2), both `addrinfo` layouts (SDK 4's has `canonname` before `addr`), `O_NONBLOCK` is `0x800`, and the error numbers are Linux's ([below](#socket-error-numbers-are-linuxs)). Calls that can wait (`Poll`, `Select`, receives, sends, `Connect`, `Accept`, name lookups) are `HLE_FORCE_WAIT` take-overs (`hle.h`): they publish the guest's registers as an SVC does, so a thread that waits in one can still be paused, and give up their guest core while they wait. A receive or `GetSockOpt` prepares the tracked guest pages it writes first (the kernel's copy-out raises no write fault). nifm reports the adapter the default route uses (`DM_NETWORK_INTERFACE` picks another, `lo0` included), with its address, mask and gateway; a submitted request settles as available once there is one. Broadcast works where the system allows it; a datagram to a broadcast address can go to `DM_NET_DISCOVERY_PEER` instead, and on a host without the multicast entitlement (iOS) a verified Pia or LDN discovery query sweeps the adapter's subnet (/20 or narrower) as unicast. `DM_NET_TRACE=1` logs each socket call's descriptor, result and error number. ssl, NSD and the online services stay offline in every mode.
+- **Check:** `make -C dm/host/tests GAME=010015100B514000 local-network`: the take-over's frame and nested pause on an 8 KB guest stack (`t_hle_wait`), TCP and UDP against native peers, both resolver layouts, an event descriptor and a socket in one `Poll` (`t_net`), the discovery sweep and its queue (`t_net_discovery`, `t_discovery_protocol`) and the copy-out into tracked pages (`t_net_write_prepare`).
+- **Found on:** [Nintendo Switch Sports Resort](../../dm/games/04008E001F098000/README.md) (its local play, through Pia); PR #846's author played Mario Kart 8 Deluxe's LAN mode with it.
+
+### Socket error numbers are Linux's
+
+- **Symptom:** a game that retries a non-blocking receive on "no data yet" treats it as a broken socket instead.
+- **Cause:** the host answered with FreeBSD's numbers (EAGAIN 35, ENETDOWN 50). `nn::socket::GetLastErrno` and `GetLastError` return the C library's `errno` (Switch Sports Resort's `sdk+0x1881e0`), and the SDK's C library (nnmusl) numbers them as Linux does: Pia's receive (`main+0x138b428`) takes 4, 11, 12 and 16 as "no data yet" and 100, 102, 104, 107 and 110 as "network down".
+- **Fix:** every socket error the host reports is Linux's (`hle_net.c`, `hle_net_backend.c`): EAGAIN 11, EBADF 9, ENETDOWN 100, EOPNOTSUPP 95.
+- **Found on:** [Nintendo Switch Sports Resort](../../dm/games/04008E001F098000/README.md).
+
 ### Socket `Poll` and `Select` with nothing to wait on
 
 - **Symptom:** one thread at 100% CPU from boot, with one SVC in 99 s (`NexusRevolution Socket`, `main+0x92c7c4`, the game's network thread).

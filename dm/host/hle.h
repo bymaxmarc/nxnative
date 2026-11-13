@@ -68,6 +68,24 @@ typedef struct { const char *name; void *fn; const char *why; } hle_force_ent;
 // writes there. The host's entry (hle_bigstack.c) replaces it at link time
 __attribute__((weak, naked, visibility("hidden"))) void dm_bigstack_enter(void) { __asm__ volatile("br x16"); }
 __attribute__((weak, naked, visibility("hidden"))) void dm_bigstack_enter_n(void) { __asm__ volatile("br x16"); }
+// A blocking take-over (a socket wait, an LDN scan or connect) publishes the guest's real register context before it waits, as an SVC does: a pause request (a garbage collector's,
+// hle_thread.c) cannot stop host code safely, so without this frame it waited for the call to return. The stub keeps x16, x17 and LR in 32 bytes of the caller's stack; dm_hle_wait_enter
+// (entry.S) saves a full gate frame, registers it with thr_svc_enter, runs the implementation on the big host stack and leaves through thr_svc_leave, where a paused thread waits for
+// resume. At most 8 integer / pointer arguments and an integer / pointer result in x0; no floating-point or stack arguments, no variadics, no calls into guest code while the frame
+// is published. Adapted from RobiiAragon's PR #846
+#define HLE_FORCE_WAIT(mangled, why, ret, cname, ...)                                              \
+    _Static_assert(HLE_NARG(__VA_ARGS__) <= 8, #cname ": a waiting take-over carries register arguments only (hle.h)"); \
+    static ret cname(__VA_ARGS__) __attribute__((used));                                          \
+    extern const char cname##_wait[];                                                             \
+    __asm__(".text\n.p2align 2\n.globl _" #cname "_wait\n.private_extern _" #cname "_wait\n_" #cname "_wait:\n" \
+            "    stp x16, x17, [sp, #-32]!\n    str x30, [sp, #16]\n    adrp x16, _" #cname "@PAGE\n    add x16, x16, _" #cname "@PAGEOFF\n    b _dm_hle_wait_enter\n"); \
+    __attribute__((used, section("__DATA,swforce"))) static const hle_force_ent hle_force_##cname = {mangled, (void *)(uintptr_t)cname##_wait, why}; \
+    static ret cname(__VA_ARGS__)
+// Unit tests that do not link entry.S get this pass-through: the implementation runs at once and the stub's 32 bytes are released (the host's entry replaces it at link time)
+__attribute__((weak, naked, visibility("hidden"))) void dm_hle_wait_enter(void) { __asm__ volatile("blr x16\n    ldr x30, [sp, #16]\n    add sp, sp, #32\n    ret"); }
+// A host hook implementing a blocking guest call gives up its guest core while it actually waits (dm_thread_native_wait); balanced and nestable
+void dm_guest_host_wait_begin(void);
+void dm_guest_host_wait_end(void);
 // The game's call site inside a HLE_FORCE implementation: pass __builtin_return_address(0), which after a stack switch is the entry's own (hle_bigstack.c). The weak one is for the
 // same programs as above
 void *dm_bigstack_caller(void *ra);

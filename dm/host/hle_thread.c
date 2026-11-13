@@ -89,6 +89,7 @@ typedef struct thr {
     // when stopped in guest code the signal handler saves it into ctx_*; pcv lets the requester wait for "stopped" and the paused thread wait for "resume"
     _Atomic int pause_req; int paused;
     uint64_t *_Atomic svc_regs; uint64_t svc_pc, svc_x18;   // svc_x18: the guest's x18 at SVC entry (its thread slot; the gate frame holds the Apple platform register)
+    unsigned svc_depth;   // owned by this thread: a gate entered inside a waiting take-over (HLE_FORCE_WAIT, hle.h) keeps the outer frame published
     // SVC exit without G: bit 0 = inside an SVC, bit 1 = a pause was requested. The exit clears bit 0 with one compare-and-swap when bit 1 is clear, and takes G only otherwise;
     // the requester sets bit 1 and treats the thread as stopped only if bit 0 was set, so a thread it counts as stopped in an SVC cannot leave the SVC without G (svc_regs stays valid for GetThreadContext3)
     _Atomic int svc_state;
@@ -202,6 +203,9 @@ void dm_thread_native_wait(int entering) {
     else { if (!t->native_wait) die("unbalanced native HLE wait"); t->native_wait--; }
     pthread_mutex_unlock(&G);
 }
+// A take-over's blocking host call (a socket poll, an LDN scan; hle_net_backend.c, hle_ldn.c) gives up the guest core the same way, without a condition mutex of its own
+void dm_guest_host_wait_begin(void) { dm_thread_native_wait(1); }
+void dm_guest_host_wait_end(void) { dm_thread_native_wait(0); }
 
 // The peers a handoff waits for are the ones it made runnable, not every runnable higher-priority thread of the core. The host runs a
 // lower-priority thread beside busy higher-priority threads of its core all the time (it has no per-core scheduler; core_preempt aside),
@@ -420,6 +424,7 @@ static void on_pause_sig(int sig, siginfo_t *si, void *uc_) {
 // called by the gate on SVC entry / exit (gate_dispatch in hle.c)
 void thr_svc_enter(uint64_t *regs, uint64_t pc) {
     thr_t *t = pthread_getspecific(g_keythr); if (!t) return;
+    if (t->svc_depth++) return;   // nested: the outer boundary's frame holds the guest's registers
     t->svc_pc = pc; t->svc_x18 = (uint64_t)(uintptr_t)pthread_getspecific(g_key18); atomic_store(&t->svc_regs, regs); atomic_fetch_or(&t->svc_state, 1);
     if (atomic_load_explicit(&t->qos_pending, memory_order_relaxed) && atomic_exchange(&t->qos_pending, 0)) {
         pthread_mutex_lock(&G); qos_apply(t); pthread_mutex_unlock(&G);
@@ -428,6 +433,14 @@ void thr_svc_enter(uint64_t *regs, uint64_t pc) {
 }
 void thr_svc_leave(void) {
     thr_t *t = pthread_getspecific(g_keythr); if (!t) return;
+    if (t->svc_depth && --t->svc_depth) {   // nested: a requested pause is honoured here, the outer frame stays published until its own exit
+        if (!atomic_load(&t->pause_req)) return;
+        pthread_mutex_lock(&G);
+        while (t->pause_req) { t->paused = 1; pthread_cond_broadcast(&t->pcv); pthread_cond_wait(&t->pcv, &G); }
+        t->paused = 0;
+        pthread_mutex_unlock(&G);
+        return;
+    }
     int in = 1; if (atomic_compare_exchange_strong(&t->svc_state, &in, 0)) { atomic_store(&t->svc_regs, NULL); return; }   // no pause requested: G is not needed (every other thread's SVC takes it)
     pthread_mutex_lock(&G);
     while (t->pause_req) { t->paused = 1; pthread_cond_broadcast(&t->pcv); pthread_cond_wait(&t->pcv, &G); }

@@ -208,8 +208,8 @@ watch-sample: $(B)/t_watch_sample
 	$(B)/t_watch_sample
 $(B)/t_altstack: t_altstack.c t_altstack_stub.c ../crash.c ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -Wno-unused-function -I.. $(GINC) -o $@ t_altstack.c t_altstack_stub.c ../crash.c
-$(B)/t_net_eventfd: t_net_eventfd.c ../hle_net.c ../hle.h ../dm.h $(GAME_H) | $(B)
-	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -fsanitize=address,undefined -I.. $(GINC) -o $@ t_net_eventfd.c
+$(B)/t_net_eventfd: t_net_eventfd.c ../hle_net.c ../hle.h ../dm.h ../hle_net_backend.c ../net_socket.h t_net_write_stub.c $(GAME_H) | $(B)
+	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -fsanitize=address,undefined -I.. $(GINC) -o $@ t_net_eventfd.c ../hle_net_backend.c t_net_write_stub.c
 
 $(B)/t_pctl: t_pctl.c ../hle_misc.c ../hle.h ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_pctl.c
@@ -421,3 +421,28 @@ coverage:
 	rm -rf $(B)/cov/prof
 	LLVM_PROFILE_FILE="$(call cov_profile,$(B)/cov)" $(MAKE) -i B=$(B)/cov SAN="$(COV_FLAGS)" run
 	@$(call cov_export,$(B)/cov)
+
+# The opt-in local network transport (DM_NETWORK, hle_net_backend.c): synthetic datagrams and loopback peers only, nothing leaves the Mac. Adapted from RobiiAragon's PR #846
+NET_SOURCES = ../hle_net_backend.c t_net_write_stub.c
+NET_HEADERS = ../net_socket.h ../net_discovery.h ../net_discovery_queue.inc ../discovery_protocol.h
+NET_FLAGS = -O1 -g -Wall -Wextra -Werror -Wno-unused-function
+$(B)/t_hle_wait: t_hle_wait.c t_hle_wait.S ../hle.h ../entry.S ../hle_bigstack.c $(GAME_H) | $(B)
+	$(CLANG) $(NET_FLAGS) $(GINC) -o $@ t_hle_wait.c t_hle_wait.S ../entry.S ../hle_bigstack.c
+$(B)/t_net: t_net.c ../hle_net.c ../hle_offline.c ../hle.h ../entry.S ../hle_bigstack.c $(NET_SOURCES) $(NET_HEADERS) $(GAME_H) | $(B)
+	$(CLANG) $(NET_FLAGS) $(GINC) -o $@ t_net.c ../hle_net.c ../hle_offline.c $(NET_SOURCES) ../entry.S ../hle_bigstack.c
+$(B)/t_net_discovery: t_net_discovery.c $(NET_SOURCES) $(NET_HEADERS) | $(B)
+	$(CLANG) $(NET_FLAGS) -DDM_NET_TEST -o $@ t_net_discovery.c $(NET_SOURCES)
+$(B)/t_discovery_protocol: t_discovery_protocol.c ../discovery_protocol.h | $(B)
+	$(CLANG) -std=c11 -O2 -Wall -Wextra -Werror -pedantic -o $@ t_discovery_protocol.c
+# A kernel socket receive prepares the tracked guest pages it writes, also after a wait
+$(B)/t_net_write_prepare: t_net_write_prepare.c $(NET_SOURCES) $(NET_HEADERS) ../../gfx/nvn/nvn_dirty.c ../../gfx/nvn/nvn_dirty.h $(GAME_H) | $(B)
+	$(CLANG) $(NET_FLAGS) $(GINC) -o $@ t_net_write_prepare.c ../../gfx/nvn/nvn_dirty.c
+.PHONY: local-network
+# t_net --no-broadcast: a real broadcast needs the local network permission for the test program
+local-network: $(B)/t_hle_wait $(B)/t_net $(B)/t_net_discovery $(B)/t_discovery_protocol $(B)/t_net_write_prepare
+	$(B)/t_hle_wait
+	$(B)/t_net --no-broadcast
+	$(B)/t_net_discovery
+	$(B)/t_discovery_protocol
+	$(B)/t_net_write_prepare
+run: local-network
