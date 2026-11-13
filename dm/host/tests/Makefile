@@ -437,12 +437,20 @@ $(B)/t_discovery_protocol: t_discovery_protocol.c ../discovery_protocol.h | $(B)
 # A kernel socket receive prepares the tracked guest pages it writes, also after a wait
 $(B)/t_net_write_prepare: t_net_write_prepare.c $(NET_SOURCES) $(NET_HEADERS) ../../gfx/nvn/nvn_dirty.c ../../gfx/nvn/nvn_dirty.h $(GAME_H) | $(B)
 	$(CLANG) $(NET_FLAGS) $(GINC) -o $@ t_net_write_prepare.c ../../gfx/nvn/nvn_dirty.c
+# nn::ldn over IP (hle_ldn.c): two contexts on loopback, in one process and in two, and the take-overs' event lifetimes
+LDN_SOURCES = ../hle_ldn.c ../hle_ldn_protocol.c
+$(B)/t_ldn: t_ldn.c $(LDN_SOURCES) ../hle_ldn.h $(NET_SOURCES) $(NET_HEADERS) | $(B)
+	$(CLANG) $(NET_FLAGS) -DDM_NET_TEST -DDM_LDN_TEST -DDM_LDN_NET_TEST -o $@ t_ldn.c $(LDN_SOURCES) $(NET_SOURCES)
+$(B)/t_ldn_events: t_ldn_events.c $(LDN_SOURCES) ../hle_ldn.h ../hle.h $(NET_HEADERS) $(GAME_H) | $(B)
+	$(CLANG) $(NET_FLAGS) $(GINC) -o $@ t_ldn_events.c ../hle_ldn_protocol.c
 .PHONY: local-network
 # t_net --no-broadcast: a real broadcast needs the local network permission for the test program
-local-network: $(B)/t_hle_wait $(B)/t_net $(B)/t_net_discovery $(B)/t_discovery_protocol $(B)/t_net_write_prepare
+local-network: $(B)/t_hle_wait $(B)/t_net $(B)/t_net_discovery $(B)/t_discovery_protocol $(B)/t_net_write_prepare $(B)/t_ldn $(B)/t_ldn_events
 	$(B)/t_hle_wait
 	$(B)/t_net --no-broadcast
 	$(B)/t_net_discovery
 	$(B)/t_discovery_protocol
 	$(B)/t_net_write_prepare
+	$(B)/t_ldn
+	$(B)/t_ldn_events
 run: local-network
