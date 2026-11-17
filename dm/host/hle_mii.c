@@ -248,18 +248,17 @@ static int mii_write(const char *dir, const char *name, int parts, size_t size) 
     int ok = b && f && fwrite(b, 1, size, f) == size;
     if (f && fclose(f)) ok = 0;
     free(b);
-    if (!ok) LOG("[RED] mii: cannot write the MiiModel stand-in %s", p);
+    if (!ok) LOG("[RED] mii: cannot write the Mii model stand-in %s", p);
     return ok;
 }
-// Written once per directory and process (the query and the mount both ask), so a host with another layout never leaves old files behind. One stand-in serves both archives:
-// the Switch's MiiModel (0100000000000802) and the Switch 2's MiiResource (0400000000000849), whose files have the same layout (Nintendo Switch Sports Resort's accessors,
-// main+0x1cdcd80..+0x1cdd0c4: 11 texture part kinds from +0x64 in 0x1c-byte entries, 12 shape kinds from +0x6c in 0x58-byte entries, hair transforms at +0x12704, faceline at
-// +0x14c24) and which adds the Switch 2's texture sets, OunceTexture{Low,Mid,High}{Linear,SRGB}.dat; the NX files are written into both, and a game reads only those it names
-enum { MII_DIRS = 4 };
+// One stand-in serves both archives, the Switch's MiiModel (0100000000000802) and the Switch 2's (0400000000000849), whose files have the same layout (Nintendo Switch Sports Resort's
+// accessors, main+0x1cdcd80..+0x1cdd0c4: 11 texture part kinds from +0x64 in 0x1c-byte entries, 12 shape kinds from +0x6c in 0x58-byte entries, hair transforms at +0x12704, faceline
+// at +0x14c24); the Switch 2's adds its own texture sets, OunceTexture{Low,Mid,High}{Linear,SRGB}.dat, and a game reads only the files it names. Written once per process (the query
+// and the mount both ask, for either archive), so a host with another layout never leaves old files behind; again only if the directory changes (a test's DM_TEMP)
 int dm_mii_standin(const char *dir) {
-    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; static char done_dir[MII_DIRS][1024]; static int done[MII_DIRS], ndone;
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; static char done_dir[1024]; static int done;
     pthread_mutex_lock(&mu);
-    for (int i = 0; i < ndone; i++) if (!strcmp(done_dir[i], dir)) { int r = done[i] > 0; pthread_mutex_unlock(&mu); return r; }
+    if (done && !strcmp(done_dir, dir)) { pthread_mutex_unlock(&mu); return done > 0; }
     char p[1024]; strlcpy(p, dir, sizeof p);
     for (char *s = p + 1; *s; s++) if (*s == '/') { *s = 0; mkdir(p, 0755); *s = '/'; }
     mkdir(p, 0755);
@@ -270,7 +269,7 @@ int dm_mii_standin(const char *dir) {
     for (size_t i = 0; i < sizeof tex / sizeof *tex; i++) ok &= mii_write(dir, tex[i], 11, MII_TEXFILE_SIZE);
     for (size_t i = 0; i < sizeof shape / sizeof *shape; i++) ok &= mii_write(dir, shape[i], 12, MII_SHAPE_SIZE);
     LOG("mii: Mii model system data is the host's stand-in (every texture part one blank 8x4 texture, every shape one degenerate triangle: Mii heads draw nothing) in %s", dir);
-    if (ndone < MII_DIRS) { strlcpy(done_dir[ndone], dir, sizeof done_dir[ndone]); done[ndone++] = ok ? 1 : -1; }
+    strlcpy(done_dir, dir, sizeof done_dir); done = ok ? 1 : -1;
     pthread_mutex_unlock(&mu);
     return ok;
 }

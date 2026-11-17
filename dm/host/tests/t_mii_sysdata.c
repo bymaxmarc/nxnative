@@ -71,9 +71,9 @@ int main(void) {
     CHECK(h_fs_QuerySysDataCache(&cache, 0x0100000000000802ull) == RES_OK && h_fs_MountSysData("MiiResource", 0x0100000000000802ull, NULL, cache) == RES_OK,
           "the Switch's MiiModel still mounts");
     CHECK(texture_ok("MiiResource:/NXTextureMidSRGB.dat") && shape_ok("MiiResource:/ShapeHigh.dat"), "with its files");
-    snprintf(p, sizeof p, "%s/temp_sysdata/0100000000000802", root); struct stat a, b2;
-    char q[1200]; snprintf(q, sizeof q, "%s/temp_sysdata/0400000000000849", root);
-    CHECK(!stat(p, &a) && !stat(q, &b2) && S_ISDIR(a.st_mode) && S_ISDIR(b2.st_mode), "each archive has a directory of its own");
+    snprintf(p, sizeof p, "%s/temp_sysdata/mii", root); struct stat a;
+    char q[1200]; snprintf(q, sizeof q, "%s/temp_sysdata/0100000000000802", root); struct stat b2;
+    CHECK(!stat(p, &a) && S_ISDIR(a.st_mode) && stat(q, &b2), "both archives are the one stand-in directory");
     snprintf(q, sizeof q, "%s/ShapeMid.dat", p); struct stat s1, s2; stat(q, &s1);
     CHECK(dm_mii_standin(p) == 1 && !stat(q, &s2) && s1.st_ino == s2.st_ino && s1.st_mtime == s2.st_mtime, "asked again, the stand-in is not written again");
     CHECK(h_fs_MountSysData("Other", 0x0100000000000803ull, NULL, 0) == RES_TARGET_NOT_FOUND, "another system data archive: target not found");

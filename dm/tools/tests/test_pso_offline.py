@@ -15,7 +15,6 @@ import struct
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 import tracemalloc
 from unittest import mock
@@ -257,16 +256,10 @@ class Compute(unittest.TestCase):
         self.assertEqual([(n, len(x), len(y)) for n, x, y in po.groups_of([], c, 5, 0)], [('c00001', 0, 3)])
 
 
-def run_logged_through_run(cmd, log_path, env, timeout=None, watch=None):
-    """po.run_logged by way of subprocess.run, which the tests replace: no compiler runs; a runner that returns None as its exit status stands for a run past its time limit"""
-    with log_path.open('w') as log: return subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, env=env).returncode
-
-
-class Build(unittest.TestCase):
-    """main: one archive per architecture, made again only when its key changes; the stamp, rest_pairs.tsv and archive.tsv beside them"""
+class BuildCase(unittest.TestCase):
+    """A profile, its libraries and a fake metal-tt for main (Build, Prewarm)"""
     def setUp(self):
-        patcher = mock.patch.object(po, 'run_logged', run_logged_through_run); patcher.start(); self.addCleanup(patcher.stop)
-        self.t = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, self.t)
+        self.t = Path(tempfile.mkdtemp()).resolve(); self.addCleanup(shutil.rmtree, self.t)
         self.lib = self.t / f'b-{CHAIN}'; self.lib.mkdir()
         for k, j, funcs in (('v', {'pull': {}, 'entry_z': 'main0_z'}, [('main0', False), ('main0_z', False)]), ('f', {}, [('main0', False)]), ('c', {}, [('main0', True)])):
             (self.lib / f'{k}_b.json').write_text(json.dumps(dict({'chain': CHAIN, 'entry': 'main0'}, **j)))
@@ -291,6 +284,9 @@ class Build(unittest.TestCase):
         with mock.patch.object(po.subprocess, 'run', self.fake_run), mock.patch.dict(os.environ, DM_GAMES_DIR=str(self.prof.parent)), contextlib.redirect_stdout(io.StringIO()):
             return po.main(args)
 
+
+class Build(BuildCase):
+    """main: one archive per architecture, made again only when its key changes; the stamp, rest_pairs.tsv and archive.tsv beside them"""
     def test_large_script_memory_and_compatible_archive_key(self):
         # Share the two synthetic library files but give every base a distinct entry pair.
         bases = [('v_bp', f'vertex{i}', 'f_b', 'main0') for i in range(512)]
@@ -345,6 +341,63 @@ class Build(unittest.TestCase):
         self.assertEqual(self.main('--gpu', 'g17p', '--os-min', '26.0'), 0)
         self.assertEqual(len(self.calls), 3)
         self.assertFalse((self.out / 'rest_pairs.tsv').exists())
+
+    def reads(self, *args):   # a run → whether it read the library (plan), not only its name and time (run_key)
+        with mock.patch.object(po, 'plan', side_effect=po.plan) as plan: self.assertEqual(self.main(*args), 0)
+        return plan.called
+
+    def test_a_library_image_and_lists_as_at_the_last_run_are_not_read_again(self):
+        # Ocarina of Time: 26 s of every build that changed nothing went into reading 33,365 bases' libraries and reflections again to find the archive reused
+        self.assertTrue(po.shader_lib.pack(str(self.lib), say=lambda m: None)); image = Path(po.shader_lib.image_of(str(self.lib)))
+        self.assertTrue(self.reads()); self.assertEqual(len(self.calls), 1); self.assertTrue((self.work / 'run.key').is_file())
+        state = lambda: {p.name: (p.stat().st_mtime_ns, p.read_bytes()) for p in sorted(self.out.iterdir())}
+        before = state()
+        with mock.patch.object(po, 'library_digest', side_effect=AssertionError('the libraries were read')): self.assertFalse(self.reads())
+        self.assertEqual(len(self.calls), 1); self.assertEqual(state(), before)
+        st = image.stat(); os.utime(image, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))   # the image written again: read, and found to hold the same libraries
+        self.assertTrue(self.reads()); self.assertEqual(len(self.calls), 1)
+        self.assertEqual(state(), before)   # the lists and stamps it would write again hold the same text: left as they are, with their times (the Mac app's packer keys them by those)
+        self.assertFalse(self.reads())
+        pairs = self.prof / 'shader_pairs.tsv'; pairs.write_text(pairs.read_text() + '# a comment\n')   # a pair list
+        self.assertTrue(self.reads()); self.assertFalse(self.reads()); self.assertEqual(len(self.calls), 1)
+        self.assertEqual((self.out / 'prebuilt.tsv').read_text(), po.stamp(CHAIN, True, pairs.read_bytes()))
+        (self.prof / 'shader_map.tsv').write_text('p\tn\tcompute\tc\n')   # the compute shaders
+        self.assertTrue(self.reads()); self.assertFalse(self.reads())
+        self.compiler = 'AIR-TT 2.0'   # the compiler
+        self.assertTrue(self.reads()); self.assertFalse(self.reads())
+        self.assertTrue(self.reads('--gpu', 'g18p,g17p')); self.assertFalse(self.reads('--gpu', 'g18p,g17p')); self.assertTrue(self.reads())   # the architectures
+        made = len(self.calls)
+        for name, change in (('applegpu_g18p.mtl4a', Path.unlink), ('prebuilt.tsv', lambda f: f.write_text('chain\tother\n')), ('archive.tsv', Path.unlink)):   # an output not as the run left it
+            with self.subTest(output=name):
+                self.assertFalse(self.reads()); change(self.out / name); self.assertTrue(self.reads())
+        self.assertEqual(len(self.calls), made + 1)   # the archive that was gone is built again
+        (self.work / 'key.applegpu_g18p').unlink(); self.assertTrue(self.reads()); self.assertFalse(self.reads())
+        (self.work / 'run.key').write_text('not a key'); self.assertTrue(self.reads()); self.assertFalse(self.reads())
+
+    def test_a_library_folder_is_read_each_run(self):   # its files have each their own time: no run.key
+        self.assertTrue(self.reads()); self.assertTrue(self.reads()); self.assertFalse((self.work / 'run.key').exists())
+
+    def test_a_changed_image_with_preserved_size_and_mtime_is_read_again(self):
+        self.assertTrue(po.shader_lib.pack(str(self.lib), say=lambda m: None))
+        image = Path(po.shader_lib.image_of(str(self.lib)))
+        self.assertTrue(self.reads()); self.assertFalse(self.reads()); self.assertEqual(len(self.calls), 1)
+        before = image.stat(); original = image.read_bytes()
+        changed = original.replace(b'BC\xc0\xde', b'BC\xc0\xdf')   # the used synthetic metallibs, same length; all image metadata and reflections stay valid
+        self.assertNotEqual(changed, original)
+        image.write_bytes(changed); os.utime(image, ns=(before.st_atime_ns, before.st_mtime_ns))
+        self.assertEqual((image.stat().st_size, image.stat().st_mtime_ns), (before.st_size, before.st_mtime_ns))
+        self.assertTrue(self.reads()); self.assertEqual(len(self.calls), 2)
+        self.assertFalse(self.reads())
+
+    def test_an_architectures_prewarm_pipelines_stay(self):
+        # the NSP script links them into the output folder after a run (mac_prebake) and takes them away: a run that removed them gave the files the app packs new change times
+        self.main('--platform', 'macos', '--os-min', '27.0', '--gpu', 'g18p,g17p')
+        for gpu in ('applegpu_g18p', 'applegpu_g17p'): (self.out / f'{gpu}-prewarm-00.mtl4a').write_bytes(b'bases'); (self.out / f'{gpu}-prewarm-00.keys').write_bytes(b'index')
+        (self.out / 'prewarm.tsv').write_text('stamp\n')
+        self.main('--platform', 'macos', '--os-min', '27.0', '--gpu', 'g18p,g17p')
+        self.assertEqual(sorted(p.name for p in self.out.glob('*-prewarm-*.mtl4a')), ['applegpu_g17p-prewarm-00.mtl4a', 'applegpu_g18p-prewarm-00.mtl4a'])
+        self.main('--platform', 'macos', '--os-min', '27.0', '--gpu', 'g18p')   # an architecture no longer asked for goes with its prewarm pipelines
+        self.assertEqual(sorted(p.name for p in self.out.glob('*.mtl4a')), ['applegpu_g18p-prewarm-00.mtl4a', 'applegpu_g18p.mtl4a'])
 
     def test_chain_move_reuses_binary_and_refreshes_metadata_for_both_platforms(self):
         for platform in ('macos', 'ios'):
@@ -448,6 +501,12 @@ class Build(unittest.TestCase):
                 script = json.loads(next(self.work.glob('*.mtl4-json')).read_text())
                 self.assertEqual(script['pipeline_descriptors']['render_pipeline_descriptors'][0]['vertex_function_descriptor'], 'fnd:v_bp.main0_z')
 
+    def test_library_digest_is_the_names_and_bytes_in_order(self):   # read on a few threads: the key every earlier build's archive has
+        bases, computes = [('v_bp', 'main0_z', 'f_b', 'main0'), ('v_b', 'main0', 'c_b', 'main0')], [('c_b', 'main0')]
+        h = hashlib.sha256()
+        for name in ('c_b', 'f_b', 'v_b', 'v_bp'): h.update(name.encode() + b'\0'); h.update(hashlib.sha256((self.lib / f'{name}.metallib').read_bytes()).digest())
+        self.assertEqual(po.library_digest(self.lib, bases, computes), h.hexdigest())
+
     def test_library_content_invalidates_archive(self):
         self.main()
         for name in ('v_bp', 'f_b'):
@@ -529,14 +588,13 @@ class Build(unittest.TestCase):
             self.assertEqual(observed, before, 'the normal packer must reuse the complete merged archive')
             self.assertIn('bases\t5\n', (self.out/'archive.tsv').read_text())
 
-    def test_batch_failure_preserves_completed_work_and_publishes_nothing(self):   # a failure that stops the build (here a full volume before the second group)
+    def test_batch_failure_preserves_completed_work_and_publishes_nothing(self):
         bases = [('v_bp', f'vertex{i}', 'f_b', 'main0') for i in range(5)]
-        runner, observed = self.batched_runner()
-        usage = lambda path: shutil._ntuple_diskusage(1 << 40, 1 << 40, (100 << 20) if '00002' in str(path) else (100 << 30))
-        with mock.patch.object(self, 'fake_run', runner), mock.patch.object(po, 'plan', return_value=(bases, [], {})), mock.patch.object(po.shutil, 'disk_usage', usage), \
-                self.assertRaises(SystemExit):
+        runner, observed = self.batched_runner(fail_compile=('vertex2', 'vertex3'))   # nothing of the group compiles: metal-tt's failure, not one pipeline's
+        with mock.patch.object(self, 'fake_run', runner), mock.patch.object(po, 'plan', return_value=(bases, [], {})), self.assertRaises(SystemExit):
             self.main('--batch-size','2','--os-min','27.0')
-        self.assertEqual(observed, [('compile',['vertex0','vertex1'])])
+        self.assertEqual(observed[:2], [('compile',['vertex0','vertex1']),('compile',['vertex2','vertex3'])])
+        self.assertTrue(all(set(names) <= {'vertex2', 'vertex3'} for _, names in observed[2:]))   # the search for the pipelines it stops on
         self.assertFalse((self.out/'prebuilt.tsv').exists())
         self.assertFalse((self.work/'key.applegpu_g18p').exists())
         self.assertFalse(list(self.out.glob('*.mtl4a')))
@@ -555,19 +613,21 @@ class Build(unittest.TestCase):
         out = io.StringIO()
         with mock.patch.object(po.subprocess, 'run', runner), mock.patch.object(po, 'plan', return_value=(bases, [('v', 'c')], {})), \
                 mock.patch.dict(os.environ, DM_GAMES_DIR=str(self.prof.parent)), contextlib.redirect_stdout(out):
-            po.main(['--game', '0100000000001000', '--msl', str(self.lib), '--out', str(self.out), '--work', str(self.work), '--os-min', '27.0', '--no-compute', '--jobs', '1'])
+            po.main(['--game', '0100000000001000', '--msl', str(self.lib), '--out', str(self.out), '--work', str(self.work), '--os-min', '27.0', '--no-compute'])
         compiles = [names for kind, names in observed if kind == 'compile']
         self.assertEqual(compiles[0], [f'vertex{i}' for i in range(5)])
+        self.assertEqual(compiles[-1], ['vertex0', 'vertex1', 'vertex3', 'vertex4'])   # the archive: every base but the one that fails
         self.assertIn(['vertex2'], compiles)                                            # tried alone before it is named
         self.assertTrue((self.out / 'applegpu_g18p.mtl4a').is_file())
         self.assertEqual((self.out / 'rest_pairs.tsv').read_text(), 'v\tc\nv\tf\n')   # after the pairs with function constants
         self.assertIn('failed\t1 bases', (self.out / 'archive.tsv').read_text())
         self.assertRegex(out.getvalue(), r'\[RED\] pso_offline: applegpu_g18p: metal-tt cannot compile the base of v \+ f \(v_bp\.vertex2, f_b\.main0\)')
+        self.assertEqual(out.getvalue().count('[RED]'), 1)
         n = len(observed); out = io.StringIO()   # a second run reuses the archive and still names the pair
         (self.out / 'rest_pairs.tsv').unlink()
         with mock.patch.object(po.subprocess, 'run', runner), mock.patch.object(po, 'plan', return_value=(bases, [('v', 'c')], {})), \
                 mock.patch.dict(os.environ, DM_GAMES_DIR=str(self.prof.parent)), contextlib.redirect_stdout(out):
-            po.main(['--game', '0100000000001000', '--msl', str(self.lib), '--out', str(self.out), '--work', str(self.work), '--os-min', '27.0', '--no-compute', '--jobs', '1'])
+            po.main(['--game', '0100000000001000', '--msl', str(self.lib), '--out', str(self.out), '--work', str(self.work), '--os-min', '27.0', '--no-compute'])
         self.assertEqual(len(observed), n)
         self.assertEqual((self.out / 'rest_pairs.tsv').read_text(), 'v\tc\nv\tf\n')
 
@@ -575,147 +635,20 @@ class Build(unittest.TestCase):
         bases = [('v_bp', f'vertex{i}', 'f_b', 'main0') for i in range(5)]
         runner, observed = self.batched_runner(fail_compile=('vertex3',))
         with mock.patch.object(self, 'fake_run', runner), mock.patch.object(po, 'plan', return_value=(bases, [], {})):
-            self.main('--batch-size', '2', '--os-min', '27.0', '--no-compute', '--jobs', '1')
+            self.main('--batch-size', '2', '--os-min', '27.0', '--no-compute')
         self.assertEqual(observed[0], ('compile', ['vertex0', 'vertex1']))
         self.assertEqual(observed[-1], ('merge', 3))
         self.assertIn(('compile', ['vertex2']), observed)   # the second group's archive, without the base that fails
         self.assertEqual((self.out / 'rest_pairs.tsv').read_text(), 'v\tf\n')
-        self.assertEqual(po.read_left_out(self.work / 'left_out.applegpu_g18p.tsv', (self.work / 'key.applegpu_g18p').read_text().strip()), [('base', ('v_bp', 'vertex3', 'f_b', 'main0'))])
+        self.assertEqual(po.read_failed(self.work / 'batches.applegpu_g18p/00002', 'applegpu_g18p'), ([('v_bp', 'vertex3', 'f_b', 'main0')], []))
 
-    def test_a_pipeline_that_fails_alone_is_left_out(self):   # Nintendo Switch Sports Resort: one failing pipeline lost the whole archive after hours
-        bases = [('v_bp', f'vertex{i}', 'f_b', 'main0') for i in range(5)]
-        runner, observed = self.batched_runner(fail_compile=('vertex2',))
-        out = io.StringIO()
-        with mock.patch.object(self, 'fake_run', runner), mock.patch.object(po, 'plan', return_value=(bases, [], {})), contextlib.redirect_stdout(out):
-            self.main('--batch-size','2','--os-min','27.0','--jobs','1')
-        # the failed group in halves: vertex2 fails alone and is left out, vertex3 compiles; one archive of the rest
-        self.assertEqual(observed, [('compile',['vertex0','vertex1']),('compile',['vertex2','vertex3']),('compile',['vertex2']),('compile',['vertex3']),('compile',['vertex4']),('merge',3)])
-        self.assertTrue((self.out/'applegpu_g18p.mtl4a').is_file()); self.assertTrue((self.out/'prebuilt.tsv').is_file())
-        self.assertEqual((self.work/'left_out.applegpu_g18p.tsv').read_text().split('\n')[1:], ['base\tv_bp\tvertex2\tf_b\tmain0', ''])
-        self.assertIn('failed\t1 bases', (self.out/'archive.tsv').read_text())
-        self.assertFalse(list(self.work.rglob('*.partial')))
-        observed.clear()   # unchanged inputs: the archive and its list reused
-        with mock.patch.object(self, 'fake_run', runner), mock.patch.object(po, 'plan', return_value=(bases, [], {})):
-            self.main('--batch-size','2','--os-min','27.0','--jobs','1')
-        self.assertEqual(observed, []); self.assertIn('failed\t1 bases', (self.out/'archive.tsv').read_text())
-        observed.clear(); (self.out/'applegpu_g18p.mtl4a').unlink()   # made again: the failed group goes straight to its parts (its failure is kept), the lone pipeline is tried again
-        with mock.patch.object(self, 'fake_run', runner), mock.patch.object(po, 'plan', return_value=(bases, [], {})):
-            self.main('--batch-size','2','--os-min','27.0','--jobs','1')
-        self.assertEqual(observed, [('compile',['vertex2']),('merge',3)])
-
-    def test_left_out_pairs_go_to_the_device(self):   # their pairs join rest_pairs.tsv: the host builds them, and its probe of the archive skips them
-        (self.lib / 'g_b.json').write_text(json.dumps({'chain': CHAIN, 'entry': 'main0'})); (self.lib / 'g_b.metallib').write_bytes(metallib([('main0', False)]))
-        (self.prof / 'shader_pairs.tsv').write_text('v\tf\nv\tc\nv\tg\n')
-        compiles = []
-        def run(cmd, **kw):
-            cmd = [str(c) for c in cmd]
-            if 'metal-tt' in cmd and '-o' in cmd:
-                libs = sorted(l['label'] for l in json.loads(next(Path(p) for p in cmd if p.endswith('.mtl4-json')).read_text())['libraries'])
-                compiles.append(libs)
-                if 'g_b' in libs: return subprocess.CompletedProcess(cmd, 1)
-            if 'metal-pack' in cmd: Path(cmd[cmd.index('-o') + 1]).write_bytes(b'merged'); return subprocess.CompletedProcess(cmd, 0)
-            return self.fake_run(cmd, **kw)
-        with mock.patch.object(po.subprocess, 'run', run), mock.patch.dict(os.environ, DM_GAMES_DIR=str(self.prof.parent)), contextlib.redirect_stdout(io.StringIO()):
-            code = po.main(['--game', '0100000000001000', '--msl', str(self.lib), '--out', str(self.out), '--work', str(self.work), '--os-min', '27.0', '--jobs', '1'])
-        self.assertEqual(code, po.LEFT_OUT_EXIT)   # an archive, but not of everything
-        self.assertEqual(compiles, [['f_b', 'g_b', 'v_bp'], ['f_b', 'v_bp'], ['g_b', 'v_bp']])   # whole once, then straight to its halves
-        self.assertEqual((self.out / 'rest_pairs.tsv').read_text(), 'v\tc\nv\tg\n')   # function constants, then the pair left out
-        self.assertIn('rest\t2\n', (self.out / 'archive.tsv').read_text())
-
-    def test_a_cluster_of_bad_pipelines_first_does_not_give_up(self):   # 10 bad pipelines first, in one group: their lone failures pass GIVE_UP before a good one is tried
+    def test_more_failing_bases_than_the_limit_stop_the_build(self):
         bases = [('v_bp', f'vertex{i}', 'f_b', 'main0') for i in range(40)]
-        bad = {f'vertex{i}' for i in range(10)}
-        runner, observed = self.batched_runner()
-        def run(cmd, **kw):
-            cmd = [str(c) for c in cmd]
-            if 'metal-tt' in cmd and '-o' in cmd:
-                names = {f['name'] for f in json.loads(next(Path(p) for p in cmd if p.endswith('.mtl4-json')).read_text())['function_descriptors']['library_function_descriptors']}
-                if names & bad: observed.append(('fail', len(names))); return subprocess.CompletedProcess(cmd, 1)
-            return runner(cmd, **kw)
-        out = io.StringIO()
-        with mock.patch.object(self, 'fake_run', run), mock.patch.object(po, 'plan', return_value=(bases, [], {})), contextlib.redirect_stdout(out):
-            self.assertEqual(self.main('--batch-size','40','--os-min','27.0','--jobs','1','--allow-left-out'), po.LEFT_OUT_EXIT)   # 10 of 40: past the share, allowed here
-        self.assertTrue((self.out/'applegpu_g18p.mtl4a').is_file())
-        self.assertEqual(sorted(kind_x[1][1] for kind_x in po.read_left_out(self.work/'left_out.applegpu_g18p.tsv', (self.work/'key.applegpu_g18p').read_text().strip())), sorted(bad))
-        self.assertNotIn('the compiler itself', out.getvalue())
-
-    def test_give_up_only_after_the_probe(self):   # the order-dependent case the probe settles: the first lone failures all bad, the rest of the list sound
-        tally, probes = po.Tally(probe=lambda: probes.append(1) or True), []
-        for _ in range(po.GIVE_UP + 3): tally.fail('a', 'x')   # GIVE_UP and more lone failures with nothing compiled: the probe finds one that compiles, the build goes on
-        self.assertTrue(tally.compiled); self.assertEqual(probes, [1])
-        broken = po.Tally(probe=lambda: False)
-        for _ in range(po.GIVE_UP - 1): broken.fail('a', 'x')
-        with self.assertRaises(SystemExit): broken.fail('a', 'x')
-
-    def test_too_many_left_out_stops_unless_allowed(self):
-        bases = [('v_bp', f'vertex{i}', 'f_b', 'main0') for i in range(20)]
-        bad = {f'vertex{i}' for i in range(6, 13)}   # 7 of 20: more than LEFT_OUT_FEW and LEFT_OUT_SHARE
-        runner, observed = self.batched_runner()
-        def run(cmd, **kw):
-            cmd = [str(c) for c in cmd]
-            if 'metal-tt' in cmd and '-o' in cmd:
-                names = {f['name'] for f in json.loads(next(Path(p) for p in cmd if p.endswith('.mtl4-json')).read_text())['function_descriptors']['library_function_descriptors']}
-                if names & bad: return subprocess.CompletedProcess(cmd, 1)
-            return runner(cmd, **kw)
-        with mock.patch.object(self, 'fake_run', run), mock.patch.object(po, 'plan', return_value=(bases, [], {})), self.assertRaises(SystemExit) as e:
-            self.main('--batch-size','10','--os-min','27.0','--jobs','1')
-        self.assertIn('--allow-left-out', str(e.exception)); self.assertFalse(list(self.out.glob('*.mtl4a'))); self.assertFalse((self.work/'key.applegpu_g18p').exists())
-        with mock.patch.object(self, 'fake_run', run), mock.patch.object(po, 'plan', return_value=(bases, [], {})):
-            self.assertEqual(self.main('--batch-size','10','--os-min','27.0','--jobs','1','--allow-left-out'), po.LEFT_OUT_EXIT)
-        self.assertTrue((self.out/'applegpu_g18p.mtl4a').is_file())
-        self.assertTrue(po.too_many_left_out(51, 100000)); self.assertFalse(po.too_many_left_out(5, 6)); self.assertTrue(po.too_many_left_out(6, 50)); self.assertFalse(po.too_many_left_out(6, 61))
-
-    def test_left_out_list_is_written_before_the_archive(self):   # a stop between them makes the archive again rather than publish it without its list
-        bases = [('v_bp', f'vertex{i}', 'f_b', 'main0') for i in range(3)]
-        runner, _ = self.batched_runner(fail_compile='vertex1')
-        real_replace = os.replace
-        def replace(src, dst):
-            if str(dst).endswith('applegpu_g18p.mtl4a') and Path(dst).parent == self.out: raise KeyboardInterrupt
-            return real_replace(src, dst)
-        with mock.patch.object(self, 'fake_run', runner), mock.patch.object(po, 'plan', return_value=(bases, [], {})), mock.patch.object(po.os, 'replace', replace), \
-                self.assertRaises(KeyboardInterrupt):
-            self.main('--batch-size','2','--os-min','27.0','--jobs','1')
-        self.assertTrue((self.work/'left_out.applegpu_g18p.tsv').is_file()); self.assertFalse((self.work/'key.applegpu_g18p').exists())
-        self.assertFalse(list(self.work.glob('left_out.*.partial')))
-
-    def test_a_timed_out_group_is_tried_again_under_a_longer_limit(self):
-        ff = self.t / 'failed.a'
-        ff.write_text('K\ntimeout\t1830\nran past its limit\n')
-        self.assertIsNone(po.known_failure(ff, 'K', None)); self.assertIsNone(po.known_failure(ff, 'K', 4000))   # no limit, or a longer one: try it again
-        self.assertTrue(po.known_failure(ff, 'K', 1830).timed_out); self.assertIsNone(po.known_failure(ff, 'other key', 1830))
-        ff.write_text('K\nfailed\t1830\nexit 1\n'); self.assertIsNotNone(po.known_failure(ff, 'K', None))   # a failure is kept whatever the limit
-
-    def test_gives_up_when_nothing_compiles(self):   # a broken toolchain fails every pipeline: stop after GIVE_UP of them alone, not after trying each
-        bases = [('v_bp', f'vertex{i}', 'f_b', 'main0') for i in range(40)]
-        calls, original = [], self.fake_run
-        def fail(cmd, **kw):
-            cmd = [str(c) for c in cmd]
-            if '-version' in cmd or '--show-sdk-version' in cmd: return original(cmd)
-            calls.append(cmd); return subprocess.CompletedProcess(cmd, 1)
-        with mock.patch.object(self, 'fake_run', fail), mock.patch.object(po, 'plan', return_value=(bases, [], {})), self.assertRaises(SystemExit) as e:
-            self.main('--batch-size','20','--os-min','27.0','--jobs','1')
-        self.assertIn('compiler itself', str(e.exception))
-        self.assertLess(len(calls), 50)   # the first group's parts, GIVE_UP pipelines alone and the probes, not each pipeline
+        runner, observed = self.batched_runner(fail_compile=[f'vertex{i}' for i in range(0, 40, 2)])
+        with mock.patch.object(self, 'fake_run', runner), mock.patch.object(po, 'plan', return_value=(bases, [], {})), self.assertRaises(SystemExit) as e:
+            self.main('--os-min', '27.0', '--no-compute')
+        self.assertIn(f'more than {po.MAX_FAILED} pipelines', str(e.exception))
         self.assertFalse(list(self.out.glob('*.mtl4a')))
-
-    def test_a_run_past_its_time_limit_is_compiled_in_parts(self):
-        bases = [('v_bp', f'vertex{i}', 'f_b', 'main0') for i in range(2)]
-        runner, observed = self.batched_runner()
-        limits = []
-        def slow(cmd, log_path, env, timeout=None, watch=None):   # the run of both pipelines does not finish in time
-            limits.append(timeout)
-            if sum('vertex' in line for line in Path(next(c for c in cmd if str(c).endswith('.mtl4-json'))).read_text().split('\n') if '"name"' in line) > 1:
-                log_path.write_text(''); return None
-            return run_logged_through_run(cmd, log_path, env, timeout)
-        out = io.StringIO()
-        with mock.patch.object(po.subprocess, 'run', runner), mock.patch.object(po, 'plan', return_value=(bases, [], {})), mock.patch.object(po, 'run_logged', slow), \
-                mock.patch.dict(os.environ, DM_GAMES_DIR=str(self.prof.parent)), contextlib.redirect_stdout(out):
-            po.main(['--game', '0100000000001000', '--msl', str(self.lib), '--out', str(self.out), '--work', str(self.work), '--os-min', '27.0', '--time-limit', '30', '--jobs', '1'])
-        self.assertEqual(limits, [po.RUN_BASE_S + 60, po.RUN_BASE_S + 30, po.RUN_BASE_S + 30])   # the group once, then its halves: not the same group whole again
-        self.assertIn('ran past its limit', out.getvalue())
-        self.assertEqual(po.time_limit(1000, po.PER_PIPELINE_S), po.RUN_BASE_S + 1000 * po.PER_PIPELINE_S); self.assertIsNone(po.time_limit(1000, 0))
-        self.assertTrue((self.out / 'applegpu_g18p.mtl4a').is_file())
-        self.assertNotIn('failed', (self.out / 'archive.tsv').read_text())
 
     def test_merge_failure_never_publishes_partial_archive(self):
         bases = [('v_bp', f'vertex{i}', 'f_b', 'main0') for i in range(3)]
@@ -800,7 +733,8 @@ class Build(unittest.TestCase):
 
     def test_low_disk_space_stops_before_metal_tt(self):   # Cruis'n Blast: a full volume made metal-tt fail with only "applegpu-nt command failed"
         self.work.mkdir(parents=True); (self.work / 'translate-0001').write_bytes(b'x'); (self.work / 'a.airp').write_bytes(b'x')
-        with mock.patch.object(po.shutil, 'disk_usage', return_value=shutil._ntuple_diskusage(1 << 40, 1 << 40, 300 << 20)), self.assertRaises(SystemExit) as e: self.main()
+        with mock.patch.object(po.shutil, 'disk_usage', return_value=shutil._ntuple_diskusage(1 << 40, 1 << 40, 300 << 20)), mock.patch.object(po.vol_space, 'important_bytes', lambda p: None), \
+                self.assertRaises(SystemExit) as e: self.main()
         self.assertIn('GB free', str(e.exception)); self.assertEqual(self.calls, [])
         self.assertEqual(sorted(p.name for p in self.work.iterdir()), ['bases.mtl4-json'])   # a failed run's temporaries cleared
 
@@ -808,14 +742,13 @@ class Build(unittest.TestCase):
         def fail(cmd, **kw):
             cmd = [str(c) for c in cmd]
             if '-version' in cmd or '--show-sdk-version' in cmd: return self.fake_run(cmd)
-            tmp = Path(kw['env']['TMPDIR'])   # where metal-tt writes them: the work folder, or a group's folder when the failed run is compiled again in parts
-            (tmp / 'translate-0001').mkdir(); (tmp / 'translate-0001/x').write_bytes(b'x'); (tmp / 'a.airp').write_bytes(b'x')
+            (self.work / 'translate-0001').mkdir(); (self.work / 'translate-0001/x').write_bytes(b'x'); (self.work / 'a.airp').write_bytes(b'x')
             return subprocess.CompletedProcess(cmd, 1)
-        usage = lambda _: shutil._ntuple_diskusage(1 << 40, 1 << 40, free_with_temporaries if next(self.work.rglob('a.airp'), None) else 100 << 30)
+        usage = lambda _: shutil._ntuple_diskusage(1 << 40, 1 << 40, free_with_temporaries if (self.work / 'a.airp').exists() else 100 << 30)
         with mock.patch.object(po.subprocess, 'run', fail), mock.patch.object(po.shutil, 'disk_usage', usage), \
                 mock.patch.dict(os.environ, DM_GAMES_DIR=str(self.prof.parent)), contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as e:
             po.main(['--game', '0100000000001000', '--msl', str(self.lib), '--out', str(self.out), '--work', str(self.work)])
-        return str(e.exception), {p.name for p in self.work.rglob('*')}
+        return str(e.exception), {p.name for p in self.work.iterdir()}
 
     def test_metal_tt_failure_on_a_full_volume_says_so(self):   # the free space as it failed, not after its temporaries are cleared: clearing them brings it back above the estimate
         text, left = self.failed_run(100 << 20)
@@ -828,62 +761,223 @@ class Build(unittest.TestCase):
         self.assertFalse({'translate-0001', 'a.airp'} & left)
 
 
-class RunLogged(unittest.TestCase):
-    """po.run_logged with real processes: a run past its time limit is stopped with the processes it started (metal-tt's air-tt and applegpu-nt go on compiling otherwise)"""
-    def setUp(self): self.t = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, self.t)
+class Prewarm(BuildCase):
+    """--prewarm-host: the host's prebuild tool makes the prewarm lists' R and M rows here (a fake host below, writing what the bundle form writes), from the profile's tables without the
+    pair lists; metal-tt compiles each period's script for each --gpu as <arch>-prewarm-<NN>.mtl4a beside the period's index; both cached; a failure leaves the archive as it is"""
+    MAC = 'applegpu_g16g'
 
-    def test_exit_status_and_log(self):
-        self.assertEqual(po.run_logged(['sh', '-c', 'echo made; exit 3'], self.t / 'log', dict(os.environ)), 3)
-        self.assertEqual((self.t / 'log').read_text(), 'made\n')
+    def setUp(self):
+        super().setUp()
+        (self.prof / 'shader_map.tsv').write_text('# map\n')
+        (self.prof / 'c1_full.tsv').write_text('c1\n')
+        (self.prof / 'pso_manifest.tsv').write_text('# list\nS\tv\t0\nR\tr1\nC\tc_b\nM\t-\tm1\nR\tr1\nR\tr2\n')
+        self.host = self.t / 'dmhost'; self.host.write_bytes(b'host 1')
+        self.vbp = hashlib.sha256((self.lib / 'v_bp.metallib').read_bytes()).hexdigest().upper()
+        self.host_runs, self.tt, self.periods, self.host_exit, self.tt_fail = [], [], 2, 0, ()
 
-    def test_time_limit_stops_the_whole_group(self):
-        pid = self.t / 'pid'
-        self.assertIsNone(po.run_logged(['sh', '-c', f'sleep 30 & echo $! > {pid}; wait'], self.t / 'log', dict(os.environ), timeout=1))
-        child = int(pid.read_text())
-        for _ in range(50):   # SIGKILL is delivered at once; give the kernel a moment to reap it
-            try: os.kill(child, 0)
-            except ProcessLookupError: break
-            if subprocess.run(['ps', '-o', 'stat=', '-p', str(child)], capture_output=True, text=True).stdout.strip().startswith('Z'): break
-            time.sleep(0.1)
-        else: self.fail('the grandchild outlived the time limit')
+    def fake_run(self, cmd, **kw):
+        cmd = [str(c) for c in cmd]
+        if cmd == ['sysctl', '-n', 'kern.osversion']: return subprocess.CompletedProcess(cmd, 0, '25A1\n', '')
+        if cmd == [str(self.host)]:   # the bundle form: per period an archive for this Mac, its index and its script; the stamp
+            env = kw['env']; self.host_runs.append(env); made = Path(env['DM_PSO_PREBUILD_OUT']); made.mkdir(parents=True, exist_ok=True)
+            for k in range(self.periods if not self.host_exit else 0):
+                (made / f'{self.MAC}-prewarm-{k:02d}.mtl4a').write_bytes(b'mac'); (made / f'{self.MAC}-prewarm-{k:02d}.keys').write_bytes(b'DMPSOIX2' + bytes([k]))
+                rp = [{'vertex_function_descriptor': f'fnd:F{k}{i}', 'label': f'p{k}{i}'} for i in range(3)]
+                (made / f'prewarm-{k:02d}.mtl4-json').write_text(json.dumps({'libraries': [{'label': self.vbp, 'path': '_Path_not_available_for_lib_from_data_with_UUID_' + self.vbp}],
+                    'function_descriptors': {'library_function_descriptors': [{'label': f'F{k}{i}', 'name': 'main0', 'library': self.vbp} for i in range(3)]},
+                    'pipeline_descriptors': {'render_pipeline_descriptors': rp, 'mesh_render_pipeline_descriptors': [{'mesh_function_descriptor': f'fnd:F{k}0', 'label': f'm{k}'}]}}))
+            if not self.host_exit: (made / 'prewarm.tsv').write_text('chain\tX\n')
+            print('[dm] [nvn-mtl] pipeline prebuild: the prewarm lists\' 3 lines in 1.0 s: 2 render pipelines', file=kw['stdout'])
+            return subprocess.CompletedProcess(cmd, self.host_exit)
+        if 'metal-tt' in cmd and '-ios-version-min' in cmd and 'pipelines.mtl4-json' in cmd[8]:
+            d = json.loads(Path(cmd[8]).read_text()); labels = [x['label'] for k in po.PIPELINE_KINDS for x in d['pipeline_descriptors'].get(k, [])]
+            self.tt.append((cmd[5], labels)); self.assertTrue(Path(d['libraries'][0]['path']).is_file())   # the library found by its bytes
+            if set(labels) & set(self.tt_fail): return subprocess.CompletedProcess(cmd, 1)
+        if 'metal-pack' in cmd: self.tt.append(('pack', len(cmd) - 8)); Path(cmd[cmd.index('-o') + 1]).write_bytes(b'packed'); return subprocess.CompletedProcess(cmd, 0)
+        return super().fake_run(cmd, **kw)
 
+    def main(self, *extra):
+        return super().main('--os-min', '27.0', *extra)
 
-    def test_a_tool_s_children_are_stopped_when_it_returns(self):   # air-tt / applegpu-nt left behind by a metal-tt that returned
-        pid = self.t / 'pid'
-        self.assertEqual(po.run_logged(['sh', '-c', f'sleep 30 & echo $! > {pid}'], self.t / 'log', dict(os.environ)), 0)
-        self.assertTrue(self.gone(int(pid.read_text())))
+    def test_rows(self):
+        self.assertEqual(po.prewarm_rows([self.prof / 'pso_manifest.tsv', self.t / 'none.tsv']), 'R\tr1\nM\t-\tm1\nR\tr2\n')
 
-    def test_stop_all_stops_the_runs_under_way(self):   # Ctrl-C or SIGTERM with --jobs above 1: the groups run detached from the terminal
-        pid, result = self.t / 'pid', []
-        t = po.threading.Thread(target=lambda: result.append(po.run_logged(['sh', '-c', f'sleep 30 & echo $! > {pid}; wait'], self.t / 'log', dict(os.environ))))
-        t.start()
-        for _ in range(300):   # a loaded Mac may take a while to start the shell
-            if pid.is_file() and pid.read_text().strip(): break
-            time.sleep(0.1)
-        po.stop_all(); t.join(30)
-        self.assertFalse(t.is_alive()); self.assertNotEqual(result, [0]); self.assertTrue(self.gone(int(pid.read_text()))); self.assertEqual(po.LIVE, set())
+    def test_cached_publication_preserves_ipa_reuse_metadata(self):
+        for copy_only in (False, True):
+            with self.subTest(copy_only=copy_only), contextlib.ExitStack() as stack:
+                if copy_only: stack.enter_context(mock.patch.object(po.os, 'link', side_effect=OSError('no hard links')))
+                self.main('--prewarm-host', str(self.host))
+                def state():
+                    return {p.name: (p.stat().st_size, p.stat().st_mtime_ns, p.stat().st_ctime_ns, p.stat().st_ino) for p in self.out.iterdir()}
+                before = state()
+                self.main('--prewarm-host', str(self.host))
+                self.assertEqual(state(), before)
+            shutil.rmtree(self.out)
 
-    def gone(self, child):
-        for _ in range(200):
-            try: os.kill(child, 0)
-            except ProcessLookupError: return True
-            if subprocess.run(['ps', '-o', 'stat=', '-p', str(child)], capture_output=True, text=True).stdout.strip().startswith('Z'): return True
-            time.sleep(0.1)
-        return False
+    def test_prewarm_only_bundle_keeps_cached_files_without_pair_archives(self):
+        (self.prof / 'shader_pairs.tsv').write_text('# no pulling bases\n')
+        self.main('--no-compute', '--prewarm-host', str(self.host))
+        archive = self.out / 'applegpu_g18p-prewarm-00.mtl4a'; before = archive.stat()
+        self.main('--no-compute', '--prewarm-host', str(self.host))
+        self.assertEqual((archive.stat().st_ino, archive.stat().st_ctime_ns), (before.st_ino, before.st_ctime_ns))
+
+    def test_files_beside_the_archive_and_reuse(self):
+        with mock.patch.dict(os.environ, DM_SAVE='/x/save', DM_PSO_PREBUILD_THREADS='3'):
+            self.assertEqual(self.main('--gpu', 'g18p,g17p', '--prewarm-host', str(self.host)), 0)
+        env = self.host_runs[0]
+        self.assertEqual((env['DM_PSO_PREBUILD'], env['DM_PSO_BUNDLE'], env['DM_PSO_PREBUILD_DEPTH'], env['DM_MSL_DIR']), ('tool', 'off', 'zero', str(self.t)))
+        self.assertEqual(Path(env['DM_PSO_MANIFEST']).read_text(), 'R\tr1\nM\t-\tm1\nR\tr2\n')   # the M rows' mesh pipelines too
+        self.assertEqual(sorted(p.name for p in Path(env['DM_NVN_SHMAP']).parent.iterdir()), ['c1_full.tsv', 'shader_map.tsv'])   # no pair list: those are the archive's
+        self.assertFalse(any(k in env for k in ('DM_SAVE', 'DM_PSO_USER')))
+        self.assertEqual(env.get('DM_PSO_PREBUILD_THREADS'), '3')   # passed on: fewer workers on a small Mac
+        names = sorted(p.name for p in self.out.iterdir())
+        for arch in ('applegpu_g17p', 'applegpu_g18p'):
+            for k in range(2):
+                self.assertIn(f'{arch}-prewarm-{k:02d}.mtl4a', names)
+                self.assertEqual((self.out / f'{arch}-prewarm-{k:02d}.keys').read_bytes(), b'DMPSOIX2' + bytes([k]))   # this Mac's index of the same period
+        self.assertEqual((self.out / 'applegpu_g18p-prewarm-01.mtl4a').read_bytes(), b'archive applegpu_g18p')
+        self.assertIn('applegpu_g18p.mtl4a', names); self.assertIn('prewarm.tsv', names)
+        self.assertEqual(sorted(a for a, _ in self.tt), ['applegpu_g17p'] * 2 + ['applegpu_g18p'] * 2)
+        self.assertEqual(self.tt[0][1], ['p00', 'p01', 'p02', 'm0'])
+        self.assertIn('prewarm\t4 files', (self.out / 'archive.tsv').read_text())
+        self.host_runs.clear(); self.tt.clear()
+        self.main('--gpu', 'g18p,g17p', '--prewarm-host', str(self.host))
+        self.assertEqual((self.host_runs, self.tt), ([], []))   # inputs unchanged: nothing runs
+        self.main('--gpu', 'g18p', '--prewarm-host', str(self.host))
+        self.assertEqual((self.host_runs, self.tt), ([], []))
+        self.assertFalse(list(self.out.glob('applegpu_g17p*')))   # a GPU no longer asked for
+        (self.prof / 'pso_manifest.tsv').write_text('R\tr3\n')
+        self.main('--gpu', 'g18p', '--prewarm-host', str(self.host))
+        self.assertEqual((len(self.host_runs), len(self.tt)), (1, 0))   # new rows: the host runs again; its scripts are the same bytes here, so metal-tt has nothing new
+        self.main('--gpu', 'g18p')
+        self.assertFalse(list(self.out.glob('*-prewarm-*')) + list(self.out.glob('prewarm.tsv')))   # without a host: none, not stale ones
+        self.assertTrue((self.out / 'applegpu_g18p.mtl4a').is_file())
+
+    def test_groups_and_a_pipeline_metal_tt_cannot_compile(self):
+        self.periods, self.tt_fail = 1, ('p01',)
+        self.assertEqual(self.main('--batch-size', '2', '--prewarm-host', str(self.host)), 0)
+        compiled = [x for x in self.tt if x[0] != 'pack']
+        self.assertEqual(compiled[0], ('applegpu_g18p', ['p00', 'p01']))
+        self.assertIn(('applegpu_g18p', ['p00']), compiled); self.assertIn(('applegpu_g18p', ['p02', 'm0']), compiled)
+        self.assertEqual(self.tt[-1], ('pack', 2))
+        self.assertEqual((self.out / 'applegpu_g18p-prewarm-00.mtl4a').read_bytes(), b'packed')
+        self.assertIn('1 pipelines left out', (self.out / 'archive.tsv').read_text())
+        self.assertFalse((self.out / 'applegpu_g18p-prewarm-00.keys').exists())   # a complete index must not claim the omitted pipeline, shadowing its device capture
+        self.tt.clear()
+        self.main('--batch-size', '2', '--prewarm-host', str(self.host))
+        self.assertEqual(self.tt, [])
+        self.assertFalse((self.out / 'applegpu_g18p-prewarm-00.keys').exists())   # the cached partial archive has the same contract
+
+    def test_library_changes_invalidate_host_cache_without_a_new_stamp(self):
+        args = (self.host, 'R\tr1\n', [self.prof / 'shader_map.tsv'], self.lib, False, 'OS')
+        key = po.prewarm_host_key(*args)
+        lib = self.lib / 'v_bp.metallib'; st = lib.stat()
+        lib.write_bytes(metallib([('main0', False), ('changed', False)]))
+        os.utime(lib, ns=(st.st_atime_ns, st.st_mtime_ns))
+        self.assertNotEqual(po.prewarm_host_key(*args), key)
+
+    def test_relative_host_and_child_paths(self):
+        with contextlib.chdir(self.t):
+            self.assertEqual(self.main('--msl', self.lib.name, '--out', 'out', '--work', 'work', '--prewarm-host', 'dmhost'), 0)
+        env = self.host_runs[0]
+        for name in ('DM_PSO_ARCHIVE', 'DM_PSO_PREBUILD_OUT', 'DM_PSO_MANIFEST', 'DM_MSL_DIR', 'DM_NVN_SHMAP'):
+            self.assertTrue(Path(env[name]).is_absolute(), name)
+
+    def test_host_launch_error_keeps_pair_archive(self):
+        runner = self.fake_run
+        def fail(cmd, **kw):
+            if list(map(str, cmd)) == [str(self.host)]: raise OSError('host cannot execute')
+            return runner(cmd, **kw)
+        with mock.patch.object(self, 'fake_run', fail):
+            self.assertEqual(self.main('--prewarm-host', str(self.host)), 0)
+        self.assertTrue((self.out / 'applegpu_g18p.mtl4a').is_file())
+        self.assertFalse(list(self.out.glob('*-prewarm-*')))
+        self.assertIn('prewarm\tnone (failed)', (self.out / 'archive.tsv').read_text())
+
+    def test_pair_fast_path_still_builds_refreshes_repairs_and_removes_prewarm(self):
+        po.shader_lib.pack(str(self.lib))
+        self.main()   # populate the pair archive's image fast path without a prewarm host
+        with mock.patch.object(po, 'plan', side_effect=AssertionError('pair archive must stay on its fast path')):
+            self.main('--prewarm-host', str(self.host))
+            self.assertEqual(len(self.host_runs), 1)
+            self.host_runs.clear(); self.tt.clear()
+            (self.prof / 'pso_manifest.tsv').write_text('C\tc_b\nR\tr3\nM\t-\tm2\n')
+            self.main('--prewarm-host', str(self.host))
+            self.assertEqual(len(self.host_runs), 1)
+            archive = self.out / 'applegpu_g18p-prewarm-00.mtl4a'; archive.unlink()
+            self.main('--prewarm-host', str(self.host))
+            self.assertTrue(archive.is_file())
+            self.assertEqual(self.tt, [])   # repaired from the prewarm cache
+            self.main()
+            self.assertFalse(list(self.out.glob('*-prewarm-*')) + list(self.out.glob('prewarm.tsv')))
+
+    def test_mac_pair_step_preserves_separately_baked_prewarm(self):
+        self.main('--platform', 'macos')
+        archive = self.out / 'applegpu_g18p-prewarm-00.mtl4a'; archive.write_bytes(b'mac prewarm')
+        keys = archive.with_suffix('.keys'); keys.write_bytes(b'index')
+        (self.out / 'prewarm.tsv').write_text('mac stamp\n')
+        self.main('--platform', 'macos')
+        self.assertEqual(archive.read_bytes(), b'mac prewarm')
+        self.assertEqual(keys.read_bytes(), b'index')
+
+    def test_a_failed_host_leaves_the_archive(self):
+        self.out.mkdir(); (self.out / 'applegpu_g18p-prewarm-07.mtl4a').write_bytes(b'old')
+        self.host_exit = 1
+        out = io.StringIO()
+        with mock.patch.object(po.subprocess, 'run', self.fake_run), mock.patch.dict(os.environ, DM_GAMES_DIR=str(self.prof.parent)), contextlib.redirect_stdout(out):
+            r = po.main(['--game', '0100000000001000', '--msl', str(self.lib), '--out', str(self.out), '--work', str(self.work), '--os-min', '27.0', '--prewarm-host', str(self.host)])
+        self.assertEqual(r, 0)
+        self.assertIn('[RED] pso_offline: prewarm: the host\'s prebuild tool made 0 files', out.getvalue())
+        self.assertEqual(sorted(p.name for p in self.out.glob('*.mtl4a')), ['applegpu_g18p.mtl4a'])
+        self.assertIn('prewarm\tnone (failed)', (self.out / 'archive.tsv').read_text())
+        self.host_exit = 0; self.host_runs.clear()
+        self.main('--prewarm-host', str(self.host))
+        self.assertEqual(len(self.host_runs), 1)   # nothing kept from the failed run
+        self.assertTrue((self.out / 'applegpu_g18p-prewarm-01.mtl4a').is_file())
+
+    @unittest.skipUnless(shutil.which('xcrun'), 'needs Xcode and Metal')
+    def test_metal_tt_takes_a_mesh_pipeline(self):   # the M rows: a native mesh pipeline descriptor, as the host's script writes it, compiles for an iPhone's GPU
+        src = ('#include <metal_stdlib>\nusing namespace metal;\nstruct V { float4 p [[position]]; };\nusing M = metal::mesh<V, void, 3, 1, topology::triangle>;\n'
+               '[[mesh]] void m0(M out, uint t [[thread_index_in_threadgroup]]) { if (t == 0) { out.set_primitive_count(1); for (uint i = 0; i < 3; i++) { V v; '
+               'v.p = float4(float(i), 0, 0, 1); out.set_vertex(i, v); out.set_index(i, i); } } }\nfragment float4 f0() { return float4(1); }\n')
+        (self.t / 'm.metal').write_text(src)
+        r = subprocess.run(['xcrun', '-sdk', 'iphoneos', 'metal', '-c', str(self.t / 'm.metal'), '-o', str(self.t / 'm.air')], capture_output=True, text=True)
+        if r.returncode: self.skipTest('no Metal compiler: ' + r.stderr[-200:])
+        subprocess.run(['xcrun', '-sdk', 'iphoneos', 'metallib', str(self.t / 'm.air'), '-o', str(self.t / 'm.metallib')], check=True, capture_output=True)
+        if subprocess.run(['xcrun', '-sdk', 'iphoneos', 'metal-tt', '-version'], capture_output=True).returncode: self.skipTest('no metal-tt')
+        h = hashlib.sha256((self.t / 'm.metallib').read_bytes()).hexdigest().upper()
+        cfg = {'libraries': [{'label': h, 'path': str(self.t / 'm.metallib')}],
+               'function_descriptors': {'library_function_descriptors': [{'label': 'M', 'name': 'm0', 'library': h}, {'label': 'F', 'name': 'f0', 'library': h}]},
+               'pipeline_descriptors': {'mesh_render_pipeline_descriptors': [{'mesh_function_descriptor': 'fnd:M', 'fragment_function_descriptor': 'fnd:F',
+                                                                              'max_total_threads_per_mesh_threadgroup': 32, 'color_attachments': [{'pixel_format': 'RGBA8Unorm'}]}]}}
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(po.compile_script(cfg, self.t / 'm.mtl4a', self.t / 'mw', 'applegpu_g18p', 'ios', '27.0', 1000), [])
+        self.assertGreater((self.t / 'm.mtl4a').stat().st_size, 0)
+
+    def test_a_missing_host_is_a_warning(self):
+        out = io.StringIO()
+        with mock.patch.object(po.subprocess, 'run', self.fake_run), mock.patch.dict(os.environ, DM_GAMES_DIR=str(self.prof.parent)), contextlib.redirect_stdout(out):
+            self.assertEqual(po.main(['--game', '0100000000001000', '--msl', str(self.lib), '--out', str(self.out), '--work', str(self.work), '--os-min', '27.0',
+                                      '--prewarm-host', str(self.t / 'nothing')]), 0)
+        self.assertIn('[RED] pso_offline: prewarm: no host at', out.getvalue())
 
 
 class IpaFallback(unittest.TestCase):
     """build_ipa.sh's own archive step with a pso_offline.py that fails: a [RED] line, no archive folder, and the build goes on (an optimization: the device builds the bases)"""
 
-    def step(self, python):
+    def step(self, python, host_game=None, make_exit=0, **extra):
         lines = (REPO / 'dm/ios/tools/build_ipa.sh').read_text().splitlines()
         i = next(n for n, ln in enumerate(lines) if ln.startswith('if [ "$GFXAPI" = nvn ] && [ -n "$GPUS" ]'))
         j = next(n for n, ln in enumerate(lines) if n > i and ln.startswith('else [ "$GFXAPI" != nvn ]'))
         with tempfile.TemporaryDirectory() as d:
             (Path(d) / 'bin').mkdir(); stub = Path(d) / 'bin/python3'; stub.write_text('#!/bin/sh\n' + python); stub.chmod(0o755)
             (Path(d) / 'shader_pairs.tsv').write_text('v\tf\n')
-            env = dict(os.environ, PATH=f'{d}/bin:{os.environ["PATH"]}', W=d, GD=d, GAME='G', DM='dm', MSL_IOS='m', V='0', GPUS='g18p', GFXAPI='nvn')
-            script = 'die() { echo "FAIL: $*"; exit 1; }\nt() { echo "$*"; }\nDM_PSO_IOS_MIN=\n' + '\n'.join(lines[i:j]) + '\nfi\necho "PSO=[$PSO]"\n[ -d "$W/build/ios/pso/bundle" ] && echo folder\necho went on\n'
+            if host_game:
+                host = Path(d) / f'dm/host/gen/{host_game}/dmhost'; host.parent.mkdir(parents=True); host.write_text('#!/bin/sh\nexit 0\n'); host.chmod(0o755)
+                make = Path(d) / 'bin/make'; make.write_text('#!/bin/sh\nprintf "%s\\n" "$*" > "$W/make.args"\nexit ' + str(make_exit) + '\n'); make.chmod(0o755)
+            env = dict({k: v for k, v in os.environ.items() if k != 'DM_PSO_HOST'}, PATH=f'{d}/bin:{os.environ["PATH"]}', W=d, GD=d, GAME='G', DM='dm', MSL_IOS='m', V='0', GPUS='g18p', GFXAPI='nvn', **extra)
+            if host_game: env['DM'] = str(Path(d) / 'dm')
+            script = 'die() { echo "FAIL: $*"; exit 1; }\nt() { echo "$*"; }\nDM_PSO_IOS_MIN=\n' + '\n'.join(lines[i:j]) + '\nfi\necho "PSO=[$PSO]"\n[ -d "$W/build/ios/pso/bundle" ] && echo folder\n[ ! -f "$W/make.args" ] || cat "$W/make.args"\necho went on\n'
             return subprocess.run(['bash', '-c', 'set -u\n' + script], env=env, capture_output=True, text=True).stdout
 
     def test_failed_archive_is_a_warning(self):
@@ -891,14 +985,25 @@ class IpaFallback(unittest.TestCase):
         self.assertIn('[RED] pipeline archive: pso_offline.py failed', out); self.assertIn('PSO=[]', out); self.assertNotIn('folder', out); self.assertIn('went on', out)
         self.assertNotIn('FAIL', out)
 
+    def test_prewarm_host(self):   # DM_PSO_HOST names the Mac host the prewarm files are made with; none, or no host of this game in the tree: none, with a line saying how
+        out = self.step('echo "ARGS $*"; exit 0\n', DM_PSO_HOST='/x/dmhost')
+        self.assertIn('--prewarm-host /x/dmhost', out); self.assertNotIn('no Mac host', out)
+        for setting in ('none', None):
+            out = self.step('echo "ARGS $*"; exit 0\n', DM_PSO_HOST=setting) if setting else self.step('echo "ARGS $*"; exit 0\n')
+            self.assertNotIn('--prewarm-host', out); self.assertIn('prewarm pipelines: no Mac host of this game', out); self.assertNotIn('FAIL', out)
+
     def test_made_archive_goes_into_the_app(self):
         out = self.step('mkdir -p "$W/build/ios/pso/bundle"; exit 0\n')
         self.assertNotIn('[RED]', out); self.assertIn('/build/ios/pso/bundle]', out); self.assertIn('folder', out)
 
-    def test_archive_with_pipelines_left_out_goes_into_the_app(self):   # exit status LEFT_OUT_EXIT: a good archive without them; the device builds those
-        out = self.step(f'mkdir -p "$W/build/ios/pso/bundle"; exit {po.LEFT_OUT_EXIT}\n')
-        self.assertIn('[RED] pipeline archive: pso_offline.py left out pipelines', out); self.assertIn('/build/ios/pso/bundle]', out); self.assertIn('folder', out)
-        self.assertNotIn('pso_offline.py failed', out)
+    def test_current_per_game_host_is_discovered_without_the_old_stamp(self):
+        out = self.step('echo "ARGS $*"; exit 0\n', host_game='G')
+        self.assertIn('/dm/host/gen/G/dmhost', out); self.assertIn('GAME=G gen/G/dmhost', out)
+        self.assertNotIn('no Mac host', out)
+        out = self.step('echo "ARGS $*"; exit 0\n', host_game='other')
+        self.assertNotIn('--prewarm-host', out); self.assertIn('no Mac host', out)
+        out = self.step('mkdir -p "$W/build/ios/pso/bundle"; exit 0\n', host_game='G', make_exit=1)
+        self.assertIn('prewarm pipelines: make', out); self.assertNotIn('--prewarm-host', out); self.assertIn('folder', out)
 
 
 class Default(unittest.TestCase):
